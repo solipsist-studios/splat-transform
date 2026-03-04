@@ -262,7 +262,7 @@ The `.omg4` format stores animated 4D Gaussian Splat scenes produced by the [OMG
 Run the provided converter on the machine where you trained the model (requires Python with PyTorch):
 
 ```bash
-python scripts/omg4_to_4dgs.py \
+python scripts/xz_to_omg4.py \
     --input  output/my_scene/comp.xz \
     --output public/scene.omg4 \
     --frames 30 \
