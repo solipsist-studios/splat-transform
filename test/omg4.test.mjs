@@ -161,7 +161,7 @@ describe('OMG4 - MLP utilities', () => {
         assert.ok(Math.abs(positions[2] - 0.5) < 1e-6);
     });
 
-    it('normalizeQuaternions should normalise to unit length', () => {
+    it('normalizeQuaternions should normalize to unit length', () => {
         const quats = new Float32Array([2, 0, 0, 0, 0, 3, 0, 0]); // 2 quats
         normalizeQuaternions(quats, 2);
         assert.ok(Math.abs(quats[0] - 1.0) < 1e-6);
