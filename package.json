@@ -45,6 +45,8 @@
     "lib/"
   ],
   "dependencies": {
+    "@napi-rs/lzma": "^1.4.5",
+    "pickleparser": "^0.2.1",
     "webgpu": "^0.3.8"
   },
   "devDependencies": {

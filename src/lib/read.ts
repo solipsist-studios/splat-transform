@@ -23,8 +23,9 @@ import { logger } from './utils/logger';
  * - `lcc` - XGrids LCC format
  * - `mjs` - JavaScript module generator
  * - `voxel` - Sparse voxel octree format
+ * - `omg4-xz` - OMG4 compressed 4DGS checkpoint (.xz)
  */
-type InputFormat = 'mjs' | 'ksplat' | 'splat' | 'sog' | 'ply' | 'spz' | 'lcc' | 'voxel';
+type InputFormat = 'mjs' | 'ksplat' | 'splat' | 'sog' | 'ply' | 'spz' | 'lcc' | 'voxel' | 'omg4-xz';
 
 /**
  * Determines the input format based on file extension.
@@ -58,6 +59,8 @@ const getInputFormat = (filename: string): InputFormat => {
         return 'lcc';
     } else if (lowerFilename.endsWith('.voxel.json')) {
         return 'voxel';
+    } else if (lowerFilename.endsWith('.xz')) {
+        return 'omg4-xz';
     }
 
     throw new Error(`Unsupported input file type: ${filename}`);

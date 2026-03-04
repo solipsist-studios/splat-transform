@@ -11,7 +11,7 @@ const esm = {
         sourcemap: true,
         entryFileNames: 'index.mjs'
     },
-    external: ['playcanvas'],
+    external: ['playcanvas', '@napi-rs/lzma', 'pickleparser'],
     plugins: [
         typescript({
             tsconfig: './tsconfig.json',
@@ -34,7 +34,7 @@ const cjs = {
         entryFileNames: 'index.cjs',
         exports: 'named'
     },
-    external: ['playcanvas'],
+    external: ['playcanvas', '@napi-rs/lzma', 'pickleparser'],
     plugins: [
         typescript({
             tsconfig: './tsconfig.json',
@@ -56,7 +56,7 @@ const cli = {
         sourcemap: true,
         entryFileNames: 'cli.mjs'
     },
-    external: ['webgpu'],
+    external: ['webgpu', '@napi-rs/lzma', 'pickleparser'],
     plugins: [
         typescript({
             tsconfig: './tsconfig.json',
