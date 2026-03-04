@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-omg4_to_4dgs.py  –  Convert an OMG4 compressed 4DGS model (.xz) to the
+xz_to_omg4.py  –  Convert an OMG4 compressed 4DGS model (.xz) to the
 web-friendly .omg4 binary format consumed by the supersplat-viewer.
 
 The .omg4 format stores pre-baked per-frame Gaussian attributes so that the
@@ -10,7 +10,7 @@ Requirements (the OMG4 training environment):
     torch  numpy  dahuffman  lzma  pickle
 
 Usage:
-    python omg4_to_4dgs.py \\
+    python xz_to_omg4.py \\
         --input  path/to/comp.xz \\
         --output path/to/scene.omg4 \\
         --frames 30 \\
