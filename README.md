@@ -253,6 +253,40 @@ splat-transform scene.voxel.json scene-voxels.ply
 splat-transform scene.voxel.json scene-voxels.csv
 ```
 
+### OMG4 Animated Format
+
+The `.omg4` format stores animated 4D Gaussian Splat scenes produced by the [OMG4](https://github.com/MinShirley/OMG4) training pipeline. It contains pre-baked per-frame Gaussian attributes (position, rotation, scale, opacity, colour) so the browser can play back a 4DGS animation at runtime without GPU-side MLP inference.
+
+#### Converting an OMG4 checkpoint to `.omg4`
+
+Run the provided converter on the machine where you trained the model (requires Python with PyTorch):
+
+```bash
+python scripts/xz_to_omg4.py \
+    --input  output/my_scene/comp.xz \
+    --output public/scene.omg4 \
+    --frames 30 \
+    --fps    24 \
+    --time_min -0.5 \
+    --time_max  0.5
+```
+
+The converter requires the OMG4 Python environment:
+
+```
+torch  numpy  dahuffman  lzma  pickle
+```
+
+#### File-size guidance
+
+| Gaussians (N) | Frames (F) | Approx. file size |
+|---------------|------------|-------------------|
+| 50 000        | 30         | ~42 MB            |
+| 100 000       | 30         | ~84 MB            |
+| 100 000       | 50         | ~140 MB           |
+
+Standard gzip compression (e.g. `gzip -k scene.omg4`) and serving with `Content-Encoding: gzip` typically halves the transfer size.
+
 ### Device Selection for SOG Compression
 
 When compressing to SOG format, you can control which device (GPU or CPU) performs the compression:
