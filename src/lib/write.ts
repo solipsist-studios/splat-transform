@@ -22,8 +22,9 @@ import { writeVoxel } from './writers/write-voxel';
  * - `html` - Self-contained HTML viewer (separate assets)
  * - `html-bundle` - Self-contained HTML viewer (all assets embedded)
  * - `voxel` - Sparse voxel octree format for collision detection
+ * - `omg4` - OMG4 4D Gaussian Splatting binary format
  */
-type OutputFormat = 'csv' | 'sog' | 'sog-bundle' | 'lod' | 'compressed-ply' | 'ply' | 'html' | 'html-bundle' | 'voxel';
+type OutputFormat = 'csv' | 'sog' | 'sog-bundle' | 'lod' | 'compressed-ply' | 'ply' | 'html' | 'html-bundle' | 'voxel' | 'omg4';
 
 /**
  * Options for writing a Gaussian splat file.
@@ -76,6 +77,8 @@ const getOutputFormat = (filename: string, options: Options): OutputFormat => {
         return 'ply';
     } else if (lowerFilename.endsWith('.html')) {
         return options.unbundled ? 'html' : 'html-bundle';
+    } else if (lowerFilename.endsWith('.omg4')) {
+        return 'omg4';
     }
 
     throw new Error(`Unsupported output file type: ${filename}`);

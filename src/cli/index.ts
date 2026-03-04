@@ -18,7 +18,8 @@ import {
     processDataTable,
     type ProcessAction,
     type Options as LibOptions,
-    logger
+    logger,
+    writeOmg4
 } from '../lib/index';
 
 /**
@@ -31,6 +32,10 @@ interface CliOptions extends LibOptions {
     quiet: boolean;
     listGpus: boolean;
     deviceIdx: number;  // -1 = auto, -2 = CPU, 0+ = GPU index
+    omg4Frames: number;
+    omg4Fps: number;
+    omg4TimeMin: number;
+    omg4TimeMax: number;
 }
 
 const fileExists = async (filename: string) => {
@@ -85,6 +90,10 @@ const parseArguments = async () => {
             unbundled: { type: 'boolean', short: 'U', default: false },
             'voxel-resolution': { type: 'string', short: 'R', default: '0.05' },
             'opacity-cutoff': { type: 'string', short: 'A', default: '0.5' },
+            'omg4-frames': { type: 'string', default: '30' },
+            'omg4-fps': { type: 'string', default: '24' },
+            'omg4-time-min': { type: 'string', default: '-0.5' },
+            'omg4-time-max': { type: 'string', default: '0.5' },
 
             // per-file options
             translate: { type: 'string', short: 't', multiple: true },
@@ -179,7 +188,11 @@ const parseArguments = async () => {
         lodChunkCount: parseInteger(v['lod-chunk-count']),
         lodChunkExtent: parseInteger(v['lod-chunk-extent']),
         voxelResolution: parseNumber(v['voxel-resolution']),
-        opacityCutoff: parseNumber(v['opacity-cutoff'])
+        opacityCutoff: parseNumber(v['opacity-cutoff']),
+        omg4Frames: parseInteger(v['omg4-frames']),
+        omg4Fps: parseNumber(v['omg4-fps']),
+        omg4TimeMin: parseNumber(v['omg4-time-min']),
+        omg4TimeMax: parseNumber(v['omg4-time-max'])
     };
 
     for (const t of tokens) {
@@ -353,10 +366,10 @@ USAGE
   • Use 'null' as output to discard file output.
 
 SUPPORTED INPUTS
-    .ply   .compressed.ply   .sog   meta.json   .ksplat   .splat   .spz   .mjs   .lcc   .voxel.json
+    .ply   .compressed.ply   .sog   meta.json   .ksplat   .splat   .spz   .mjs   .lcc   .voxel.json   .xz
 
 SUPPORTED OUTPUTS
-    .ply   .compressed.ply   .sog   meta.json   lod-meta.json   .csv   .html   .voxel.json   null
+    .ply   .compressed.ply   .sog   meta.json   lod-meta.json   .csv   .html   .voxel.json   .omg4   null
 
 ACTIONS (can be repeated, in any order)
     -t, --translate        <x,y,z>          Translate Gaussians by (x, y, z)
@@ -393,6 +406,10 @@ GLOBAL OPTIONS
     -X, --lod-chunk-extent <n>              Approximate size of an LOD chunk in world units (m). Default: 16
     -R, --voxel-resolution <n>              Voxel size in world units for .voxel.json. Default: 0.05
     -A, --opacity-cutoff   <n>              Opacity threshold for solid voxels. Default: 0.5
+        --omg4-frames      <n>              Number of baked frames for .omg4 output. Default: 30
+        --omg4-fps         <n>              Frames per second for .omg4 output. Default: 24
+        --omg4-time-min    <n>              Time range start for .omg4 output. Default: -0.5
+        --omg4-time-max    <n>              Time range end for .omg4 output. Default: 0.5
 
 EXAMPLES
     # Scale then translate
@@ -424,6 +441,12 @@ EXAMPLES
 
     # Print summary without writing a file (discard output)
     splat-transform bunny.ply -m null
+
+    # Convert OMG4 compressed checkpoint to .omg4 binary format
+    splat-transform comp.xz scene.omg4
+
+    # Convert with custom frame count and time range
+    splat-transform --omg4-frames 60 --omg4-fps 30 --omg4-time-min -1.0 --omg4-time-max 1.0 comp.xz scene.omg4
 `;
 
 const main = async () => {
@@ -544,100 +567,124 @@ const main = async () => {
     }
 
     try {
-        // Create file system for reading (reused across all input files)
-        const nodeFs = new NodeReadFileSystem();
+        // ── OMG4 conversion path (.xz → .omg4) ────────────────────────────
+        // This is a special pipeline that bypasses the normal DataTable flow
+        // because the .xz checkpoint requires per-frame MLP inference.
+        const isOmg4Conversion = inputArgs.length === 1 &&
+            getInputFormat(resolve(inputArgs[0].filename)) === 'omg4-xz' &&
+            outputFormat === 'omg4';
 
-        // read, filter, process input files
-        const inputDataTables = (await Promise.all(inputArgs.map(async (inputArg) => {
+        if (isOmg4Conversion) {
+            const inputFilename = resolve(inputArgs[0].filename);
+            const xzData = await pathReadFile(inputFilename);
+
+            await writeOmg4({
+                filename: outputFilename,
+                xzData: new Uint8Array(xzData.buffer, xzData.byteOffset, xzData.byteLength),
+                numFrames: options.omg4Frames,
+                fps: options.omg4Fps,
+                timeMin: options.omg4TimeMin,
+                timeMax: options.omg4TimeMax
+            }, new NodeFileSystem());
+        } else {
+
+            // ── Normal conversion path ─────────────────────────────────────────
+            // Create file system for reading (reused across all input files)
+            const nodeFs = new NodeReadFileSystem();
+
+            // read, filter, process input files
+            const inputDataTables = (await Promise.all(inputArgs.map(async (inputArg) => {
             // extract params
-            const params = inputArg.processActions.filter(a => a.kind === 'param').map((p) => {
-                return { name: p.name, value: p.value };
-            });
+                const params = inputArg.processActions.filter(a => a.kind === 'param').map((p) => {
+                    return { name: p.name, value: p.value };
+                });
 
-            // read input
-            const filename = resolve(inputArg.filename);
-            const inputFormat = getInputFormat(filename);
+                // read input
+                const filename = resolve(inputArg.filename);
+                const inputFormat = getInputFormat(filename);
 
-            // For mjs format, convert to file:// URL (Node.js-specific)
-            const readFilename = inputFormat === 'mjs' ? `file://${filename}` : filename;
+                // For mjs format, convert to file:// URL (Node.js-specific)
+                const readFilename = inputFormat === 'mjs' ? `file://${filename}` : filename;
 
-            const dataTables = await readFile({
-                filename: readFilename,
-                inputFormat,
-                options,
-                params,
-                fileSystem: nodeFs
-            });
+                const dataTables = await readFile({
+                    filename: readFilename,
+                    inputFormat,
+                    options,
+                    params,
+                    fileSystem: nodeFs
+                });
 
-            for (let i = 0; i < dataTables.length; ++i) {
-                const dataTable = dataTables[i];
+                for (let i = 0; i < dataTables.length; ++i) {
+                    const dataTable = dataTables[i];
 
-                if (dataTable.numRows === 0 || !isGSDataTable(dataTable)) {
-                    throw new Error(`Unsupported data in file '${inputArg.filename}'`);
+                    if (dataTable.numRows === 0 || !isGSDataTable(dataTable)) {
+                        throw new Error(`Unsupported data in file '${inputArg.filename}'`);
+                    }
+
+                    dataTables[i] = processDataTable(dataTable, inputArg.processActions);
                 }
 
-                dataTables[i] = processDataTable(dataTable, inputArg.processActions);
+                return dataTables;
+            }))).flat(1).filter(dataTable => dataTable !== null);
+
+            // special-case the environment dataTable
+            const envDataTables = inputDataTables.filter(dt => dt.hasColumn('lod') && dt.getColumnByName('lod').data.every(v => v === -1));
+            const nonEnvDataTables = inputDataTables.filter(dt => !dt.hasColumn('lod') || dt.getColumnByName('lod').data.some(v => v !== -1));
+
+            // combine inputs into a single output dataTable
+            const dataTable = nonEnvDataTables.length > 0 && processDataTable(
+                combine(nonEnvDataTables),
+                outputArg.processActions
+            );
+
+            if (!dataTable || dataTable.numRows === 0) {
+                throw new Error('No Gaussians to write');
             }
 
-            return dataTables;
-        }))).flat(1).filter(dataTable => dataTable !== null);
+            const envDataTable = envDataTables.length > 0 && processDataTable(
+                combine(envDataTables),
+                outputArg.processActions
+            );
 
-        // special-case the environment dataTable
-        const envDataTables = inputDataTables.filter(dt => dt.hasColumn('lod') && dt.getColumnByName('lod').data.every(v => v === -1));
-        const nonEnvDataTables = inputDataTables.filter(dt => !dt.hasColumn('lod') || dt.getColumnByName('lod').data.some(v => v !== -1));
+            logger.log(`Loaded ${dataTable.numRows} gaussians`);
 
-        // combine inputs into a single output dataTable
-        const dataTable = nonEnvDataTables.length > 0 && processDataTable(
-            combine(nonEnvDataTables),
-            outputArg.processActions
-        );
-
-        if (!dataTable || dataTable.numRows === 0) {
-            throw new Error('No Gaussians to write');
-        }
-
-        const envDataTable = envDataTables.length > 0 && processDataTable(
-            combine(envDataTables),
-            outputArg.processActions
-        );
-
-        logger.log(`Loaded ${dataTable.numRows} gaussians`);
-
-        // Skip file writing for null output
-        if (!isNullOutput) {
+            // Skip file writing for null output
+            if (!isNullOutput) {
             // Create device creator function with caching
             // deviceIdx: -1 = auto, -2 = CPU, 0+ = specific GPU index
-            let cachedDevice: GraphicsDevice | undefined;
-            const deviceCreator = options.deviceIdx === -2 ? undefined : async () => {
-                if (cachedDevice) {
-                    return cachedDevice;
-                }
-
-                let adapterName: string | undefined;
-                if (options.deviceIdx >= 0) {
-                    const adapters = await enumerateAdapters();
-                    const adapter = adapters[options.deviceIdx];
-                    if (adapter) {
-                        adapterName = adapter.name;
-                    } else {
-                        logger.warn(`GPU adapter index ${options.deviceIdx} not found, using default`);
+                let cachedDevice: GraphicsDevice | undefined;
+                const deviceCreator = options.deviceIdx === -2 ? undefined : async () => {
+                    if (cachedDevice) {
+                        return cachedDevice;
                     }
-                }
 
-                cachedDevice = await createDevice(adapterName);
-                return cachedDevice;
-            };
+                    let adapterName: string | undefined;
+                    if (options.deviceIdx >= 0) {
+                        const adapters = await enumerateAdapters();
+                        const adapter = adapters[options.deviceIdx];
+                        if (adapter) {
+                            adapterName = adapter.name;
+                        } else {
+                            logger.warn(`GPU adapter index ${options.deviceIdx} not found, using default`);
+                        }
+                    }
 
-            // write file
-            await writeFile({
-                filename: outputFilename,
-                outputFormat: outputFormat!,
-                dataTable,
-                envDataTable,
-                options,
-                createDevice: deviceCreator
-            }, new NodeFileSystem());
-        }
+                    cachedDevice = await createDevice(adapterName);
+                    return cachedDevice;
+                };
+
+                // write file
+                await writeFile({
+                    filename: outputFilename,
+                    outputFormat: outputFormat!,
+                    dataTable,
+                    envDataTable,
+                    options,
+                    createDevice: deviceCreator
+                }, new NodeFileSystem());
+            }
+
+        } // end of normal conversion path
     } catch (err) {
         // handle errors
         logger.error(err);

@@ -59,6 +59,12 @@ export { writeHtml } from './writers/write-html';
 export { writeLod } from './writers/write-lod';
 export { writeVoxel } from './writers/write-voxel';
 export type { WriteVoxelOptions, VoxelMetadata } from './writers/write-voxel';
+export { writeOmg4 } from './writers/write-omg4';
+export type { WriteOmg4Options } from './writers/write-omg4';
+
+// OMG4 conversion
+export { convertOmg4 } from './omg4/convert-omg4';
+export type { ConvertOmg4Options } from './omg4/convert-omg4';
 
 // Types
 export type { Options, Param } from './types';
