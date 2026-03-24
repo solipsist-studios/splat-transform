@@ -6,7 +6,7 @@ export { transform } from './data-table/transform';
 export { computeSummary } from './data-table/summary';
 export type { ColumnStats, SummaryData } from './data-table/summary';
 export { sortMortonOrder } from './data-table/morton-order';
-export { sortByVisibility } from './data-table/filter-visibility';
+export { sortByVisibility, simplifyGaussians } from './data-table/decimate';
 
 // High-level read/write
 export { readFile, getInputFormat } from './read';
@@ -30,7 +30,7 @@ export type {
     Lod,
     Summary,
     MortonOrder,
-    FilterVisibility
+    Decimate
 } from './process';
 
 // File system abstractions
@@ -57,8 +57,13 @@ export { writeCompressedPly } from './writers/write-compressed-ply';
 export { writeCsv } from './writers/write-csv';
 export { writeHtml } from './writers/write-html';
 export { writeLod } from './writers/write-lod';
+export { writeGlb } from './writers/write-glb';
 export { writeVoxel } from './writers/write-voxel';
 export type { WriteVoxelOptions, VoxelMetadata } from './writers/write-voxel';
+export { simplifyForCapsule } from './voxel/nav-simplify';
+export type { NavSeed, NavSimplifyResult } from './voxel/nav-simplify';
+export { marchingCubes } from './voxel/marching-cubes';
+export type { MarchingCubesMesh } from './voxel/marching-cubes';
 
 // Types
 export type { Options, Param } from './types';

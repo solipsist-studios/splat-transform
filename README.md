@@ -12,7 +12,7 @@
 SplatTransform is an open source library and CLI tool for converting and editing Gaussian splats. It can:
 
 📥 Read PLY, Compressed PLY, SOG, SPLAT, KSPLAT, SPZ, LCC and Voxel formats  
-📤 Write PLY, Compressed PLY, SOG, CSV, HTML Viewer, LOD and Voxel formats  
+📤 Write PLY, Compressed PLY, SOG, GLB, CSV, HTML Viewer, LOD and Voxel formats  
 📊 Generate statistical summaries for data analysis  
 🔗 Merge multiple splats  
 🔄 Apply transformations to input splats  
@@ -60,6 +60,7 @@ splat-transform [GLOBAL] input [ACTIONS]  ...  output [ACTIONS]
 | `.splat` | ✅ | ❌ | Compressed splat format (antimatter15 format) |
 | `.spz` | ✅ | ❌ | Compressed splat format (Niantic format) |
 | `.mjs` | ✅ | ❌ | Generate a scene using an mjs script (Beta) |
+| `.glb` | ❌ | ✅ | Binary glTF with [KHR_gaussian_splatting](https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_gaussian_splatting) extension |
 | `.csv` | ❌ | ✅ | Comma-separated values spreadsheet |
 | `.html` | ❌ | ✅ | HTML viewer app (single-page or unbundled) based on SOG |
 | `.voxel.json` | ✅ | ✅ | Sparse voxel octree for collision detection |
@@ -78,7 +79,7 @@ Actions can be repeated and applied in any order:
 -S, --filter-sphere    <x,y,z,radius>   Remove Gaussians outside sphere (center, radius)
 -V, --filter-value     <name,cmp,value> Keep splats where <name> <cmp> <value>
                                           cmp ∈ {lt,lte,gt,gte,eq,neq}
--F, --filter-visibility <n|n%>          Keep the n most visible splats (by opacity * volume)
+-F, --decimate         <n|n%>          Simplify to n splats via progressive pairwise merging
                                           Use n% to keep a percentage of splats
 -p, --params           <key=val,...>    Pass parameters to .mjs generator script
 -l, --lod              <n>              Specify the level of detail of this model, n >= 0.
@@ -102,7 +103,7 @@ Actions can be repeated and applied in any order:
 -C, --lod-chunk-count  <n>              Approx number of Gaussians per LOD chunk in K. Default: 512
 -X, --lod-chunk-extent <n>              Approx size of an LOD chunk in world units (m). Default: 16
 -R, --voxel-resolution <n>              Voxel size in world units for .voxel.json. Default: 0.05
--A, --opacity-cutoff   <n>              Opacity threshold for solid voxels. Default: 0.5
+-A, --opacity-cutoff   <n>              Opacity threshold for solid voxels. Default: 0.1
 ```
 
 > [!NOTE]
@@ -176,10 +177,10 @@ splat-transform input.ply -V opacity,gt,0.5 output.ply
 # Strip spherical harmonic bands higher than 2
 splat-transform input.ply --filter-harmonics 2 output.ply
 
-# Keep only the 50000 most visible splats
-splat-transform input.ply --filter-visibility 50000 output.ply
+# Simplify to 50000 splats via progressive pairwise merging
+splat-transform input.ply --decimate 50000 output.ply
 
-# Keep the top 25% most visible splats
+# Simplify to 25% of original splat count
 splat-transform input.ply -F 25% output.ply
 ```
 
@@ -433,7 +434,7 @@ type ProcessAction =
     | { kind: 'filterBands'; value: 0|1|2|3 }
     | { kind: 'filterBox'; min: Vec3; max: Vec3 }
     | { kind: 'filterSphere'; center: Vec3; radius: number }
-    | { kind: 'filterVisibility'; count: number | null; percent: number | null }
+    | { kind: 'decimate'; count: number | null; percent: number | null }
     | { kind: 'lod'; value: number }
     | { kind: 'summary' }
     | { kind: 'mortonOrder' };

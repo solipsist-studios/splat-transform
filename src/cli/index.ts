@@ -84,7 +84,12 @@ const parseArguments = async () => {
             'lod-chunk-extent': { type: 'string', short: 'X', default: '16' },
             unbundled: { type: 'boolean', short: 'U', default: false },
             'voxel-resolution': { type: 'string', short: 'R', default: '0.05' },
-            'opacity-cutoff': { type: 'string', short: 'A', default: '0.5' },
+            'opacity-cutoff': { type: 'string', short: 'A', default: '0.1' },
+            'collision-mesh': { type: 'boolean', short: 'K', default: false },
+            'mesh-simplify': { type: 'string', short: 'T', default: '0.25' },
+            'no-nav-simplify': { type: 'boolean', short: 'n', default: false },
+            'nav-capsule': { type: 'string', default: '' },
+            'nav-seed': { type: 'string', default: '' },
 
             // per-file options
             translate: { type: 'string', short: 't', multiple: true },
@@ -95,7 +100,7 @@ const parseArguments = async () => {
             'filter-harmonics': { type: 'string', short: 'H', multiple: true },
             'filter-box': { type: 'string', short: 'B', multiple: true },
             'filter-sphere': { type: 'string', short: 'S', multiple: true },
-            'filter-visibility': { type: 'string', short: 'F', multiple: true },
+            'decimate': { type: 'string', short: 'F', multiple: true },
             params: { type: 'string', short: 'p', multiple: true },
             lod: { type: 'string', short: 'l', multiple: true },
             summary: { type: 'boolean', short: 'm', multiple: true },
@@ -165,6 +170,42 @@ const parseArguments = async () => {
 
     const viewerSettingsPath = v['viewer-settings'];
 
+    // Parse nav simplification options
+    const navCapsuleStr = v['nav-capsule'];
+    const navSeedStr = v['nav-seed'];
+    const navSimplify = !v['no-nav-simplify'];
+    let navCapsule: { height: number; radius: number } | undefined;
+    let navSeed: { x: number; y: number; z: number } | undefined;
+
+    if (navSimplify) {
+        if (navCapsuleStr) {
+            const parts = navCapsuleStr.split(',').map(parseNumber);
+            if (parts.length !== 2) {
+                throw new Error(`Invalid nav-capsule value: ${navCapsuleStr}. Expected height,radius`);
+            }
+            const [height, radius] = parts;
+            if (!Number.isFinite(height) || !Number.isFinite(radius) || height <= 0 || radius < 0) {
+                throw new Error(`Invalid nav-capsule value: ${navCapsuleStr}. Height must be > 0 and radius must be >= 0`);
+            }
+            navCapsule = { height, radius };
+        } else {
+            navCapsule = { height: 1.6, radius: 0.2 };
+        }
+        if (navSeedStr) {
+            const parts = navSeedStr.split(',').map(parseNumber);
+            if (parts.length !== 3) {
+                throw new Error(`Invalid nav-seed value: ${navSeedStr}. Expected x,y,z`);
+            }
+            const [x, y, z] = parts;
+            if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) {
+                throw new Error(`Invalid nav-seed value: ${navSeedStr}. x, y, and z must be finite numbers`);
+            }
+            navSeed = { x, y, z };
+        } else {
+            navSeed = { x: 0, y: 0, z: 0 };
+        }
+    }
+
     const options: CliOptions = {
         overwrite: v.overwrite,
         help: v.help,
@@ -179,8 +220,17 @@ const parseArguments = async () => {
         lodChunkCount: parseInteger(v['lod-chunk-count']),
         lodChunkExtent: parseInteger(v['lod-chunk-extent']),
         voxelResolution: parseNumber(v['voxel-resolution']),
-        opacityCutoff: parseNumber(v['opacity-cutoff'])
+        opacityCutoff: parseNumber(v['opacity-cutoff']),
+        collisionMesh: v['collision-mesh'],
+        meshSimplify: parseNumber(v['mesh-simplify']),
+        navSimplify,
+        navCapsule,
+        navSeed
     };
+
+    if (!Number.isFinite(options.meshSimplify) || options.meshSimplify < 0 || options.meshSimplify > 1) {
+        throw new Error(`Invalid mesh-simplify value: ${options.meshSimplify}. Must be a finite number between 0 and 1.`);
+    }
 
     for (const t of tokens) {
         if (t.kind === 'positional') {
@@ -308,7 +358,7 @@ const parseArguments = async () => {
                         kind: 'mortonOrder'
                     });
                     break;
-                case 'filter-visibility': {
+                case 'decimate': {
                     const value = t.value.trim();
                     let count: number | null = null;
                     let percent: number | null = null;
@@ -317,18 +367,18 @@ const parseArguments = async () => {
                         // Percentage mode
                         percent = parseNumber(value.slice(0, -1));
                         if (percent < 0 || percent > 100) {
-                            throw new Error(`Invalid filter-visibility percentage: ${value}. Must be between 0% and 100%.`);
+                            throw new Error(`Invalid decimate percentage: ${value}. Must be between 0% and 100%.`);
                         }
                     } else {
                         // Count mode
                         count = parseInteger(value);
                         if (count < 0) {
-                            throw new Error(`Invalid filter-visibility count: ${value}. Must be a non-negative integer.`);
+                            throw new Error(`Invalid decimate count: ${value}. Must be a non-negative integer.`);
                         }
                     }
 
                     current.processActions.push({
-                        kind: 'filterVisibility',
+                        kind: 'decimate',
                         count,
                         percent
                     });
@@ -356,7 +406,7 @@ SUPPORTED INPUTS
     .ply   .compressed.ply   .sog   meta.json   .ksplat   .splat   .spz   .mjs   .lcc   .voxel.json
 
 SUPPORTED OUTPUTS
-    .ply   .compressed.ply   .sog   meta.json   lod-meta.json   .csv   .html   .voxel.json   null
+    .ply   .compressed.ply   .sog   meta.json   lod-meta.json   .glb   .csv   .html   .voxel.json   null
 
 ACTIONS (can be repeated, in any order)
     -t, --translate        <x,y,z>          Translate Gaussians by (x, y, z)
@@ -371,7 +421,7 @@ ACTIONS (can be repeated, in any order)
                                               opacity, scale_*, f_dc_* use transformed values
                                               (linear opacity 0-1, linear scale, linear color 0-1).
                                               Append _raw for raw PLY values (e.g. opacity_raw).
-    -F, --filter-visibility <n|n%>          Keep the n most visible Gaussians (by opacity * volume)
+    -F, --decimate         <n|n%>           Simplify to n Gaussians via progressive pairwise merging
                                               Use n% to keep a percentage of Gaussians
     -p, --params           <key=val,...>    Pass parameters to .mjs generator script
     -l, --lod              <n>              Specify the level of detail, n >= 0
@@ -392,7 +442,12 @@ GLOBAL OPTIONS
     -C, --lod-chunk-count  <n>              Approximate number of Gaussians per LOD chunk in K. Default: 512
     -X, --lod-chunk-extent <n>              Approximate size of an LOD chunk in world units (m). Default: 16
     -R, --voxel-resolution <n>              Voxel size in world units for .voxel.json. Default: 0.05
-    -A, --opacity-cutoff   <n>              Opacity threshold for solid voxels. Default: 0.5
+    -A, --opacity-cutoff   <n>              Opacity threshold for solid voxels. Default: 0.1
+    -K, --collision-mesh                    Generate collision mesh (.collision.glb) with voxel output
+    -T, --mesh-simplify    <n>              Ratio of triangles to keep for collision mesh (0-1). Default: 0.25
+    -n, --no-nav-simplify                   Disable capsule navigation simplification for voxel output
+        --nav-capsule      <height,radius>  Capsule dimensions for nav simplification. Default: 1.6,0.2
+        --nav-seed         <x,y,z>          Seed position for nav simplification. Default: 0,0,0
 
 EXAMPLES
     # Scale then translate
@@ -410,11 +465,17 @@ EXAMPLES
     # Generate LOD with custom chunk size and node split size
     splat-transform -O 0,1,2 -C 1024 -X 32 input.lcc output/lod-meta.json
 
-    # Generate voxel collision data
+    # Generate voxel data
     splat-transform input.ply output.voxel.json
+
+    # Generate voxel data with collision mesh
+    splat-transform -K input.ply output.voxel.json
 
     # Generate voxel data with custom resolution and opacity threshold
     splat-transform -R 0.1 -A 0.3 input.ply output.voxel.json
+
+    # Generate voxel data with nav simplification disabled
+    splat-transform -n input.ply output.voxel.json
 
     # Convert voxel data back to PLY for visualization
     splat-transform scene.voxel.json scene-voxels.ply
@@ -439,23 +500,28 @@ const main = async () => {
 
     let start: Timing | null = null;
 
+    const err = console.error.bind(console);
+    const warn = console.warn.bind(console);
+
     // inject Node.js-specific logger - logs go to stderr, data output goes to stdout
     logger.setLogger({
-        log: (...args) => console.error(...args),
-        warn: (...args) => console.warn(...args),
-        error: (...args) => console.error(...args),
-        debug: (...args) => console.error(...args),
-        output: text => console.log(text),
+        log: err,
+        warn: warn,
+        error: err,
+        debug: err,
+        output: console.log.bind(console),
         onProgress: (node) => {
             if (node.stepName) {
-                console.error(`[${node.step}/${node.totalSteps}] ${node.stepName}`);
+                err(`[${node.step}/${node.totalSteps}] ${node.stepName}`);
+            } else if (node.step === 0) {
+                start = hrtime();
             } else {
-                if (node.step === 0) {
-                    start = hrtime();
-                } else if (node.step === node.totalSteps) {
-                    process.stderr.write(`# done in ${hrtimeDelta(start, hrtime()).toFixed(3)}s 🎉\n`);
-                } else {
-                    process.stderr.write('#');
+                const displaySteps = 10;
+                const curr = Math.round(displaySteps * node.step / node.totalSteps);
+                const prev = Math.round(displaySteps * (node.step - 1) / node.totalSteps);
+                if (curr > prev) process.stderr.write('#'.repeat(curr - prev));
+                if (node.step === node.totalSteps) {
+                    process.stderr.write(` (${hrtimeDelta(start, hrtime()).toFixed(3)}s)\n`);
                 }
             }
         }
@@ -530,6 +596,7 @@ const main = async () => {
                 const filesToCheck = [
                     join(outputDir, 'index.css'),
                     join(outputDir, 'index.js'),
+                    join(outputDir, 'settings.json'),
                     join(outputDir, `${baseFilename}.sog`)
                 ];
 
@@ -601,7 +668,7 @@ const main = async () => {
             outputArg.processActions
         );
 
-        logger.log(`Loaded ${dataTable.numRows} gaussians`);
+        logger.log(`Total gaussians loaded: ${dataTable.numRows}`);
 
         // Skip file writing for null output
         if (!isNullOutput) {

@@ -4,6 +4,7 @@ import { Options } from './types';
 import { logger } from './utils/logger';
 import { writeCompressedPly } from './writers/write-compressed-ply';
 import { writeCsv } from './writers/write-csv';
+import { writeGlb } from './writers/write-glb';
 import { writeHtml } from './writers/write-html';
 import { writeLod } from './writers/write-lod';
 import { writePly } from './writers/write-ply';
@@ -15,6 +16,7 @@ import { writeVoxel } from './writers/write-voxel';
  *
  * - `ply` - Standard PLY format
  * - `compressed-ply` - Compressed PLY format
+ * - `glb` - Binary glTF with KHR_gaussian_splatting extension
  * - `csv` - CSV text format (for debugging/analysis)
  * - `sog` - PlayCanvas SOG format (separate files)
  * - `sog-bundle` - PlayCanvas SOG format (bundled into single .sog file)
@@ -23,7 +25,7 @@ import { writeVoxel } from './writers/write-voxel';
  * - `html-bundle` - Self-contained HTML viewer (all assets embedded)
  * - `voxel` - Sparse voxel octree format for collision detection
  */
-type OutputFormat = 'csv' | 'sog' | 'sog-bundle' | 'lod' | 'compressed-ply' | 'ply' | 'html' | 'html-bundle' | 'voxel';
+type OutputFormat = 'csv' | 'sog' | 'sog-bundle' | 'lod' | 'compressed-ply' | 'ply' | 'glb' | 'html' | 'html-bundle' | 'voxel';
 
 /**
  * Options for writing a Gaussian splat file.
@@ -74,6 +76,8 @@ const getOutputFormat = (filename: string, options: Options): OutputFormat => {
         return 'compressed-ply';
     } else if (lowerFilename.endsWith('.ply')) {
         return 'ply';
+    } else if (lowerFilename.endsWith('.glb')) {
+        return 'glb';
     } else if (lowerFilename.endsWith('.html')) {
         return options.unbundled ? 'html' : 'html-bundle';
     }
@@ -148,6 +152,9 @@ const writeFile = async (writeOptions: WriteOptions, fs: FileSystem) => {
                 }
             }, fs);
             break;
+        case 'glb':
+            await writeGlb({ filename, dataTable }, fs);
+            break;
         case 'html':
         case 'html-bundle':
             await writeHtml({
@@ -159,15 +166,23 @@ const writeFile = async (writeOptions: WriteOptions, fs: FileSystem) => {
                 createDevice
             }, fs);
             break;
-        case 'voxel':
+        case 'voxel': {
+            const enableNav = options.navSimplify !== false;
+            const navCapsule = enableNav ? (options.navCapsule ?? { height: 1.6, radius: 0.2 }) : undefined;
+            const navSeed = enableNav ? (options.navSeed ?? { x: 0, y: 0, z: 0 }) : undefined;
             await writeVoxel({
                 filename,
                 dataTable,
                 voxelResolution: options.voxelResolution,
                 opacityCutoff: options.opacityCutoff,
+                collisionMesh: options.collisionMesh,
+                meshSimplify: options.meshSimplify,
+                navCapsule,
+                navSeed,
                 createDevice
             }, fs);
             break;
+        }
     }
 };
 
