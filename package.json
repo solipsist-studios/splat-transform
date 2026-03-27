@@ -1,6 +1,6 @@
 {
   "name": "@playcanvas/splat-transform",
-  "version": "1.10.1",
+  "version": "1.10.2",
   "author": "PlayCanvas<support@playcanvas.com>",
   "homepage": "https://playcanvas.com",
   "description": "Library and CLI tool for 3D Gaussian splat format conversion and transformation",
@@ -50,7 +50,7 @@
   },
   "devDependencies": {
     "@playcanvas/eslint-config": "2.1.0",
-    "@playcanvas/supersplat-viewer": "1.18.4",
+    "@playcanvas/supersplat-viewer": "1.19.0",
     "@rollup/plugin-json": "6.1.0",
     "@rollup/plugin-node-resolve": "16.0.3",
     "@rollup/plugin-typescript": "12.3.0",
