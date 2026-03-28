@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-queen_pkl_to_omg4.py – Convert a QUEEN compressed 4DGS model (folder of per-frame
-.pkl files) to the web-friendly .omg4 binary format consumed by the
-supersplat-viewer.
+queen_pkl_to_queen.py – Convert a QUEEN compressed 4DGS model (folder of
+per-frame .pkl files) to the web-friendly .queen binary format consumed by
+the supersplat-viewer.
 
 QUEEN (QUantized Efficient ENcoding, NeurIPS 2024) stores per-frame Gaussians
 in a folder structure such as:
@@ -10,44 +10,29 @@ in a folder structure such as:
     <input_dir>/
       Frame0001/
         compressed/
-          0001.pkl          ← or point_cloud.pkl
+          0001.pkl          ← entropy-coded latents + decoder state
       Frame0002/
         compressed/
-          0002.pkl
+          0002.pkl          ← residuals relative to previous frame
       ...
 
 Frame 1 may alternatively be stored as a plain PLY file:
     <input_dir>/Frame0001/point_cloud.ply
 
-The .omg4 format stores pre-baked per-frame Gaussian attributes so that the
-viewer can play back the animation without GPU-side MLP inference.
+The .queen format stores pre-baked per-frame Gaussian attributes so that
+the viewer can play back the animation directly without any GPU-side
+inference.  See splat4d_io.py for the on-disk layout.
 
 Requirements:
-    torch  numpy  torchac  plyfile  (torchac and plyfile only needed if
-                                    CompressedLatents or PLY fallback is used)
+    torch  numpy  torchac  plyfile
+    (torchac and plyfile are soft dependencies; clear errors are printed if
+    either is missing and only needed for entropy-coded PKL or PLY frames.)
 
 Usage:
-    python queen_pkl_to_omg4.py \\
+    python queen_pkl_to_queen.py \\
         --input  path/to/queen_frames_directory \\
-        --output path/to/scene.omg4 \\
+        --output path/to/scene.queen \\
         --fps    30.0
-
-File format written (all values little-endian):
-    Header (28 bytes):
-        uint32  magic = 0x34474D4F  ("OMG4")
-        uint32  version = 1
-        uint32  numSplats
-        uint32  numFrames
-        float32 fps
-        float32 timeDurationMin
-        float32 timeDurationMax
-    Per-frame record (repeated numFrames times):
-        float32          timestamp
-        float32[N * 14]  per-splat data, AoS layout:
-            x  y  z  rot_0(w)  rot_1(x)  rot_2(y)  rot_3(z)
-            scale_0  scale_1  scale_2   (log-space)
-            opacity                      (logit-space)
-            f_dc_0  f_dc_1  f_dc_2      (raw SH DC coefficients)
 """
 
 import argparse
@@ -56,10 +41,14 @@ import pickle
 import re
 import struct
 import sys
+from pathlib import Path
 
-import numpy as np
 import torch
 import torch.nn.functional as F
+
+# Shared I/O utilities (binary header, AoS packing, PLY reader)
+sys.path.insert(0, str(Path(__file__).parent))
+from splat4d_io import QUEEN_MAGIC, pack_frame_aos, write_4dgs_header, report_output, read_ply_gaussians
 
 
 # ---------------------------------------------------------------------------
@@ -77,7 +66,7 @@ class CompressedLatents:
     """
 
     def uncompress(self, scale: float = 1.0) -> torch.Tensor:
-        """Decode entropy-coded bytes back to a float tensor of shape [N, D]."""
+        """Decode entropy-coded bytes back to a float tensor [num_latents, latent_dim]."""
         try:
             import torchac
         except ImportError:
@@ -87,6 +76,7 @@ class CompressedLatents:
                 "(see https://github.com/fab-jul/torchac)"
             )
 
+        import numpy as np
         cdf = torch.tensor(self.cdf).unsqueeze(0).repeat(
             self.num_latents * self.latent_dim, 1
         )
@@ -146,11 +136,11 @@ def _apply_decoder_layer(
     ldecode_matrix: str,
 ) -> torch.Tensor:
     """Single DecoderLayer forward: x @ (dft *) scale + shift."""
-    scale = state[f'{prefix}.scale']   # [latent_dim, feature_dim]
-    shift = state.get(f'{prefix}.shift', None)  # [1, feature_dim] or None
+    scale = state[f'{prefix}.scale']         # [latent_dim, feature_dim]
+    shift = state.get(f'{prefix}.shift')     # [1, feature_dim] or None
 
     if 'dft' in ldecode_matrix:
-        dft = state[f'{prefix}.dft']   # [latent_dim, dft_dim]
+        dft = state[f'{prefix}.dft']         # [latent_dim, dft_dim]
         out = (x @ dft) * scale
     else:
         out = x @ scale
@@ -170,15 +160,14 @@ def _forward_decoder(
 
     Layout of nn.Sequential layers:
       - 0 hidden layers  (num_layers_dec=0):  layers.0
-      - 1 hidden layer   (num_layers_dec=1):  layers.0, activation, layers.2
       - n hidden layers  (num_layers_dec=n):  layers.0, act, layers.2, act, …, layers.2n
     """
     num_hidden = int(args.get('num_layers_dec', 0))
-    act_name    = str(args.get('activation', 'none'))
-    ldm         = str(args.get('ldecode_matrix', 'learnable'))
-    act_fn      = _ACTIVATIONS.get(act_name, _ACTIVATIONS['none'])
+    act_name   = str(args.get('activation', 'none'))
+    ldm        = str(args.get('ldecode_matrix', 'learnable'))
+    act_fn     = _ACTIVATIONS.get(act_name, _ACTIVATIONS['none'])
 
-    div = state['div']            # [latent_dim]
+    div = state['div']   # [latent_dim]
     x   = latent / div
 
     for i in range(num_hidden):
@@ -197,7 +186,7 @@ def _decode_attribute(
     prev_decoded: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
-    Decode a single Gaussian attribute.
+    Decode a single Gaussian attribute from a PKL latent value.
 
     Parameters
     ----------
@@ -205,13 +194,13 @@ def _decode_attribute(
     decoder_type  : 'DecoderIdentity' | 'LatentDecoder' | 'LatentDecoderRes'
     state         : decoder state dict (may include 'decoded_att' for Res)
     args          : decoder constructor args dict
-    prev_decoded  : previous frame's decoded output (needed for gated xyz)
+    prev_decoded  : previous frame's decoded output (for gated residual xyz)
     """
     if decoder_type == 'DecoderIdentity':
         if isinstance(latent_val, dict):
-            # Gated residual xyz – reconstruct from sparse delta on prev_xyz
-            mapping   = latent_val['mapping']          # [N] → prev frame indices
-            ung_idx   = latent_val['ungated_indices']  # indices with changes
+            # Gated residual xyz: reconstruct from sparse delta on prev frame
+            mapping   = latent_val['mapping']
+            ung_idx   = latent_val['ungated_indices']
             residuals = latent_val['ungated_residuals_compressed'].uncompress(scale=10000.0)
 
             if prev_decoded is None:
@@ -222,7 +211,6 @@ def _decode_attribute(
             recon[ung_idx] += residuals
             return recon
         else:
-            # Plain tensor – no compression
             return latent_val.float()
 
     elif decoder_type == 'LatentDecoder':
@@ -231,7 +219,6 @@ def _decode_attribute(
 
     elif decoder_type == 'LatentDecoderRes':
         latent = latent_val.uncompress()
-        # Separate 'decoded_att' from regular layer params
         decoded_att = state.get('decoded_att', None)
         layer_state = {k: v for k, v in state.items() if k != 'decoded_att'}
         out = _forward_decoder(latent, layer_state, args)
@@ -244,66 +231,18 @@ def _decode_attribute(
 
 
 # ---------------------------------------------------------------------------
-# PLY fallback for frame 1 (if no PKL is present)
+# Decode all wanted attributes from a PKL data dict
 # ---------------------------------------------------------------------------
 
-def _load_ply_frame(ply_path: str) -> dict[str, torch.Tensor]:
-    """
-    Read the base-frame PLY written by QUEEN training and return decoded
-    attribute tensors (same names as _decode_all_attributes returns).
-    """
-    try:
-        from plyfile import PlyData
-    except ImportError:
-        sys.exit(
-            "ERROR: 'plyfile' package not found.\n"
-            "Install it with:  pip install plyfile"
-        )
-
-    plydata = PlyData.read(ply_path)
-    el = plydata.elements[0]
-
-    xyz = np.stack([el['x'], el['y'], el['z']], axis=1).astype(np.float32)
-
-    f_dc = np.stack([el['f_dc_0'], el['f_dc_1'], el['f_dc_2']], axis=1).astype(np.float32)
-
-    scale_names = sorted(
-        [p.name for p in el.properties if p.name.startswith('scale_')],
-        key=lambda n: int(n.split('_')[-1])
-    )
-    sc = np.stack([np.asarray(el[n]) for n in scale_names], axis=1).astype(np.float32)
-
-    rot_names = sorted(
-        [p.name for p in el.properties if p.name.startswith('rot_')],
-        key=lambda n: int(n.split('_')[-1])
-    )
-    rot = np.stack([np.asarray(el[n]) for n in rot_names], axis=1).astype(np.float32)
-
-    op = np.asarray(el['opacity']).astype(np.float32)  # logit-space
-
-    return {
-        'xyz':   torch.tensor(xyz),
-        'f_dc':  torch.tensor(f_dc),
-        'sc':    torch.tensor(sc),
-        'rot':   torch.tensor(rot),
-        'op':    torch.tensor(op).unsqueeze(-1),
-    }
-
-
-# ---------------------------------------------------------------------------
-# Decode all required attributes from a PKL data dict
-# ---------------------------------------------------------------------------
-
-# Attributes written to .omg4 (skipping f_rest and flow)
-_WANTED = ('xyz', 'f_dc', 'sc', 'rot', 'op')
+_WANTED_ATTRS = ('xyz', 'f_dc', 'sc', 'rot', 'op')
 
 
 def _decode_all_attributes(
     data: dict,
-    prev_decoded: dict[str, torch.Tensor] | None,
-) -> dict[str, torch.Tensor]:
+    prev_decoded: dict | None,
+) -> dict:
     """
-    Decode all wanted attributes from a QUEEN PKL data dict.
+    Decode all wanted Gaussian attributes from a QUEEN PKL data dict.
 
     Parameters
     ----------
@@ -312,23 +251,21 @@ def _decode_all_attributes(
 
     Returns
     -------
-    dict mapping attribute name → decoded float tensor
+    dict mapping attribute name → decoded float32 tensor
     """
-    latents     = data['latents']
-    states      = data.get('decoder_state_dict', {})
-    args        = data.get('decoder_args', {})
-    dec_types   = data['latent_decoders_dict']
+    latents   = data['latents']
+    states    = data.get('decoder_state_dict', {})
+    args      = data.get('decoder_args', {})
+    dec_types = data['latent_decoders_dict']
 
     result = {}
-    for attr in _WANTED:
+    for attr in _WANTED_ATTRS:
         if attr not in latents:
             continue
-
         dtype = dec_types.get(attr, 'DecoderIdentity')
         state = states.get(attr, {})
         arg   = args.get(attr, {})
         prev  = prev_decoded.get(attr) if prev_decoded else None
-
         result[attr] = _decode_attribute(latents[attr], dtype, state, arg, prev)
 
     return result
@@ -338,13 +275,12 @@ def _decode_all_attributes(
 # Directory scanning
 # ---------------------------------------------------------------------------
 
-def _find_frame_entries(input_dir: str) -> list[tuple[int, str]]:
+def _find_frame_entries(input_dir: str) -> list:
     """
     Scan *input_dir* for QUEEN frame sub-directories.
 
-    Accepted naming patterns:
-      Frame0001, Frame0002, …  (4-digit zero-padded integer suffix)
-      frame0001, FRAME0001, …  (case-insensitive)
+    Accepted naming patterns (case-insensitive):
+      Frame0001, frame0002, …  (optional 'frame' prefix + zero-padded integer)
       0001, 0002, …            (plain zero-padded integers)
 
     Returns a sorted list of (frame_number, absolute_dir_path) pairs.
@@ -371,18 +307,16 @@ def _find_frame_entries(input_dir: str) -> list[tuple[int, str]]:
     return entries
 
 
-def _find_pkl_or_ply(frame_dir: str) -> tuple[str, str]:
+def _find_pkl_or_ply(frame_dir: str) -> tuple:
     """
     Return (path, kind) where kind is 'pkl' or 'ply'.
 
     Search order:
       1. <frame_dir>/compressed/*.pkl   (any .pkl inside compressed/)
-      2. <frame_dir>/compressed/point_cloud.pkl
-      3. <frame_dir>/point_cloud.ply    (PLY fallback for frame 1)
+      2. <frame_dir>/point_cloud.ply    (PLY fallback, typically frame 1)
     """
     compressed_dir = os.path.join(frame_dir, 'compressed')
     if os.path.isdir(compressed_dir):
-        # Pick any .pkl in that directory (prefer numerically named ones)
         pkls = sorted(
             [f for f in os.listdir(compressed_dir) if f.endswith('.pkl')]
         )
@@ -403,102 +337,64 @@ def _find_pkl_or_ply(frame_dir: str) -> tuple[str, str]:
 # Main conversion
 # ---------------------------------------------------------------------------
 
-def convert(
-    input_dir: str,
-    out_path: str,
-    fps: float,
-) -> None:
+def convert(input_dir: str, out_path: str, fps: float) -> None:
 
     # ── Discover frames ───────────────────────────────────────────────────────
     frame_entries = _find_frame_entries(input_dir)
     num_frames = len(frame_entries)
     print(f"Found {num_frames} frame(s) in '{input_dir}'")
 
-    # ── First pass: determine N (number of Gaussians) from frame 1 ───────────
+    # ── First pass: load frame 1 to determine N ───────────────────────────────
     _, first_dir = frame_entries[0]
     first_path, first_kind = _find_pkl_or_ply(first_dir)
     print(f"  Frame 1: {first_path}  [{first_kind.upper()}]")
 
     if first_kind == 'ply':
-        first_attrs = _load_ply_frame(first_path)
+        first_attrs = read_ply_gaussians(first_path)
     else:
-        first_data  = _load_pkl(first_path)
-        first_attrs = _decode_all_attributes(first_data, prev_decoded=None)
+        first_attrs = _decode_all_attributes(_load_pkl(first_path), prev_decoded=None)
 
     N = first_attrs['xyz'].shape[0]
-    print(f"  {N:,} Gaussians | {num_frames} frames @ {fps} fps")
-
-    # ── Write .omg4 file ─────────────────────────────────────────────────────
-    FLOATS_PER_SPLAT = 14
-    MAGIC   = 0x34474D4F   # "OMG4" little-endian
-    VERSION = 1
 
     time_min = 0.0
     time_max = (num_frames - 1) / fps if num_frames > 1 else 0.0
 
-    with open(out_path, 'wb') as fp:
-        # Header
-        fp.write(struct.pack(
-            '<IIIIfff',
-            MAGIC, VERSION,
-            N, num_frames,
-            fps,
-            time_min, time_max,
-        ))
+    print(f"  {N:,} Gaussians | {num_frames} frames @ {fps} fps")
 
-        prev_decoded: dict[str, torch.Tensor] | None = None
+    # ── Write .queen file ─────────────────────────────────────────────────────
+    with open(out_path, 'wb') as fp:
+        write_4dgs_header(fp, QUEEN_MAGIC, N, num_frames, fps, time_min, time_max)
+
+        prev_decoded = None
 
         for fi, (frame_num, frame_dir) in enumerate(frame_entries):
             timestamp = time_min + (time_max - time_min) * fi / max(num_frames - 1, 1)
             print(f"  Frame {fi + 1}/{num_frames}  (#{frame_num})  t={timestamp:.4f}", end='\r')
 
-            if fi == 0 and first_kind in ('ply', 'pkl'):
-                # Already loaded above – reuse
+            if fi == 0:
                 attrs = first_attrs
             else:
                 path, kind = _find_pkl_or_ply(frame_dir)
                 if kind == 'ply':
-                    attrs = _load_ply_frame(path)
+                    attrs = read_ply_gaussians(path)
                 else:
-                    data  = _load_pkl(path)
-                    attrs = _decode_all_attributes(data, prev_decoded=prev_decoded)
+                    attrs = _decode_all_attributes(_load_pkl(path), prev_decoded=prev_decoded)
 
-            # ── Extract attribute tensors ─────────────────────────────────────
-            xyz = attrs['xyz']                      # [N, 3]  actual coordinates
-            rot = attrs['rot']                      # [N, 4]  raw quaternion
-            sc  = attrs['sc']                       # [N, 3]  log-space scale
-            op  = attrs['op'].squeeze(-1)           # [N]     logit-space opacity
-            fdc = attrs['f_dc']                     # [N, 3]  SH DC coefficients
-
-            # Normalise quaternion (viewer expects unit quaternion)
-            rot_norm = F.normalize(rot, dim=-1)     # [N, 4]
-
-            # ── Pack AoS ─────────────────────────────────────────────────────
-            frame_np = np.empty((N, FLOATS_PER_SPLAT), dtype=np.float32)
-            frame_np[:, 0 ] = xyz[:, 0].detach().numpy()         # x
-            frame_np[:, 1 ] = xyz[:, 1].detach().numpy()         # y
-            frame_np[:, 2 ] = xyz[:, 2].detach().numpy()         # z
-            frame_np[:, 3 ] = rot_norm[:, 0].detach().numpy()    # rot_0 (w)
-            frame_np[:, 4 ] = rot_norm[:, 1].detach().numpy()    # rot_1 (x)
-            frame_np[:, 5 ] = rot_norm[:, 2].detach().numpy()    # rot_2 (y)
-            frame_np[:, 6 ] = rot_norm[:, 3].detach().numpy()    # rot_3 (z)
-            frame_np[:, 7 ] = sc[:, 0].detach().numpy()          # scale_0 (log)
-            frame_np[:, 8 ] = sc[:, 1].detach().numpy()          # scale_1 (log)
-            frame_np[:, 9 ] = sc[:, 2].detach().numpy()          # scale_2 (log)
-            frame_np[:, 10] = op.detach().numpy()                 # opacity (logit)
-            frame_np[:, 11] = fdc[:, 0].detach().numpy()         # f_dc_0
-            frame_np[:, 12] = fdc[:, 1].detach().numpy()         # f_dc_1
-            frame_np[:, 13] = fdc[:, 2].detach().numpy()         # f_dc_2
+            frame_data = pack_frame_aos(
+                pos=attrs['xyz'],
+                rot=attrs['rot'],
+                sc=attrs['sc'],
+                op=attrs['op'],
+                fdc=attrs['f_dc'],
+            )
 
             fp.write(struct.pack('<f', timestamp))
-            fp.write(frame_np.tobytes())
+            fp.write(frame_data.tobytes())
 
-            # Keep current decoded attrs for gated-residual reconstruction
             prev_decoded = attrs
 
     print()
-    size_mb = os.path.getsize(out_path) / 1024 / 1024
-    print(f"Wrote {out_path}  ({size_mb:.1f} MB)")
+    report_output(out_path)
 
 
 # ---------------------------------------------------------------------------
@@ -506,8 +402,7 @@ def convert(
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description=(
-            'Convert a QUEEN per-frame PKL directory to supersplat-viewer '
-            '.omg4 format'
+            'Convert a QUEEN per-frame PKL directory to the .queen web format'
         )
     )
     parser.add_argument(
@@ -516,7 +411,7 @@ if __name__ == '__main__':
     )
     parser.add_argument(
         '--output', required=True,
-        help='Destination .omg4 file',
+        help='Destination .queen file',
     )
     parser.add_argument(
         '--fps', type=float, default=30.0,
@@ -525,7 +420,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     convert(
-        input_dir = args.input,
-        out_path  = args.output,
-        fps       = args.fps,
+        input_dir=args.input,
+        out_path=args.output,
+        fps=args.fps,
     )
