@@ -43,9 +43,15 @@ import os
 import pickle
 import struct
 import sys
+from pathlib import Path
 
 import numpy as np
 import torch
+
+# Add the scripts directory to the path so splat4d_io can be imported when
+# this script is run directly from any working directory.
+sys.path.insert(0, str(Path(__file__).parent))
+from splat4d_io import OMG4_MAGIC, pack_frame_aos, write_4dgs_header, report_output
 
 # ---------------------------------------------------------------------------
 # Huffman decode (mirrors compress_utils.py in the OMG4 repository)
@@ -235,17 +241,8 @@ def convert(xz_path: str, out_path: str,
     features_static = appearance[:, 0:3]   # [N, 3]
 
     # ── Write .omg4 file ─────────────────────────────────────────────────────
-    FLOATS_PER_SPLAT = 14
-    MAGIC   = 0x34474D4F   # "OMG4" little-endian
-    VERSION = 1
-
     with open(out_path, 'wb') as fp:
-        # Header
-        fp.write(struct.pack('<IIIIFFF',
-                             MAGIC, VERSION,
-                             N, num_frames,
-                             fps,
-                             time_min, time_max))
+        write_4dgs_header(fp, OMG4_MAGIC, N, num_frames, fps, time_min, time_max)
 
         for fi in range(num_frames):
             timestamp = time_min + (time_max - time_min) * fi / max(num_frames - 1, 1)
@@ -286,32 +283,14 @@ def convert(xz_path: str, out_path: str,
             opa_final   = opa_final.clamp(1e-6, 1 - 1e-6)
             opa_logit   = torch.log(opa_final / (1 - opa_final))          # [N]
 
-            # Scales stay in log-space; normalise rotation quaternion
-            rot_norm = torch.nn.functional.normalize(rotation, dim=-1)    # [N, 4]
-
-            # ── Pack AoS ─────────────────────────────────────────────────────
-            frame_data = np.empty((N, FLOATS_PER_SPLAT), dtype=np.float32)
-            frame_data[:, 0 ] = pos[:, 0].numpy()            # x
-            frame_data[:, 1 ] = pos[:, 1].numpy()            # y
-            frame_data[:, 2 ] = pos[:, 2].numpy()            # z
-            frame_data[:, 3 ] = rot_norm[:, 0].numpy()       # rot_0 (w)
-            frame_data[:, 4 ] = rot_norm[:, 1].numpy()       # rot_1 (x)
-            frame_data[:, 5 ] = rot_norm[:, 2].numpy()       # rot_2 (y)
-            frame_data[:, 6 ] = rot_norm[:, 3].numpy()       # rot_3 (z)
-            frame_data[:, 7 ] = scaling[:, 0].numpy()        # scale_0 (log)
-            frame_data[:, 8 ] = scaling[:, 1].numpy()        # scale_1 (log)
-            frame_data[:, 9 ] = scaling[:, 2].numpy()        # scale_2 (log)
-            frame_data[:, 10] = opa_logit.detach().numpy()   # opacity (logit)
-            frame_data[:, 11] = dc[:, 0].detach().numpy()    # f_dc_0
-            frame_data[:, 12] = dc[:, 1].detach().numpy()    # f_dc_1
-            frame_data[:, 13] = dc[:, 2].detach().numpy()    # f_dc_2
+            # rotation is normalised inside pack_frame_aos; scales stay in log-space
+            frame_data = pack_frame_aos(pos, rotation, scaling, opa_logit, dc)
 
             fp.write(struct.pack('<f', timestamp))
             fp.write(frame_data.tobytes())
 
     print()
-    size_mb = os.path.getsize(out_path) / 1024 / 1024
-    print(f"Wrote {out_path}  ({size_mb:.1f} MB)")
+    report_output(out_path)
 
 
 # ---------------------------------------------------------------------------
