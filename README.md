@@ -288,6 +288,48 @@ torch  numpy  dahuffman  lzma  pickle
 
 Standard gzip compression (e.g. `gzip -k scene.omg4`) and serving with `Content-Encoding: gzip` typically halves the transfer size.
 
+### QUEEN Animated Format
+
+The `.queen` format stores animated 4D Gaussian Splat scenes produced by the [QUEEN](https://research.nvidia.com/labs/toronto-ai/queen/) training pipeline (NeurIPS 2024). Like `.omg4`, it contains pre-baked per-frame Gaussian attributes for browser playback without any GPU-side inference.
+
+QUEEN stores its compressed output as per-frame `.pkl` files in a directory structure such as:
+
+```
+<frames_dir>/
+  Frame0001/
+    compressed/
+      0001.pkl          ← entropy-coded latents (torchac)
+  Frame0002/
+    compressed/
+      0002.pkl          ← residuals relative to previous frame
+  ...
+```
+
+#### Converting a QUEEN checkpoint to `.queen`
+
+```bash
+python scripts/queen_pkl_to_queen.py \
+    --input  path/to/queen_frames_directory \
+    --output public/scene.queen \
+    --fps    30.0
+```
+
+Required Python packages:
+
+```
+torch  numpy  torchac  plyfile
+```
+
+(`torchac` and `plyfile` are soft dependencies – clear error messages are shown if either is absent and are only needed when processing entropy-coded PKL or PLY frames.)
+
+#### Shared conversion library
+
+Both `xz_to_omg4.py` and `queen_pkl_to_queen.py` import from `scripts/splat4d_io.py`, which provides:
+
+- `write_4dgs_header()` – writes the 28-byte binary file header
+- `pack_frame_aos()` – packs per-frame Gaussian attributes into the common AoS float32 layout
+- `read_ply_gaussians()` – loads Gaussian attributes from a standard 3DGS PLY file
+
 ### Device Selection for SOG Compression
 
 When compressing to SOG format, you can control which device (GPU or CPU) performs the compression:
