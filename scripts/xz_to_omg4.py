@@ -289,15 +289,45 @@ def quat_from_rotmat(R):
 # Main conversion
 # ---------------------------------------------------------------------------
 
+def main_cluster_mask(xyz, opacity_logit, cell_frac=0.03):
+    """Keep only the largest connected splat cluster (voxel 26-connectivity).
+
+    Removes isolated floater clusters (mask noise, stray props) that
+    reconstruct away from the subject. Cell size is cell_frac of the bbox
+    diagonal; clusters are ranked by opacity mass.
+    """
+    from scipy import ndimage
+    lo, hi = xyz.min(axis=0), xyz.max(axis=0)
+    diag = float(np.linalg.norm(hi - lo))
+    cell = max(diag * cell_frac, 1e-6)
+    ijk = np.floor((xyz - lo) / cell).astype(np.int64)
+    dims = ijk.max(axis=0) + 1
+    grid = np.zeros(dims, dtype=bool)
+    grid[ijk[:, 0], ijk[:, 1], ijk[:, 2]] = True
+    labels, n_lab = ndimage.label(grid, structure=np.ones((3, 3, 3)))
+    if n_lab <= 1:
+        return np.ones(len(xyz), dtype=bool)
+    splat_label = labels[ijk[:, 0], ijk[:, 1], ijk[:, 2]]
+    w = 1.0 / (1.0 + np.exp(-opacity_logit))
+    mass = np.bincount(splat_label, weights=w, minlength=n_lab + 1)
+    mass[0] = 0
+    keep = splat_label == mass.argmax()
+    print(f'  Main-cluster filter: kept {int(keep.sum()):,} / {len(xyz):,} splats '
+          f'({n_lab} clusters found)')
+    return keep
+
+
 def finish_export(out_path, time_min, time_max, fps, prune_threshold, cov2d_scale,
                   xyz, quat, log_scales, opacity_logit, f_dc, f_rest,
-                  velocity, t_center, t_sigma):
+                  velocity, t_center, t_sigma, keep_main_cluster=False):
     """Shared tail: prune, diagnostics, write the v2 file."""
     N = xyz.shape[0]
     dist = np.abs(t_center - np.clip(t_center, time_min, time_max))
     peak_weight = np.exp(-0.5 * (dist / np.maximum(t_sigma, 1e-9)) ** 2)
     peak_alpha = (1.0 / (1.0 + np.exp(-opacity_logit))) * peak_weight
     keep = peak_alpha >= prune_threshold
+    if keep_main_cluster:
+        keep &= main_cluster_mask(xyz, opacity_logit)
     kept = int(keep.sum())
     print(f"  Pruning: dropped {N - kept:,} / {N:,} Gaussians below alpha {prune_threshold:.5f} inside time range")
 
@@ -337,7 +367,7 @@ def finish_export(out_path, time_min, time_max, fps, prune_threshold, cov2d_scal
 
 
 def convert_ftgs(save_dict, out_path, time_min, time_max, fps, prune_threshold,
-                 include_sh=True, sh_clamp=1.5):
+                 include_sh=True, sh_clamp=1.5, keep_main_cluster=False):
     """FTGS-variant checkpoint (OMG4_FTGS): explicit velocity + temporal
     opacity, gsplat-trained (no FoV-sentinel bug -> no compensation), MLPs in
     tiny-cuda-nn layout with a 3-D (xyz-only) frequency-encoded input."""
@@ -374,19 +404,21 @@ def convert_ftgs(save_dict, out_path, time_min, time_max, fps, prune_threshold,
 
     finish_export(out_path, time_min, time_max, fps, prune_threshold, None,
                   means, quats, log_scales.astype(np.float32), opacity_logit,
-                  f_dc, f_rest, velocity, times, t_sigma)
+                  f_dc, f_rest, velocity, times, t_sigma,
+                  keep_main_cluster=keep_main_cluster)
 
 
 def convert(xz_path, out_path, time_min, time_max, fps, prune_threshold, include_sh=True,
             scale_boost=1.0, aniso_boost=None, aniso_camera_rotations=None,
-            cov2d_scale=None, sh_clamp=1.5):
+            cov2d_scale=None, sh_clamp=1.5, keep_main_cluster=False):
     print(f"Loading {xz_path} …")
     with lzma.open(xz_path, "rb") as f:
         save_dict = pickle.load(f)
 
     if 'means' in save_dict:
         convert_ftgs(save_dict, out_path, time_min, time_max, fps, prune_threshold,
-                     include_sh=include_sh, sh_clamp=sh_clamp)
+                     include_sh=include_sh, sh_clamp=sh_clamp,
+                     keep_main_cluster=keep_main_cluster)
         return
 
     xyz = to_numpy(save_dict['xyz'])                # [N,3]
@@ -476,7 +508,7 @@ def convert(xz_path, out_path, time_min, time_max, fps, prune_threshold, include
 
     finish_export(out_path, time_min, time_max, fps, prune_threshold, cov2d_scale,
                   xyz, quat, log_scales, opacity_logit, f_dc, f_rest,
-                  velocity, t_center, t_sigma)
+                  velocity, t_center, t_sigma, keep_main_cluster=keep_main_cluster)
 
 
 if __name__ == '__main__':
@@ -491,6 +523,9 @@ if __name__ == '__main__':
     parser.add_argument('--fps', type=float, default=30.0, help='Advisory fps for UI (default: 30)')
     parser.add_argument('--prune_threshold', type=float, default=1.0 / 1024,
                         help='Drop Gaussians whose peak alpha inside the time range is below this (default: 1/1024; 0 disables)')
+    parser.add_argument('--keep_main_cluster', action='store_true',
+                        help='Drop splats outside the largest connected cluster (removes isolated '
+                             'floater blobs; intended for masked single-subject captures)')
     parser.add_argument('--sh_clamp', type=float, default=1.5,
                         help='Attenuate higher SH bands per splat so total colour excursion stays below '
                              'this (colour units) from every direction; kills firework artifacts on '
@@ -536,4 +571,4 @@ if __name__ == '__main__':
     convert(args.input, args.output, args.time_min, args.time_max, args.fps,
             args.prune_threshold, include_sh=not args.no_sh, scale_boost=args.scale_boost,
             aniso_boost=aniso, aniso_camera_rotations=cam_rots, cov2d_scale=cov2d,
-            sh_clamp=args.sh_clamp)
+            sh_clamp=args.sh_clamp, keep_main_cluster=args.keep_main_cluster)
