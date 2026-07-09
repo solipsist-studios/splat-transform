@@ -373,12 +373,16 @@ if __name__ == '__main__':
                         help='Skip baking the 3-band view-dependent SH coefficients (smaller file, flatter shading)')
     parser.add_argument('--cov2d_scale', type=str, default=None,
                         help='"kx,ky": store a screen-space 2D-covariance scale in the header for the '
-                             'viewer to apply per view. The exact compensation for the OMG4 FoV-sentinel '
-                             'bug: use "1.6942,1.2707" for the N3V checkpoints, with no --scale_boost.')
+                             'viewer to apply per view. Reproduces the reference renderer exactly at '
+                             'training-like views but smears at oblique angles; for free-viewpoint '
+                             'viewing prefer --aniso_boost, which bakes the compensation statically '
+                             'along the training-rig axes.')
     parser.add_argument('--aniso_boost', type=str, default=None,
-                        help='"kx,ky": anisotropic scale compensation along the average training-camera '
+                        help='"kx,ky": anisotropic scale compensation baked along the average training-camera '
                              'x/y axes (requires --cameras_json). For OMG4 N3V checkpoints use "1.6942,1.2707". '
-                             'More faithful than --scale_boost for frontal-rig captures.')
+                             'RECOMMENDED for free-viewpoint viewing of FoV-sentinel-trained checkpoints: '
+                             'it un-squashes the world-frame anisotropy the bug baked into the model, '
+                             'so quality holds up at oblique angles (unlike --cov2d_scale).')
     parser.add_argument('--cameras_json', type=str, default=None,
                         help='cameras.json from the training output dir (provides camera orientations for --aniso_boost)')
     parser.add_argument('--scale_boost', type=float, default=1.0,
