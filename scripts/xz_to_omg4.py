@@ -161,6 +161,35 @@ def contract_to_unisphere(x):
     return x / 4 + 0.5
 
 
+def clamp_sh_overshoot(f_dc, f_rest, sh_clamp):
+    """Scale down each splat's higher SH bands so its colour stays bounded
+    from every view direction.
+
+    Splats observed from a narrow cone of training views can have SH
+    coefficients that explode when evaluated from novel directions
+    (saturated 'firework' spikes). A conservative bound on the band
+    contribution is sum(|c_lm| * max|Y_lm|); per splat, if
+    base + bound exceeds sh_clamp (in colour units), the f_rest coefficients
+    are scaled so it does not. sh_clamp <= 0 disables.
+    """
+    if f_rest is None or sh_clamp <= 0:
+        return f_rest
+    # max |Y_lm| over the sphere for bands 1..3 (l=1: 0.489, l=2: up to 0.630, l=3: up to 0.746)
+    y_max = np.array([0.489, 0.489, 0.489,
+                      0.546, 0.546, 0.630, 0.546, 0.546,
+                      0.590, 0.590, 0.457, 0.746, 0.457, 0.590, 0.590], dtype=np.float32)
+    SH_C0 = 0.28209479177387814
+    base = np.abs(f_dc * SH_C0 + 0.5)                                  # [N,3]
+    bound = (np.abs(f_rest) * y_max[None, :, None]).sum(axis=1)        # [N,3]
+    excess = (base + bound).max(axis=1)                                # [N]
+    scale = np.minimum(1.0, np.maximum(sh_clamp - base.max(axis=1), 0.0) /
+                       np.maximum(bound.max(axis=1), 1e-9))
+    clamped = int((scale < 1.0).sum())
+    print(f'  SH overshoot clamp: attenuated {clamped:,} / {len(scale):,} splats '
+          f'(max total excursion was {excess.max():.2f})')
+    return f_rest * scale[:, None, None]
+
+
 # ---------------------------------------------------------------------------
 # 4D rotor / covariance math (mirrors utils/general_utils.py)
 # ---------------------------------------------------------------------------
@@ -222,7 +251,7 @@ def quat_from_rotmat(R):
 
 def convert(xz_path, out_path, time_min, time_max, fps, prune_threshold, include_sh=True,
             scale_boost=1.0, aniso_boost=None, aniso_camera_rotations=None,
-            cov2d_scale=None):
+            cov2d_scale=None, sh_clamp=1.5):
     print(f"Loading {xz_path} …")
     with lzma.open(xz_path, "rb") as f:
         save_dict = pickle.load(f)
@@ -310,6 +339,7 @@ def convert(xz_path, out_path, time_min, time_max, fps, prune_threshold, include
         f_dc = f_dc + view_sh[:, 15, :] + view_sh[:, 31, :]
         # eff[k] for k=1..15: view indices k-1, k+15, k+31
         f_rest = (view_sh[:, 0:15, :] + view_sh[:, 16:31, :] + view_sh[:, 32:47, :])  # [N,15,3]
+        f_rest = clamp_sh_overshoot(f_dc, f_rest, sh_clamp)
 
     # ── Prune Gaussians that can never contribute inside the time range ─────
     # Peak temporal weight over [time_min, time_max]:
@@ -369,6 +399,10 @@ if __name__ == '__main__':
     parser.add_argument('--fps', type=float, default=30.0, help='Advisory fps for UI (default: 30)')
     parser.add_argument('--prune_threshold', type=float, default=1.0 / 1024,
                         help='Drop Gaussians whose peak alpha inside the time range is below this (default: 1/1024; 0 disables)')
+    parser.add_argument('--sh_clamp', type=float, default=1.5,
+                        help='Attenuate higher SH bands per splat so total colour excursion stays below '
+                             'this (colour units) from every direction; kills firework artifacts on '
+                             'under-observed splats (default: 1.5; 0 disables)')
     parser.add_argument('--no_sh', action='store_true',
                         help='Skip baking the 3-band view-dependent SH coefficients (smaller file, flatter shading)')
     parser.add_argument('--cov2d_scale', type=str, default=None,
@@ -409,4 +443,5 @@ if __name__ == '__main__':
 
     convert(args.input, args.output, args.time_min, args.time_max, args.fps,
             args.prune_threshold, include_sh=not args.no_sh, scale_boost=args.scale_boost,
-            aniso_boost=aniso, aniso_camera_rotations=cam_rots, cov2d_scale=cov2d)
+            aniso_boost=aniso, aniso_camera_rotations=cam_rots, cov2d_scale=cov2d,
+            sh_clamp=args.sh_clamp)
