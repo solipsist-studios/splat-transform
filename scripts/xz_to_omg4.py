@@ -161,6 +161,46 @@ def contract_to_unisphere(x):
     return x / 4 + 0.5
 
 
+# ---------------------------------------------------------------------------
+# tiny-cuda-nn MLP forward (used by the FTGS variant checkpoints).
+# FullyFusedMLP: no biases, dims padded to multiples of 16, params are
+#   W0 [n_hidden, in_padded] | W1 [out_padded, n_hidden]   (row-major f16)
+# Frequency encoding order per input dim d: [sin(2^0 pi x_d), cos(2^0 pi x_d),
+# sin(2^1 pi x_d), ...]. Hidden LeakyReLU slope is tcnn's 0.01.
+# ---------------------------------------------------------------------------
+
+def _pad16(n):
+    return ((n + 15) // 16) * 16
+
+
+def tcnn_mlp_forward(params_f16, x, n_hidden, n_out, hidden_activation):
+    p = np.asarray(params_f16, dtype=np.float32)
+    n_in = x.shape[1]
+    inp, outp = _pad16(n_in), _pad16(n_out)
+    expected = n_hidden * inp + outp * n_hidden
+    if p.size != expected:
+        raise ValueError(f'tcnn MLP param count mismatch: got {p.size}, expected {expected}')
+    w0 = p[:n_hidden * inp].reshape(n_hidden, inp)[:, :n_in]
+    w1 = p[n_hidden * inp:].reshape(outp, n_hidden)[:n_out]
+    h = x @ w0.T
+    if hidden_activation == 'relu':
+        h = np.maximum(h, 0.0)
+    else:
+        h = np.where(h >= 0.0, h, 0.01 * h)
+    return h @ w1.T
+
+
+def tcnn_frequency_encode(x, n_frequencies=16):
+    N, D = x.shape
+    out = np.empty((N, D * 2 * n_frequencies), dtype=np.float32)
+    for d in range(D):
+        for f in range(n_frequencies):
+            a = x[:, d] * (2.0 ** f) * np.pi
+            out[:, d * 2 * n_frequencies + 2 * f] = np.sin(a)
+            out[:, d * 2 * n_frequencies + 2 * f + 1] = np.cos(a)
+    return out
+
+
 def clamp_sh_overshoot(f_dc, f_rest, sh_clamp):
     """Scale down each splat's higher SH bands so its colour stays bounded
     from every view direction.
@@ -249,12 +289,105 @@ def quat_from_rotmat(R):
 # Main conversion
 # ---------------------------------------------------------------------------
 
+def finish_export(out_path, time_min, time_max, fps, prune_threshold, cov2d_scale,
+                  xyz, quat, log_scales, opacity_logit, f_dc, f_rest,
+                  velocity, t_center, t_sigma):
+    """Shared tail: prune, diagnostics, write the v2 file."""
+    N = xyz.shape[0]
+    dist = np.abs(t_center - np.clip(t_center, time_min, time_max))
+    peak_weight = np.exp(-0.5 * (dist / np.maximum(t_sigma, 1e-9)) ** 2)
+    peak_alpha = (1.0 / (1.0 + np.exp(-opacity_logit))) * peak_weight
+    keep = peak_alpha >= prune_threshold
+    kept = int(keep.sum())
+    print(f"  Pruning: dropped {N - kept:,} / {N:,} Gaussians below alpha {prune_threshold:.5f} inside time range")
+
+    arrays = [
+        xyz[:, 0], xyz[:, 1], xyz[:, 2],
+        quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3],
+        log_scales[:, 0], log_scales[:, 1], log_scales[:, 2],
+        opacity_logit,
+        f_dc[:, 0], f_dc[:, 1], f_dc[:, 2],
+        velocity[:, 0], velocity[:, 1], velocity[:, 2],
+        t_center,
+        t_sigma
+    ]
+    if f_rest is not None:
+        # PLY channel-major order: f_rest_{ch*15 + k} = eff_rest[k][channel ch]
+        for ch in range(3):
+            for k in range(15):
+                arrays.append(f_rest[:, k, ch])
+    arrays = [np.ascontiguousarray(a[keep], dtype=np.float32) for a in arrays]
+
+    for t in np.linspace(time_min, time_max, 5):
+        w = np.exp(-0.5 * ((t_center[keep] - t) / np.maximum(t_sigma[keep], 1e-9)) ** 2)
+        alpha = (1.0 / (1.0 + np.exp(-opacity_logit[keep]))) * w
+        print(f"    t={t:6.2f}s  active(alpha>1/255): {(alpha > 1 / 255).mean() * 100:5.1f}%")
+    vmag = np.linalg.norm(velocity[keep], axis=1)
+    print(f"    |velocity| p50/p95/p99: {np.percentile(vmag, [50, 95, 99]).round(4)}")
+    print(f"    t_sigma    p50/p95    : {np.percentile(t_sigma[keep], [50, 95]).round(3)}")
+
+    flags = 1 if f_rest is not None else 0
+    with open(out_path, 'wb') as fp:
+        write_omg4_v2_header(fp, OMG4_MAGIC, kept, time_min, time_max, fps, flags,
+                             cov2d_scale=cov2d_scale)
+        for a in arrays:
+            fp.write(a.tobytes())
+
+    report_output(out_path)
+
+
+def convert_ftgs(save_dict, out_path, time_min, time_max, fps, prune_threshold,
+                 include_sh=True, sh_clamp=1.5):
+    """FTGS-variant checkpoint (OMG4_FTGS): explicit velocity + temporal
+    opacity, gsplat-trained (no FoV-sentinel bug -> no compensation), MLPs in
+    tiny-cuda-nn layout with a 3-D (xyz-only) frequency-encoded input."""
+    means = np.asarray(save_dict['means'], dtype=np.float32)          # [N,3]
+    times = np.asarray(save_dict['times'], dtype=np.float32).reshape(-1)  # [N]
+    N = means.shape[0]
+    print(f"  FTGS checkpoint: {N:,} Gaussians | time range [{time_min}, {time_max}] s")
+
+    log_scales = decode_all_layers(save_dict['scale_code'], save_dict['scale_index'], save_dict['scale_htable'], N)      # [N,3] log
+    quats = decode_all_layers(save_dict['rotation_code'], save_dict['rotation_index'], save_dict['rotation_htable'], N)  # [N,4] (w,x,y,z)
+    durations = decode_all_layers(save_dict['durations_code'], save_dict['durations_index'], save_dict['durations_htable'], N).reshape(-1)  # log
+    velocity = decode_all_layers(save_dict['velocities_code'], save_dict['velocities_index'], save_dict['velocities_htable'], N)  # [N,3]
+    appearance = decode_all_layers(save_dict['app_code'], save_dict['app_index'], save_dict['app_htable'], N)            # [N,6]
+    t_sigma = np.exp(durations).astype(np.float32)
+    # normalise quats; renderer expects w-first which matches gsplat's storage
+    quats = quats / np.maximum(np.linalg.norm(quats, axis=1, keepdims=True), 1e-9)
+
+    print("  Evaluating appearance MLPs (tcnn layout) …")
+    xyz_c = contract_to_unisphere(means.astype(np.float64)).astype(np.float32)
+    encoded = tcnn_frequency_encode(xyz_c)                                       # [N,96]
+    cont_feat = tcnn_mlp_forward(save_dict['MLP_cont'], encoded, 64, 13, 'relu')  # [N,13]
+    space_feat = np.concatenate([cont_feat, appearance[:, 0:3]], axis=1)          # [N,16]
+    f_dc = tcnn_mlp_forward(save_dict['MLP_dc'], space_feat, 64, 3, 'leaky')      # [N,3]
+    opacity_logit = tcnn_mlp_forward(save_dict['MLP_opacity'], space_feat, 64, 1, 'leaky')[:, 0]
+
+    f_rest = None
+    if include_sh:
+        view_feat = np.concatenate([cont_feat, appearance[:, 3:6]], axis=1)
+        view_sh = tcnn_mlp_forward(save_dict['MLP_sh'], view_feat, 64, 141, 'leaky').reshape(-1, 47, 3)
+        # gsplat consumes the first (deg+1)^2 = 16 coefficients of [dc, view]:
+        # dc is coeff 0, view[0:15] are the deg 1..3 spatial coefficients.
+        f_rest = view_sh[:, 0:15, :].copy()
+        f_rest = clamp_sh_overshoot(f_dc, f_rest, sh_clamp)
+
+    finish_export(out_path, time_min, time_max, fps, prune_threshold, None,
+                  means, quats, log_scales.astype(np.float32), opacity_logit,
+                  f_dc, f_rest, velocity, times, t_sigma)
+
+
 def convert(xz_path, out_path, time_min, time_max, fps, prune_threshold, include_sh=True,
             scale_boost=1.0, aniso_boost=None, aniso_camera_rotations=None,
             cov2d_scale=None, sh_clamp=1.5):
     print(f"Loading {xz_path} …")
     with lzma.open(xz_path, "rb") as f:
         save_dict = pickle.load(f)
+
+    if 'means' in save_dict:
+        convert_ftgs(save_dict, out_path, time_min, time_max, fps, prune_threshold,
+                     include_sh=include_sh, sh_clamp=sh_clamp)
+        return
 
     xyz = to_numpy(save_dict['xyz'])                # [N,3]
     t_center = to_numpy(save_dict['t'])[:, 0]       # [N]
@@ -341,50 +474,9 @@ def convert(xz_path, out_path, time_min, time_max, fps, prune_threshold, include
         f_rest = (view_sh[:, 0:15, :] + view_sh[:, 16:31, :] + view_sh[:, 32:47, :])  # [N,15,3]
         f_rest = clamp_sh_overshoot(f_dc, f_rest, sh_clamp)
 
-    # ── Prune Gaussians that can never contribute inside the time range ─────
-    # Peak temporal weight over [time_min, time_max]:
-    dist = np.abs(t_center - np.clip(t_center, time_min, time_max))
-    peak_weight = np.exp(-0.5 * (dist / np.maximum(t_sigma, 1e-9)) ** 2)
-    peak_alpha = (1.0 / (1.0 + np.exp(-opacity_logit))) * peak_weight
-    keep = peak_alpha >= prune_threshold
-    kept = int(keep.sum())
-    print(f"  Pruning: dropped {N - kept:,} / {N:,} Gaussians below alpha {prune_threshold:.5f} inside time range")
-
-    arrays = [
-        xyz[:, 0], xyz[:, 1], xyz[:, 2],
-        quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3],
-        log_scales[:, 0], log_scales[:, 1], log_scales[:, 2],
-        opacity_logit,
-        f_dc[:, 0], f_dc[:, 1], f_dc[:, 2],
-        velocity[:, 0], velocity[:, 1], velocity[:, 2],
-        t_center,
-        t_sigma
-    ]
-    if f_rest is not None:
-        # PLY channel-major order: f_rest_{ch*15 + k} = eff_rest[k][channel ch]
-        for ch in range(3):
-            for k in range(15):
-                arrays.append(f_rest[:, k, ch])
-    arrays = [np.ascontiguousarray(a[keep], dtype=np.float32) for a in arrays]
-
-    # ── Diagnostics ─────────────────────────────────────────────────────────
-    for t in np.linspace(time_min, time_max, 5):
-        w = np.exp(-0.5 * ((t_center[keep] - t) / np.maximum(t_sigma[keep], 1e-9)) ** 2)
-        alpha = (1.0 / (1.0 + np.exp(-opacity_logit[keep]))) * w
-        print(f"    t={t:6.2f}s  active(alpha>1/255): {(alpha > 1 / 255).mean() * 100:5.1f}%")
-    vmag = np.linalg.norm(velocity[keep], axis=1)
-    print(f"    |velocity| p50/p95/p99: {np.percentile(vmag, [50, 95, 99]).round(4)}")
-    print(f"    t_sigma    p50/p95    : {np.percentile(t_sigma[keep], [50, 95]).round(3)}")
-
-    # ── Write ───────────────────────────────────────────────────────────────
-    flags = 1 if f_rest is not None else 0
-    with open(out_path, 'wb') as fp:
-        write_omg4_v2_header(fp, OMG4_MAGIC, kept, time_min, time_max, fps, flags,
-                             cov2d_scale=cov2d_scale)
-        for a in arrays:
-            fp.write(a.tobytes())
-
-    report_output(out_path)
+    finish_export(out_path, time_min, time_max, fps, prune_threshold, cov2d_scale,
+                  xyz, quat, log_scales, opacity_logit, f_dc, f_rest,
+                  velocity, t_center, t_sigma)
 
 
 if __name__ == '__main__':

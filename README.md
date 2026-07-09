@@ -474,6 +474,10 @@ torch  numpy  dahuffman
 
 Standard gzip compression (e.g. `gzip -k scene.omg4`) and serving with `Content-Encoding: gzip` reduces the transfer size further. The full binary layout is documented in `scripts/splat4d_io.py`.
 
+#### FTGS-variant checkpoints (recommended source)
+
+The converter auto-detects OMG4_FTGS checkpoints (keys `means/times/durations/velocities`, tiny-cuda-nn MLPs). These are trained with gsplat, carry no FoV-sentinel bug, need **no compensation flags**, and give markedly higher quality than the 4D-rotor checkpoints. Note their world frame is raw LLFF (y-down): view with `?omg4rot=180,0,0`.
+
 ### QUEEN Animated Format
 
 The `.queen` format stores animated 4D Gaussian Splat scenes produced by the [QUEEN](https://research.nvidia.com/labs/toronto-ai/queen/) training pipeline (NeurIPS 2024). Like `.omg4`, it contains pre-baked per-frame Gaussian attributes for browser playback without any GPU-side inference.
