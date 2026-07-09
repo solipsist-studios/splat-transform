@@ -220,7 +220,8 @@ def quat_from_rotmat(R):
 # Main conversion
 # ---------------------------------------------------------------------------
 
-def convert(xz_path, out_path, time_min, time_max, fps, prune_threshold, include_sh=True):
+def convert(xz_path, out_path, time_min, time_max, fps, prune_threshold, include_sh=True,
+            scale_boost=1.0):
     print(f"Loading {xz_path} …")
     with lzma.open(xz_path, "rb") as f:
         save_dict = pickle.load(f)
@@ -260,7 +261,7 @@ def convert(xz_path, out_path, time_min, time_max, fps, prune_threshold, include
     neg = np.linalg.det(eigvec) < 0
     eigvec[neg, :, 2] *= -1
     quat = quat_from_rotmat(eigvec)                                            # (w,x,y,z)
-    log_scales = (0.5 * np.log(eigval)).astype(np.float32)                     # log(sqrt(eig))
+    log_scales = (0.5 * np.log(eigval) + math.log(max(scale_boost, 1e-6))).astype(np.float32)
 
     # ── MLP appearance at each Gaussian's own temporal centre ───────────────
     print("  Evaluating appearance MLPs …")
@@ -354,7 +355,16 @@ if __name__ == '__main__':
                         help='Drop Gaussians whose peak alpha inside the time range is below this (default: 1/1024; 0 disables)')
     parser.add_argument('--no_sh', action='store_true',
                         help='Skip baking the 3-band view-dependent SH coefficients (smaller file, flatter shading)')
+    parser.add_argument('--scale_boost', type=float, default=1.0,
+                        help='Multiply all splat scales by this factor. The OMG4 repo trains its 4D-rotor '
+                             'models with a camera bug: dataset cameras carry a FoV=-1 sentinel, so the '
+                             'rasterizer computes its EWA Jacobian from tan(-0.5) instead of the real focal, '
+                             'inflating every splat footprint by W/(2*tan(0.5)*fl_x) horizontally and '
+                             'H/(2*tan(0.5)*fl_y) vertically during training. Models fit under that inflation '
+                             'look thin/streaky in a geometrically correct renderer. For the N3V/dynerf '
+                             'checkpoints use sqrt(1.6942*1.2707) = 1.4672. Models trained with a fixed '
+                             'camera (or the FTGS/gsplat variant) need the default 1.0.')
     args = parser.parse_args()
 
     convert(args.input, args.output, args.time_min, args.time_max, args.fps,
-            args.prune_threshold, include_sh=not args.no_sh)
+            args.prune_threshold, include_sh=not args.no_sh, scale_boost=args.scale_boost)
