@@ -221,7 +221,8 @@ def quat_from_rotmat(R):
 # ---------------------------------------------------------------------------
 
 def convert(xz_path, out_path, time_min, time_max, fps, prune_threshold, include_sh=True,
-            scale_boost=1.0):
+            scale_boost=1.0, aniso_boost=None, aniso_camera_rotations=None,
+            cov2d_scale=None):
     print(f"Loading {xz_path} …")
     with lzma.open(xz_path, "rb") as f:
         save_dict = pickle.load(f)
@@ -253,6 +254,20 @@ def convert(xz_path, out_path, time_min, time_max, fps, prune_threshold, include
     velocity = (S12 / Stt[:, None]).astype(np.float32)                         # units/sec
     t_sigma = np.sqrt(Stt).astype(np.float32)
     Sigma3D = S11 - np.einsum('ni,nj->nij', S12, S12) / Stt[:, None, None]
+
+    # Anisotropic compensation for the FoV-sentinel training bug: inflate each
+    # splat's covariance by (kx, ky) along the average training-camera x/y axes
+    # (a good approximation when the rig's cameras share one orientation, as in
+    # N3V). Exact per-view compensation would be screen-space; this bakes the
+    # dominant effect into world space so any renderer benefits.
+    if aniso_boost is not None:
+        kx, ky = aniso_boost
+        cam_rots = np.array(aniso_camera_rotations)                      # [C,3,3] C2W
+        # average camera basis via SVD orthonormalisation of the mean rotation
+        u, _, vt = np.linalg.svd(cam_rots.mean(axis=0))
+        R_avg = u @ vt
+        M = R_avg @ np.diag([kx, ky, 1.0]) @ R_avg.T
+        Sigma3D = np.einsum('ij,njk,lk->nil', M, Sigma3D, M)
 
     # Eigendecompose the sliced covariance -> principal axes + scales
     eigval, eigvec = np.linalg.eigh(Sigma3D)                                   # ascending
@@ -334,7 +349,8 @@ def convert(xz_path, out_path, time_min, time_max, fps, prune_threshold, include
     # ── Write ───────────────────────────────────────────────────────────────
     flags = 1 if f_rest is not None else 0
     with open(out_path, 'wb') as fp:
-        write_omg4_v2_header(fp, OMG4_MAGIC, kept, time_min, time_max, fps, flags)
+        write_omg4_v2_header(fp, OMG4_MAGIC, kept, time_min, time_max, fps, flags,
+                             cov2d_scale=cov2d_scale)
         for a in arrays:
             fp.write(a.tobytes())
 
@@ -355,6 +371,16 @@ if __name__ == '__main__':
                         help='Drop Gaussians whose peak alpha inside the time range is below this (default: 1/1024; 0 disables)')
     parser.add_argument('--no_sh', action='store_true',
                         help='Skip baking the 3-band view-dependent SH coefficients (smaller file, flatter shading)')
+    parser.add_argument('--cov2d_scale', type=str, default=None,
+                        help='"kx,ky": store a screen-space 2D-covariance scale in the header for the '
+                             'viewer to apply per view. The exact compensation for the OMG4 FoV-sentinel '
+                             'bug: use "1.6942,1.2707" for the N3V checkpoints, with no --scale_boost.')
+    parser.add_argument('--aniso_boost', type=str, default=None,
+                        help='"kx,ky": anisotropic scale compensation along the average training-camera '
+                             'x/y axes (requires --cameras_json). For OMG4 N3V checkpoints use "1.6942,1.2707". '
+                             'More faithful than --scale_boost for frontal-rig captures.')
+    parser.add_argument('--cameras_json', type=str, default=None,
+                        help='cameras.json from the training output dir (provides camera orientations for --aniso_boost)')
     parser.add_argument('--scale_boost', type=float, default=1.0,
                         help='Multiply all splat scales by this factor. The OMG4 repo trains its 4D-rotor '
                              'models with a camera bug: dataset cameras carry a FoV=-1 sentinel, so the '
@@ -366,5 +392,17 @@ if __name__ == '__main__':
                              'camera (or the FTGS/gsplat variant) need the default 1.0.')
     args = parser.parse_args()
 
+    aniso = None
+    cam_rots = None
+    if args.aniso_boost:
+        import json as _json
+        aniso = tuple(float(v) for v in args.aniso_boost.split(','))
+        if not args.cameras_json:
+            sys.exit('--aniso_boost requires --cameras_json')
+        cam_rots = [c['rotation'] for c in _json.load(open(args.cameras_json))[:64]]
+
+    cov2d = tuple(float(v) for v in args.cov2d_scale.split(',')) if args.cov2d_scale else None
+
     convert(args.input, args.output, args.time_min, args.time_max, args.fps,
-            args.prune_threshold, include_sh=not args.no_sh, scale_boost=args.scale_boost)
+            args.prune_threshold, include_sh=not args.no_sh, scale_boost=args.scale_boost,
+            aniso_boost=aniso, aniso_camera_rotations=cam_rots, cov2d_scale=cov2d)

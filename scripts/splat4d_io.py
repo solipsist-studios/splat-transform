@@ -135,25 +135,36 @@ def write_omg4_v2_header(
     time_max: float,
     fps: float,
     flags: int = 0,
+    cov2d_scale=None,
 ) -> None:
     """Write the 32-byte header for a version-2 .omg4 file.
 
     Parameters
     ----------
-    fp         : Writable binary file object.
-    magic      : Format magic number (OMG4_MAGIC).
-    num_splats : Total number of Gaussians (N).
-    time_min   : Clip start time (seconds).
-    time_max   : Clip end time (seconds).
-    fps        : Advisory frames per second (UI only).
-    flags      : Reserved bitfield (must be 0 for now).
+    fp          : Writable binary file object.
+    magic       : Format magic number (OMG4_MAGIC).
+    num_splats  : Total number of Gaussians (N).
+    time_min    : Clip start time (seconds).
+    time_max    : Clip end time (seconds).
+    fps         : Advisory frames per second (UI only).
+    flags       : Bitfield (bit 0: SH arrays present; bit 1: cov2d_scale set).
+    cov2d_scale : Optional (kx, ky) screen-space 2D-covariance scale the
+                  viewer must apply (packed as 2 x float16 in the reserved
+                  word). Compensates renderers whose training inflated splat
+                  footprints in screen space (OMG4's FoV-sentinel bug).
     """
+    reserved = 0
+    if cov2d_scale is not None:
+        kx, ky = cov2d_scale
+        h = np.array([kx, ky], dtype=np.float16).view(np.uint16)
+        reserved = int(h[0]) | (int(h[1]) << 16)
+        flags |= 2
     fp.write(struct.pack(
         '<IIIIfffI',
         magic, OMG4_V2_VERSION,
         num_splats, flags,
         time_min, time_max, fps,
-        0,
+        reserved,
     ))
 
 
