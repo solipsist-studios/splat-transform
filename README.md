@@ -435,7 +435,14 @@ splat-transform input.ply view.webp \
 
 ### OMG4 Animated Format
 
-The `.omg4` format stores animated 4D Gaussian Splat scenes produced by the [OMG4](https://github.com/MinShirley/OMG4) training pipeline. It contains pre-baked per-frame Gaussian attributes (position, rotation, scale, opacity, colour) so the browser can play back a 4DGS animation at runtime without GPU-side MLP inference.
+The `.omg4` format (version 2) stores animated 4D Gaussian Splat scenes produced by the [OMG4](https://github.com/MinShirley/OMG4) training pipeline. Each Gaussian is stored once with its temporal parameters — linear velocity, temporal centre and temporal std-dev derived by slicing OMG4's 4D space-time covariance — and the viewer evaluates motion and temporal fade on the GPU:
+
+```
+position(t) = position + velocity * (t - t_center)
+alpha(t)    = sigmoid(opacity) * exp(-0.5 * ((t - t_center) / t_sigma)^2)
+```
+
+Colour (SH DC plus optional 3-band view-dependent SH) and peak opacity are baked from OMG4's appearance MLPs at each Gaussian's own temporal centre. Playback is continuous in time; file size is independent of clip duration.
 
 #### Converting an OMG4 checkpoint to `.omg4`
 
@@ -445,27 +452,27 @@ Run the provided converter on the machine where you trained the model (requires 
 python scripts/xz_to_omg4.py \
     --input  output/my_scene/comp.xz \
     --output public/scene.omg4 \
-    --frames 30 \
-    --fps    24 \
-    --time_min -0.5 \
-    --time_max  0.5
+    --time_min 0.0 \
+    --time_max 10.0 \
+    --fps 30
 ```
+
+`--time_min` / `--time_max` **must match the `time_duration` the model was trained with** (`configs/dynerf/*.yaml` in the OMG4 repo, `[0.0, 10.0]` for the Neural 3D Video scenes): the stored temporal centres are in those units and the appearance MLPs normalise time against that range. Pass `--no_sh` to skip the 45 view-dependent SH coefficients (about 3.4x smaller, flatter shading), and `--prune_threshold` to control removal of Gaussians that never become visible inside the time range.
 
 The converter requires the OMG4 Python environment:
 
 ```
-torch  numpy  dahuffman  lzma  pickle
+torch  numpy  dahuffman
 ```
 
 #### File-size guidance
 
-| Gaussians (N) | Frames (F) | Approx. file size |
-|---------------|------------|-------------------|
-| 50 000        | 30         | ~42 MB            |
-| 100 000       | 30         | ~84 MB            |
-| 100 000       | 50         | ~140 MB           |
+| Gaussians (N) | Without SH | With 3-band SH |
+|---------------|------------|----------------|
+| 100 000       | ~7.6 MB    | ~26 MB         |
+| 150 000       | ~11 MB     | ~38 MB         |
 
-Standard gzip compression (e.g. `gzip -k scene.omg4`) and serving with `Content-Encoding: gzip` typically halves the transfer size.
+Standard gzip compression (e.g. `gzip -k scene.omg4`) and serving with `Content-Encoding: gzip` reduces the transfer size further. The full binary layout is documented in `scripts/splat4d_io.py`.
 
 ### QUEEN Animated Format
 

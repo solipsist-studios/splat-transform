@@ -8,8 +8,8 @@ This module provides:
   - pack_frame_aos()     – pack per-frame Gaussian attributes into AoS layout
   - read_ply_gaussians() – load Gaussian attributes from a plain PLY file
 
-Both the .omg4 and .queen formats share the same on-disk layout, differing
-only in their magic number and intended source model:
+Version 1 (baked per-frame; .omg4 and .queen share the layout, differing
+only in their magic number and intended source model):
 
     Header (28 bytes, all values little-endian):
         uint32  magic            – format identifier (OMG4_MAGIC or QUEEN_MAGIC)
@@ -27,6 +27,39 @@ only in their magic number and intended source model:
             scale_0  scale_1  scale_2   (log-space)
             opacity                      (logit-space)
             f_dc_0  f_dc_1  f_dc_2      (raw SH DC coefficients)
+
+Version 2 (.omg4 only – compact temporal splats, no per-frame data; the
+viewer evaluates linear motion and Gaussian temporal opacity on the GPU):
+
+    Header (32 bytes, all values little-endian):
+        uint32  magic = OMG4_MAGIC
+        uint32  version = 2
+        uint32  numSplats (N)
+        uint32  flags = 0            – reserved for future use
+        float32 timeMin              – clip start time (seconds)
+        float32 timeMax              – clip end time (seconds)
+        float32 fps                  – advisory only (UI frame count)
+        uint32  reserved = 0
+
+    Data: 19 SoA float32[N] arrays, in this order:
+        x  y  z                      – position at t = t_center
+        rot_0(w) rot_1(x) rot_2(y) rot_3(z)
+                                     – quaternion of the sliced 3D covariance
+        scale_0  scale_1  scale_2    – log-space sqrt eigenvalues of sliced cov
+        opacity                      – logit-space peak opacity
+        f_dc_0  f_dc_1  f_dc_2       – raw SH DC coefficients
+        vx  vy  vz                   – linear velocity (scene units / second)
+        t_center                     – temporal centre (seconds)
+        t_sigma                      – temporal std-dev (seconds)
+
+    If flags bit 0 is set, 45 further float32[N] SoA arrays follow:
+        f_rest_0 .. f_rest_44        – 3-band spherical harmonics, PLY
+                                       channel-major order, baked at each
+                                       splat's temporal centre
+
+    Reconstruction at time t:
+        position(t) = (x,y,z) + (vx,vy,vz) * (t - t_center)
+        alpha(t)    = sigmoid(opacity) * exp(-0.5 * ((t - t_center)/t_sigma)^2)
 """
 
 import os
@@ -44,6 +77,19 @@ import torch
 OMG4_MAGIC  = 0x34474D4F   # "OMG4" in little-endian ASCII bytes
 QUEEN_MAGIC = 0x4E455551   # "QUEN" in little-endian ASCII bytes
 FORMAT_VERSION = 1
+OMG4_V2_VERSION = 2
+
+# Version 2 SoA field order (each is a float32[N] array)
+OMG4_V2_FIELDS = [
+    'x', 'y', 'z',
+    'rot_0', 'rot_1', 'rot_2', 'rot_3',
+    'scale_0', 'scale_1', 'scale_2',
+    'opacity',
+    'f_dc_0', 'f_dc_1', 'f_dc_2',
+    'vx', 'vy', 'vz',
+    't_center',
+    't_sigma',
+]
 
 FLOATS_PER_SPLAT = 14      # x y z w(rot) x(rot) y(rot) z(rot) s0 s1 s2 op dc0 dc1 dc2
 
@@ -78,6 +124,36 @@ def write_4dgs_header(
         num_splats, num_frames,
         fps,
         time_min, time_max,
+    ))
+
+
+def write_omg4_v2_header(
+    fp: BinaryIO,
+    magic: int,
+    num_splats: int,
+    time_min: float,
+    time_max: float,
+    fps: float,
+    flags: int = 0,
+) -> None:
+    """Write the 32-byte header for a version-2 .omg4 file.
+
+    Parameters
+    ----------
+    fp         : Writable binary file object.
+    magic      : Format magic number (OMG4_MAGIC).
+    num_splats : Total number of Gaussians (N).
+    time_min   : Clip start time (seconds).
+    time_max   : Clip end time (seconds).
+    fps        : Advisory frames per second (UI only).
+    flags      : Reserved bitfield (must be 0 for now).
+    """
+    fp.write(struct.pack(
+        '<IIIIfffI',
+        magic, OMG4_V2_VERSION,
+        num_splats, flags,
+        time_min, time_max, fps,
+        0,
     ))
 
 
