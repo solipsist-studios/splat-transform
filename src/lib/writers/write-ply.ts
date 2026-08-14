@@ -1,5 +1,10 @@
+import { basename } from 'pathe';
+
+import { logWrittenFile } from './utils';
+import { convertToSpace } from '../data-table';
 import { type FileSystem } from '../io/write';
-import { PlyData } from '../readers/read-ply';
+import { PlyData } from '../readers';
+import { logger, Transform } from '../utils';
 
 const columnTypeToPlyType = (type: string): string => {
     switch (type) {
@@ -30,7 +35,14 @@ type WritePlyOptions = {
  * @ignore
  */
 const writePly = async (options: WritePlyOptions, fs: FileSystem) => {
-    const { filename, plyData } = options;
+    const { filename } = options;
+    const plyData: PlyData = {
+        ...options.plyData,
+        elements: options.plyData.elements.map(e => ({
+            ...e,
+            dataTable: convertToSpace(e.dataTable, Transform.PLY)
+        }))
+    };
 
     const header = [
         'ply',
@@ -46,6 +58,8 @@ const writePly = async (options: WritePlyOptions, fs: FileSystem) => {
         }),
         'end_header'
     ];
+
+    const writingGroup = logger.group('Writing');
 
     // write the header
     const writer = await fs.createWriter(filename);
@@ -85,6 +99,9 @@ const writePly = async (options: WritePlyOptions, fs: FileSystem) => {
     }
 
     await writer.close();
+
+    logWrittenFile(basename(filename), writer.bytesWritten);
+    writingGroup.end();
 };
 
 export { writePly };

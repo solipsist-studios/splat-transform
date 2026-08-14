@@ -1,25 +1,36 @@
 import { lstat, mkdir, readFile as pathReadFile } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
-import { exit, hrtime } from 'node:process';
+import process, { exit } from 'node:process';
 import { parseArgs } from 'node:util';
 
 import { GraphicsDevice, Vec3 } from 'playcanvas';
 
 import { createDevice, enumerateAdapters } from './node-device';
 import { NodeFileSystem, NodeReadFileSystem } from './node-file-system';
-import { version } from '../../package.json';
 import {
     combine,
     DataTable,
+    fmtBytes,
+    fmtCount,
+    fmtTime,
     getInputFormat,
+    getSHBands,
     readFile,
     getOutputFormat,
     writeFile,
     processDataTable,
+    revision,
+    TextRenderer,
+    UrlReadFileSystem,
+    version,
     type ProcessAction,
+    type FilterFloaters,
+    type FilterCluster,
     type Options as LibOptions,
+    type CollisionMeshShape,
+    type ReadFileSystem,
     logger
-} from '../lib/index';
+} from '../lib';
 
 /**
  * CLI-specific options extending library options.
@@ -29,6 +40,9 @@ interface CliOptions extends LibOptions {
     help: boolean;
     version: boolean;
     quiet: boolean;
+    verbose: boolean;
+    mem: boolean;
+    noTty: boolean | undefined;
     listGpus: boolean;
     deviceIdx: number;  // -1 = auto, -2 = CPU, 0+ = GPU index
 }
@@ -43,6 +57,44 @@ const fileExists = async (filename: string) => {
         }
         throw e; // real error (permissions, etc)
     }
+};
+
+const isHttpUrl = (s: string) => /^https?:\/\//i.test(s);
+
+type ResolvedInput = {
+    filename: string;
+    fileSystem: ReadFileSystem;
+    classifyName: string;
+};
+
+// Resolve a CLI input arg into a (filename, fileSystem) pair. http(s):// URLs
+// are split into a baseUrl (directory) + leaf filename so multi-file formats
+// (SOG meta.json, LCC) can fetch siblings via UrlReadFileSystem's
+// `new URL(filename, baseUrl)` resolution. Any querystring/fragment on the
+// original URL (e.g. presigned `?token=...`) is preserved on `filename` so
+// the initial fetch carries it; `classifyName` is the bare leaf so format
+// detection sees only the path.
+const resolveInput = (arg: string): ResolvedInput => {
+    if (isHttpUrl(arg)) {
+        const url = new URL(arg);
+        const lastSlash = url.pathname.lastIndexOf('/');
+        const leaf = url.pathname.slice(lastSlash + 1);
+        if (!leaf) {
+            throw new Error(`Input URL must include a filename: ${arg}`);
+        }
+        const baseUrl = new URL('./', url).href;
+        return {
+            filename: `${leaf}${url.search}${url.hash}`,
+            fileSystem: new UrlReadFileSystem(baseUrl),
+            classifyName: leaf
+        };
+    }
+    const resolved = resolve(arg);
+    return {
+        filename: resolved,
+        fileSystem: new NodeReadFileSystem(),
+        classifyName: resolved
+    };
 };
 
 const isGSDataTable = (dataTable: DataTable) => {
@@ -63,55 +115,148 @@ type File = {
     processActions: ProcessAction[];
 };
 
+const cliOptionsConfig = {
+    // global options
+    overwrite: { type: 'boolean', short: 'w', default: false },
+    help: { type: 'boolean', short: 'h', default: false },
+    version: { type: 'boolean', short: 'v', default: false },
+    quiet: { type: 'boolean', short: 'q', default: false },
+    verbose: { type: 'boolean', default: false },
+    mem: { type: 'boolean', default: false },
+    tty: { type: 'boolean' },
+    iterations: { type: 'string', short: 'i', default: '10' },
+    'list-gpus': { type: 'boolean', short: 'L', default: false },
+    gpu: { type: 'string', short: 'g', default: '-1' },
+    'lod-select': { type: 'string', short: 'O', default: '' },
+    'viewer-settings': { type: 'string', short: 'E', default: '' },
+    'lod-chunk-count': { type: 'string', short: 'C', default: '512' },
+    'lod-chunk-extent': { type: 'string', short: 'X', default: '16' },
+    'spz-version': { type: 'string', default: '4' },
+    unbundled: { type: 'boolean', short: 'U', default: false },
+    'voxel-params': { type: 'string', default: '' },
+    'voxel-external-fill': { type: 'string' },
+    'voxel-floor-fill': { type: 'string' },
+    'voxel-carve': { type: 'string' },
+    'seed-pos': { type: 'string', default: '' },
+    'collision-mesh': { type: 'string', short: 'K' },
+    'projection': { type: 'string' },
+    'camera': { type: 'string' },
+    'look-at': { type: 'string' },
+    'up': { type: 'string' },
+    'fov': { type: 'string' },
+    'resolution': { type: 'string' },
+    'near': { type: 'string' },
+    'background': { type: 'string' },
+    'f-stop': { type: 'string' },
+    'focus-distance': { type: 'string' },
+    'sensor-size': { type: 'string' },
+    'camera-end': { type: 'string' },
+    'look-at-end': { type: 'string' },
+    'up-end': { type: 'string' },
+    'shutter': { type: 'string' },
+    'motion-samples': { type: 'string' },
+
+    // per-file options
+    translate: { type: 'string', short: 't', multiple: true },
+    rotate: { type: 'string', short: 'r', multiple: true },
+    scale: { type: 'string', short: 's', multiple: true },
+    'filter-nan': { type: 'boolean', short: 'N', multiple: true },
+    'filter-value': { type: 'string', short: 'V', multiple: true },
+    'filter-harmonics': { type: 'string', short: 'H', multiple: true },
+    'filter-box': { type: 'string', short: 'B', multiple: true },
+    'filter-sphere': { type: 'string', short: 'S', multiple: true },
+    'decimate': { type: 'string', short: 'F', multiple: true },
+    'filter-cluster': { type: 'string', short: 'D', multiple: true },
+    'filter-floaters': { type: 'string', short: 'G', multiple: true },
+    params: { type: 'string', short: 'p', multiple: true },
+    lod: { type: 'string', short: 'l', multiple: true },
+    summary: { type: 'boolean', short: 'm', multiple: true },
+    'morton-order': { type: 'boolean', short: 'M', multiple: true }
+} as const;
+
+const stringOptionNames = new Set(Object.entries(cliOptionsConfig)
+.filter(([, v]) => v.type === 'string')
+.flatMap(([name, v]) => [`--${name}`, ...('short' in v ? [`-${v.short}`] : [])])
+);
+
+const isNumericValue = (s: string) => /^-?\d[\d.,e+-]*$/.test(s);
+const isCollisionMeshShape = (s: string) => /^(?:smooth|faces)$/i.test(s);
+
+// Options that may appear without a value. The predicate gates whether the
+// next argv token is consumed as the value; when omitted (or rejected) the
+// option is normalized to an empty `--option=` form.
+type OptionalValueValidator = (next: string) => boolean;
+const optionalValueOptions: Map<string, OptionalValueValidator> = new Map([
+    ['--filter-cluster', isNumericValue],
+    ['-D', isNumericValue],
+    ['--filter-floaters', isNumericValue],
+    ['-G', isNumericValue],
+    ['--voxel-external-fill', isNumericValue],
+    ['--voxel-floor-fill', isNumericValue],
+    ['--voxel-carve', isNumericValue],
+    ['--voxel-params', isNumericValue],
+    ['--collision-mesh', isCollisionMeshShape],
+    ['-K', isCollisionMeshShape]
+]);
+
+const shortToLong = new Map<string, string>(
+    Object.entries(cliOptionsConfig)
+    .filter(([, v]) => 'short' in v)
+    .map(([name, v]) => [`-${(v as { short: string }).short}`, `--${name}`])
+);
+
+/**
+ * Normalize argv so that all string options use the long `=` form
+ * (`--option=value`). This prevents parseArgs from misinterpreting negative
+ * numeric values (e.g. `-0.5,0,0`) as flags. Short-form flags are converted
+ * to long form because parseArgs only treats `=` as a separator for long
+ * options. Optional-value options (e.g. `--filter-cluster`,
+ * `--voxel-external-fill`) get an empty `=` when no value is provided.
+ *
+ * @param args - Raw command-line arguments (process.argv.slice(2)).
+ * @returns Normalized argument array.
+ */
+const normalizeArgv = (args: string[]): string[] => {
+    const result: string[] = [];
+    for (let i = 0; i < args.length; i++) {
+        const arg = args[i];
+        const next = args[i + 1];
+        const longArg = shortToLong.get(arg) ?? arg;
+        const accept = optionalValueOptions.get(arg);
+        if (accept) {
+            if (next !== undefined && accept(next)) {
+                result.push(`${longArg}=${next}`);
+                i++;
+            } else {
+                result.push(`${longArg}=`);
+            }
+        } else if (stringOptionNames.has(arg) && next !== undefined) {
+            result.push(`${longArg}=${next}`);
+            i++;
+        } else {
+            result.push(arg);
+        }
+    }
+    return result;
+};
+
 const parseArguments = async () => {
     const { values: v, tokens } = parseArgs({
+        args: normalizeArgv(process.argv.slice(2)),
         tokens: true,
         strict: true,
         allowPositionals: true,
         allowNegative: true,
-        options: {
-            // global options
-            overwrite: { type: 'boolean', short: 'w', default: false },
-            help: { type: 'boolean', short: 'h', default: false },
-            version: { type: 'boolean', short: 'v', default: false },
-            quiet: { type: 'boolean', short: 'q', default: false },
-            iterations: { type: 'string', short: 'i', default: '10' },
-            'list-gpus': { type: 'boolean', short: 'L', default: false },
-            gpu: { type: 'string', short: 'g', default: '-1' },
-            'lod-select': { type: 'string', short: 'O', default: '' },
-            'viewer-settings': { type: 'string', short: 'E', default: '' },
-            'lod-chunk-count': { type: 'string', short: 'C', default: '512' },
-            'lod-chunk-extent': { type: 'string', short: 'X', default: '16' },
-            unbundled: { type: 'boolean', short: 'U', default: false },
-            'voxel-resolution': { type: 'string', short: 'R', default: '0.05' },
-            'opacity-cutoff': { type: 'string', short: 'A', default: '0.1' },
-            'collision-mesh': { type: 'boolean', short: 'K', default: false },
-            'mesh-simplify': { type: 'string', short: 'T', default: '0.25' },
-            'no-nav-simplify': { type: 'boolean', short: 'n', default: false },
-            'nav-capsule': { type: 'string', default: '' },
-            'nav-seed': { type: 'string', default: '' },
-
-            // per-file options
-            translate: { type: 'string', short: 't', multiple: true },
-            rotate: { type: 'string', short: 'r', multiple: true },
-            scale: { type: 'string', short: 's', multiple: true },
-            'filter-nan': { type: 'boolean', short: 'N', multiple: true },
-            'filter-value': { type: 'string', short: 'V', multiple: true },
-            'filter-harmonics': { type: 'string', short: 'H', multiple: true },
-            'filter-box': { type: 'string', short: 'B', multiple: true },
-            'filter-sphere': { type: 'string', short: 'S', multiple: true },
-            'decimate': { type: 'string', short: 'F', multiple: true },
-            params: { type: 'string', short: 'p', multiple: true },
-            lod: { type: 'string', short: 'l', multiple: true },
-            summary: { type: 'boolean', short: 'm', multiple: true },
-            'morton-order': { type: 'boolean', short: 'M', multiple: true }
-        }
+        options: cliOptionsConfig
     });
 
-    const parseNumber = (value: string): number => {
+    const parseNumber = (value: string, min?: number): number => {
         const result = Number(value);
-        if (isNaN(result)) {
+        if (!Number.isFinite(result)) {
             throw new Error(`Invalid number value: ${value}`);
+        }
+        if (min !== undefined && result < min) {
+            throw new Error(`Value must be >= ${min}, got ${value}`);
         }
         return result;
     };
@@ -124,12 +269,20 @@ const parseArguments = async () => {
         return result;
     };
 
-    const parseVec3 = (value: string): Vec3 => {
-        const parts = value.split(',').map(parseNumber);
-        if (parts.length !== 3 || parts.some(isNaN)) {
-            throw new Error(`Invalid Vec3 value: ${value}`);
+    const parseVec = (value: string, count: number): number[] => {
+        const parts = value.split(',').map(p => parseNumber(p));
+        if (parts.length !== count) {
+            throw new Error(`Expected ${count} comma-separated values, got ${parts.length}: ${value}`);
         }
-        return new Vec3(parts[0], parts[1], parts[2]);
+        return parts;
+    };
+
+    const parseCollisionMesh = (value: string | undefined): false | CollisionMeshShape => {
+        if (value === undefined) return false;
+        if (value === '') return 'smooth';
+        const normalized = value.toLowerCase();
+        if (normalized === 'smooth' || normalized === 'faces') return normalized;
+        throw new Error(`Invalid collision mesh shape: ${value}. Expected smooth or faces.`);
     };
 
     const parseComparator = (value: string): 'lt' | 'lte' | 'gt' | 'gte' | 'eq' | 'neq' => {
@@ -170,40 +323,146 @@ const parseArguments = async () => {
 
     const viewerSettingsPath = v['viewer-settings'];
 
-    // Parse nav simplification options
-    const navCapsuleStr = v['nav-capsule'];
-    const navSeedStr = v['nav-seed'];
-    const navSimplify = !v['no-nav-simplify'];
-    let navCapsule: { height: number; radius: number } | undefined;
-    let navSeed: { x: number; y: number; z: number } | undefined;
+    // Parse voxel processing options
+    const voxelParamsStr = v['voxel-params'];
+    const externalFillStr = v['voxel-external-fill'];
+    const carveStr = v['voxel-carve'];
+    const seedPosStr = v['seed-pos'];
 
-    if (navSimplify) {
-        if (navCapsuleStr) {
-            const parts = navCapsuleStr.split(',').map(parseNumber);
-            if (parts.length !== 2) {
-                throw new Error(`Invalid nav-capsule value: ${navCapsuleStr}. Expected height,radius`);
-            }
-            const [height, radius] = parts;
-            if (!Number.isFinite(height) || !Number.isFinite(radius) || height <= 0 || radius < 0) {
-                throw new Error(`Invalid nav-capsule value: ${navCapsuleStr}. Height must be > 0 and radius must be >= 0`);
+    let voxelResolution = 0.05;
+    let opacityCutoff = 0.1;
+    if (voxelParamsStr) {
+        const parts = voxelParamsStr.split(',').map((p: string) => p.trim());
+        if (parts.length >= 1 && parts[0] !== '') {
+            voxelResolution = parseNumber(parts[0], 0);
+        }
+        if (parts.length >= 2) {
+            opacityCutoff = parseNumber(parts[1], 0);
+        }
+    }
+
+    let navExteriorRadius: number | undefined;
+    if (externalFillStr !== undefined) {
+        navExteriorRadius = externalFillStr ? parseNumber(externalFillStr, 0) : 1.6;
+    }
+
+    const floorFillStr = v['voxel-floor-fill'];
+    let floorFill = false;
+    let floorFillDilation = 0;
+    if (floorFillStr !== undefined) {
+        floorFill = true;
+        floorFillDilation = floorFillStr ? parseNumber(floorFillStr, 0) : 1.6;
+    }
+
+    let navCapsule: { height: number; radius: number } | undefined;
+    if (carveStr !== undefined) {
+        if (carveStr) {
+            const [height, radius] = parseVec(carveStr, 2);
+            if (height < 0 || radius < 0) {
+                throw new Error(`Invalid voxel-carve value: ${carveStr}. Height and radius must be >= 0`);
             }
             navCapsule = { height, radius };
         } else {
             navCapsule = { height: 1.6, radius: 0.2 };
         }
-        if (navSeedStr) {
-            const parts = navSeedStr.split(',').map(parseNumber);
-            if (parts.length !== 3) {
-                throw new Error(`Invalid nav-seed value: ${navSeedStr}. Expected x,y,z`);
-            }
-            const [x, y, z] = parts;
-            if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) {
-                throw new Error(`Invalid nav-seed value: ${navSeedStr}. x, y, and z must be finite numbers`);
-            }
-            navSeed = { x, y, z };
-        } else {
-            navSeed = { x: 0, y: 0, z: 0 };
+    }
+    let navSeed: { x: number; y: number; z: number };
+    if (seedPosStr) {
+        const [x, y, z] = parseVec(seedPosStr, 3);
+        navSeed = { x, y, z };
+    } else {
+        navSeed = { x: 0, y: 0, z: 0 };
+    }
+
+    const collisionMesh = parseCollisionMesh(v['collision-mesh']);
+    const spzVersion = parseInteger(v['spz-version']);
+    if (spzVersion !== 3 && spzVersion !== 4) {
+        throw new Error(`Invalid spz-version value: ${v['spz-version']}. Must be 3 or 4.`);
+    }
+
+    // Image render options (apply when output is .webp).
+    let renderProjection: 'pinhole' | 'equirect' | undefined;
+    if (v.projection !== undefined) {
+        if (v.projection !== 'pinhole' && v.projection !== 'equirect') {
+            throw new Error(`Invalid --projection value: ${v.projection}. Must be 'pinhole' or 'equirect'.`);
         }
+        renderProjection = v.projection;
+    }
+    let renderCameraPosition: { x: number; y: number; z: number } | undefined;
+    if (v.camera !== undefined) {
+        const [cx, cy, cz] = parseVec(v.camera, 3);
+        renderCameraPosition = { x: cx, y: cy, z: cz };
+    }
+    let renderLookAt: { x: number; y: number; z: number } | undefined;
+    if (v['look-at'] !== undefined) {
+        const [lx, ly, lz] = parseVec(v['look-at'], 3);
+        renderLookAt = { x: lx, y: ly, z: lz };
+    }
+    let renderUp: { x: number; y: number; z: number } | undefined;
+    if (v.up !== undefined) {
+        const [ux, uy, uz] = parseVec(v.up, 3);
+        renderUp = { x: ux, y: uy, z: uz };
+    }
+    const renderFov = v.fov !== undefined ? parseNumber(v.fov, 0) : undefined;
+    let renderWidth: number | undefined;
+    let renderHeight: number | undefined;
+    if (v.resolution !== undefined) {
+        const m = v.resolution.match(/^(\d+)x(\d+)$/i);
+        if (!m) {
+            throw new Error(`Invalid resolution: ${v.resolution}. Expected WxH (e.g., 1920x1080).`);
+        }
+        renderWidth = parseInteger(m[1]);
+        renderHeight = parseInteger(m[2]);
+    }
+    const renderNear = v.near !== undefined ? parseNumber(v.near, 0) : undefined;
+    const renderFStop = v['f-stop'] !== undefined ? parseNumber(v['f-stop'], 0) : undefined;
+    if (renderFStop !== undefined && renderFStop <= 0) {
+        throw new Error(`Invalid --f-stop value: ${v['f-stop']}. Must be > 0.`);
+    }
+    const renderFocusDistance = v['focus-distance'] !== undefined ? parseNumber(v['focus-distance'], 0) : undefined;
+    if (renderFocusDistance !== undefined && renderFocusDistance <= 0) {
+        throw new Error(`Invalid --focus-distance value: ${v['focus-distance']}. Must be > 0.`);
+    }
+    const renderSensorSize = v['sensor-size'] !== undefined ? parseNumber(v['sensor-size'], 0) : undefined;
+    if (renderSensorSize !== undefined && renderSensorSize <= 0) {
+        throw new Error(`Invalid --sensor-size value: ${v['sensor-size']}. Must be > 0.`);
+    }
+    let renderCameraEndPosition: { x: number; y: number; z: number } | undefined;
+    if (v['camera-end'] !== undefined) {
+        const [cx, cy, cz] = parseVec(v['camera-end'], 3);
+        renderCameraEndPosition = { x: cx, y: cy, z: cz };
+    }
+    let renderLookAtEnd: { x: number; y: number; z: number } | undefined;
+    if (v['look-at-end'] !== undefined) {
+        const [lx, ly, lz] = parseVec(v['look-at-end'], 3);
+        renderLookAtEnd = { x: lx, y: ly, z: lz };
+    }
+    let renderUpEnd: { x: number; y: number; z: number } | undefined;
+    if (v['up-end'] !== undefined) {
+        const [ux, uy, uz] = parseVec(v['up-end'], 3);
+        renderUpEnd = { x: ux, y: uy, z: uz };
+    }
+    const renderShutter = v.shutter !== undefined ? parseNumber(v.shutter) : undefined;
+    if (renderShutter !== undefined && (renderShutter < 0 || renderShutter > 1)) {
+        throw new Error(`Invalid --shutter value: ${v.shutter}. Must be in [0, 1].`);
+    }
+    const renderMotionSamples = v['motion-samples'] !== undefined ? parseInteger(v['motion-samples']) : undefined;
+    if (renderMotionSamples !== undefined && renderMotionSamples < 1) {
+        throw new Error(`Invalid --motion-samples value: ${v['motion-samples']}. Must be >= 1.`);
+    }
+    let renderBackground: { r: number; g: number; b: number; a: number } | undefined;
+    if (v.background !== undefined) {
+        const parts = v.background.split(',').map((p: string) => parseNumber(p.trim()));
+        if (parts.length === 3) parts.push(1);
+        if (parts.length !== 4) {
+            throw new Error(`Invalid background: ${v.background}. Expected r,g,b or r,g,b,a.`);
+        }
+        for (let i = 0; i < 4; i++) {
+            if (parts[i] < 0 || parts[i] > 1) {
+                throw new Error(`Invalid background channel ${i}: ${parts[i]}. Each channel must be in [0, 1].`);
+            }
+        }
+        renderBackground = { r: parts[0], g: parts[1], b: parts[2], a: parts[3] };
     }
 
     const options: CliOptions = {
@@ -211,6 +470,9 @@ const parseArguments = async () => {
         help: v.help,
         version: v.version,
         quiet: v.quiet,
+        verbose: v.verbose,
+        mem: v.mem,
+        noTty: v.tty === undefined ? undefined : !v.tty,
         iterations: parseInteger(v.iterations),
         listGpus: v['list-gpus'],
         deviceIdx,
@@ -219,18 +481,33 @@ const parseArguments = async () => {
         unbundled: v.unbundled,
         lodChunkCount: parseInteger(v['lod-chunk-count']),
         lodChunkExtent: parseInteger(v['lod-chunk-extent']),
-        voxelResolution: parseNumber(v['voxel-resolution']),
-        opacityCutoff: parseNumber(v['opacity-cutoff']),
-        collisionMesh: v['collision-mesh'],
-        meshSimplify: parseNumber(v['mesh-simplify']),
-        navSimplify,
+        spzVersion: spzVersion as 3 | 4,
+        voxelResolution,
+        opacityCutoff,
+        navExteriorRadius,
+        floorFill,
+        floorFillDilation,
         navCapsule,
-        navSeed
+        navSeed,
+        collisionMesh,
+        renderProjection,
+        renderCameraPosition,
+        renderLookAt,
+        renderUp,
+        renderFov,
+        renderWidth,
+        renderHeight,
+        renderNear,
+        renderBackground,
+        renderFStop,
+        renderFocusDistance,
+        renderSensorSize,
+        renderCameraEndPosition,
+        renderLookAtEnd,
+        renderUpEnd,
+        renderShutter,
+        renderMotionSamples
     };
-
-    if (!Number.isFinite(options.meshSimplify) || options.meshSimplify < 0 || options.meshSimplify > 1) {
-        throw new Error(`Invalid mesh-simplify value: ${options.meshSimplify}. Must be a finite number between 0 and 1.`);
-    }
 
     for (const t of tokens) {
         if (t.kind === 'positional') {
@@ -241,18 +518,22 @@ const parseArguments = async () => {
         } else if (t.kind === 'option' && files.length > 0) {
             const current = files[files.length - 1];
             switch (t.name) {
-                case 'translate':
+                case 'translate': {
+                    const [x, y, z] = parseVec(t.value, 3);
                     current.processActions.push({
                         kind: 'translate',
-                        value: parseVec3(t.value)
+                        value: new Vec3(x, y, z)
                     });
                     break;
-                case 'rotate':
+                }
+                case 'rotate': {
+                    const [x, y, z] = parseVec(t.value, 3);
                     current.processActions.push({
                         kind: 'rotate',
-                        value: parseVec3(t.value)
+                        value: new Vec3(x, y, z)
                     });
                     break;
+                }
                 case 'scale':
                     current.processActions.push({
                         kind: 'scale',
@@ -317,7 +598,7 @@ const parseArguments = async () => {
                     if (parts.length !== 4) {
                         throw new Error(`Invalid filter-sphere value: ${t.value}`);
                     }
-                    const values = parts.map(parseNumber);
+                    const values = parts.map((p: string) => parseNumber(p));
                     current.processActions.push({
                         kind: 'filterSphere',
                         center: new Vec3(values[0], values[1], values[2]),
@@ -384,6 +665,43 @@ const parseArguments = async () => {
                     });
                     break;
                 }
+                case 'filter-cluster': {
+                    const fcAction: FilterCluster = { kind: 'filterCluster' };
+                    if (t.value) {
+                        const parts = t.value.split(',').map((p: string) => p.trim());
+                        if (parts.length >= 1 && parts[0] !== '') {
+                            fcAction.voxelResolution = parseNumber(parts[0]);
+                        }
+                        if (parts.length >= 2) {
+                            fcAction.opacityCutoff = parseNumber(parts[1]);
+                        }
+                        if (parts.length >= 3) {
+                            fcAction.minContribution = parseNumber(parts[2]);
+                        }
+                    }
+                    if (navSeed) {
+                        fcAction.seed = new Vec3(navSeed.x, navSeed.y, navSeed.z);
+                    }
+                    current.processActions.push(fcAction);
+                    break;
+                }
+                case 'filter-floaters': {
+                    const ffAction: FilterFloaters = { kind: 'filterFloaters' };
+                    if (t.value) {
+                        const parts = t.value.split(',').map((p: string) => p.trim());
+                        if (parts.length >= 1 && parts[0] !== '') {
+                            ffAction.voxelResolution = parseNumber(parts[0]);
+                        }
+                        if (parts.length >= 2) {
+                            ffAction.opacityCutoff = parseNumber(parts[1]);
+                        }
+                        if (parts.length >= 3) {
+                            ffAction.minContribution = parseNumber(parts[2]);
+                        }
+                    }
+                    current.processActions.push(ffAction);
+                    break;
+                }
             }
         }
     }
@@ -403,134 +721,237 @@ USAGE
   • Use 'null' as output to discard file output.
 
 SUPPORTED INPUTS
-    .ply   .compressed.ply   .sog   meta.json   .ksplat   .splat   .spz   .mjs   .lcc   .voxel.json
+    .ply   .compressed.ply   .sog   .spz   meta.json   .ksplat   .splat   .mjs   .lcc
+
+    Input filenames may also be http(s):// URLs (downloaded on demand;
+    .mjs generators are local-only).
 
 SUPPORTED OUTPUTS
-    .ply   .compressed.ply   .sog   meta.json   lod-meta.json   .glb   .csv   .html   .voxel.json   null
+    .ply   .compressed.ply   .sog   .spz   meta.json   lod-meta.json   .glb   .csv   .html   .voxel.json   .webp   null
 
-ACTIONS (can be repeated, in any order)
+ACTIONS (executed in order; can be repeated)
     -t, --translate        <x,y,z>          Translate Gaussians by (x, y, z)
-    -r, --rotate           <x,y,z>          Rotate Gaussians by Euler angles (x, y, z), in degrees
+    -r, --rotate           <x,y,z>          Rotate Gaussians by Euler angles, in degrees
     -s, --scale            <factor>         Uniformly scale Gaussians by factor
     -H, --filter-harmonics <0|1|2|3>        Remove spherical harmonic bands > n
-    -N, --filter-nan                        Remove Gaussians with NaN or Inf values
+    -N, --filter-nan                        Remove Gaussians with NaN values and most Inf values
     -B, --filter-box       <x,y,z,X,Y,Z>    Remove Gaussians outside box (min, max corners)
-    -S, --filter-sphere    <x,y,z,radius>   Remove Gaussians outside sphere (center, radius)
-    -V, --filter-value     <name,cmp,value> Keep Gaussians where <name> <cmp> <value>
+    -S, --filter-sphere    <x,y,z,radius>   Remove Gaussians outside sphere
+    -V, --filter-value     <name,cmp,value> Keep Gaussians where <name> <cmp> <value>;
                                               cmp ∈ {lt,lte,gt,gte,eq,neq}
-                                              opacity, scale_*, f_dc_* use transformed values
-                                              (linear opacity 0-1, linear scale, linear color 0-1).
-                                              Append _raw for raw PLY values (e.g. opacity_raw).
-    -F, --decimate         <n|n%>           Simplify to n Gaussians via progressive pairwise merging
-                                              Use n% to keep a percentage of Gaussians
+    -F, --decimate         <n|n%>           Simplify to n (or n%) Gaussians via pairwise merging
+    -G, --filter-floaters  [size,op,min]    Remove Gaussians not contributing to any solid voxel. Default: 0.05,0.1,0.004
+    -D, --filter-cluster   [res,op,min]     Keep only the connected cluster at --seed-pos. Default: 1.0,0.999,0.1
     -p, --params           <key=val,...>    Pass parameters to .mjs generator script
-    -l, --lod              <n>              Specify the level of detail, n >= 0
+    -l, --lod              <n>              Tag the Gaussians with LOD level n (n >= 0)
     -m, --summary                           Print per-column statistics to stdout
     -M, --morton-order                      Reorder Gaussians by Morton code (Z-order curve)
 
-GLOBAL OPTIONS
+GENERAL
     -h, --help                              Show this help and exit
     -v, --version                           Show version and exit
     -q, --quiet                             Suppress non-error output
+        --verbose                           Show debug-level diagnostics
+        --mem                               Show peak memory in progress output
+        --tty                               Interactive bar rendering (--no-tty to disable)
     -w, --overwrite                         Overwrite output file if it exists
-    -i, --iterations       <n>              Iterations for SOG SH compression (more=better). Default: 10
+
+GPU (used by SOG compression and GPU voxelization: --filter-cluster, --filter-floaters, .voxel.json output)
     -L, --list-gpus                         List available GPU adapters and exit
-    -g, --gpu              <n|cpu>          Select device for SOG compression: GPU adapter index | 'cpu'
+    -g, --gpu              <n|cpu>          Device for GPU operations: GPU adapter index | 'cpu'
+                                              ('cpu' disables GPU and is incompatible with GPU-only features)
+
+SOG COMPRESSION (.sog, meta.json, lod-meta.json, .html outputs)
+    -i, --iterations       <n>              SH compression iterations (more=better). Default: 10
+
+SPZ OUTPUT (.spz)
+        --spz-version      <3|4>            The SPZ format version to write. Default: 4
+
+HTML VIEWER OUTPUT (.html)
     -E, --viewer-settings  <settings.json>  HTML viewer settings JSON file
     -U, --unbundled                         Generate unbundled HTML viewer with separate files
+
+LCC INPUT (.lcc)
     -O, --lod-select       <n,n,...>        Comma-separated LOD levels to read from LCC input
+
+LOD OUTPUT (lod-meta.json)
     -C, --lod-chunk-count  <n>              Approximate number of Gaussians per LOD chunk in K. Default: 512
     -X, --lod-chunk-extent <n>              Approximate size of an LOD chunk in world units (m). Default: 16
-    -R, --voxel-resolution <n>              Voxel size in world units for .voxel.json. Default: 0.05
-    -A, --opacity-cutoff   <n>              Opacity threshold for solid voxels. Default: 0.1
-    -K, --collision-mesh                    Generate collision mesh (.collision.glb) with voxel output
-    -T, --mesh-simplify    <n>              Ratio of triangles to keep for collision mesh (0-1). Default: 0.25
-    -n, --no-nav-simplify                   Disable capsule navigation simplification for voxel output
-        --nav-capsule      <height,radius>  Capsule dimensions for nav simplification. Default: 1.6,0.2
-        --nav-seed         <x,y,z>          Seed position for nav simplification. Default: 0,0,0
+
+VOXEL OUTPUT (.voxel.json)
+        --voxel-params     [size,opacity]   Voxel size and opacity threshold for .voxel.json. Default: 0.05,0.1
+        --voxel-external-fill [size]        Fill exterior voxels via boundary flood fill (interior scenes). Default: 1.6
+        --voxel-floor-fill [size]           Fill columns upward from bottom (exterior scenes). Default: 1.6
+        --voxel-carve [h,r]                 Carve navigable space using capsule flood fill from seed. Default: 1.6,0.2
+        --seed-pos         <x,y,z>          Seed position for voxel processing and --filter-cluster. Default: 0,0,0
+    -K, --collision-mesh   [smooth|faces]   Generate collision mesh (.collision.glb). Default shape: smooth
+
+IMAGE OUTPUT (.webp) — lossless WebP rendered via GPU rasterizer
+        --projection       <pinhole|equirect>  Camera projection. Default: pinhole.
+                                            equirect = 360°×180° panorama from --camera; --fov must be omitted;
+                                            --resolution must be 2:1 (default 2048x1024).
+        --camera           <x,y,z>          Camera position in world space. Default: 2,1,-2
+        --look-at          <x,y,z>          Camera target point. Default: 0,0,0
+        --up               <x,y,z>          World up vector. Default: 0,1,0
+        --fov              <degrees>        Vertical field of view in degrees. Default: 60. Rejected with --projection equirect.
+        --resolution       <WxH>            Output resolution, e.g. 1920x1080. Default: 1280x720 (pinhole) or 2048x1024 (equirect)
+        --near             <n>              Near clip distance. Default: 0.2 (matches reference 3DGS)
+        --background       <r,g,b[,a]>      Background color in [0,1]. Default: 0,0,0,1
+        --f-stop           <N>              Aperture as a photographic f-stop (e.g. 2.8, 5.6, 11). Enables defocus blur;
+                                            smaller = more blur. Pinhole only. Default: disabled (no defocus).
+        --focus-distance   <n>              Camera-space Z of the focus plane (world units). Default: distance to --look-at.
+                                            Pinhole only; only meaningful with --f-stop.
+        --sensor-size      <n>              Vertical sensor height in world units. Gives --f-stop a physical meaning.
+                                            Default: 0.024 (35mm full-frame, world units = meters). Scale to your world:
+                                            world unit = decimeter → 0.24, world unit = millimeter → 24.
+        --camera-end       <x,y,z>          End camera position. When set, enables camera motion blur: the renderer
+                                            averages sub-frames with the camera interpolated from --camera (shutter open)
+                                            to --camera-end (shutter close). Default: disabled (no motion blur).
+        --look-at-end      <x,y,z>          End camera target. Default: same as --look-at. Only with --camera-end.
+        --up-end           <x,y,z>          End up vector. Default: same as --up. Only with --camera-end.
+        --shutter          <0..1>           Fraction of the start→end segment integrated, centered on the midpoint
+                                            (1.0 = full motion; 0.5 = 180° shutter). Default: 1. Only with --camera-end.
+        --motion-samples   <n>              Sub-frames to accumulate for motion blur. Cost is N× a single render.
+                                            Default: 16. Only with --camera-end.
 
 EXAMPLES
-    # Scale then translate
-    splat-transform bunny.ply -s 0.5 -t 0,0,10 bunny-scaled.ply
+    # Convert formats
+    splat-transform input.ply output.sog
 
-    # Merge two files with transforms and compress to SOG format
-    splat-transform -w cloudA.ply -r 0,90,0 cloudB.ply -s 2 merged.sog
+    # Merge files with transforms
+    splat-transform -w a.ply -r 0,90,0 b.ply -s 2 merged.sog
 
-    # Generate unbundled HTML viewer with separate CSS, JS and SOG files
-    splat-transform -U bunny.ply bunny-viewer.html
+    # Generate voxel collision data
+    splat-transform input.ply --filter-cluster output.voxel.json
 
-    # Generate synthetic splats using a generator script
-    splat-transform gen-grid.mjs -p width=500,height=500,scale=0.1 grid.ply
-
-    # Generate LOD with custom chunk size and node split size
-    splat-transform -O 0,1,2 -C 1024 -X 32 input.lcc output/lod-meta.json
-
-    # Generate voxel data
-    splat-transform input.ply output.voxel.json
-
-    # Generate voxel data with collision mesh
-    splat-transform -K input.ply output.voxel.json
-
-    # Generate voxel data with custom resolution and opacity threshold
-    splat-transform -R 0.1 -A 0.3 input.ply output.voxel.json
-
-    # Generate voxel data with nav simplification disabled
-    splat-transform -n input.ply output.voxel.json
-
-    # Convert voxel data back to PLY for visualization
-    splat-transform scene.voxel.json scene-voxels.ply
-
-    # Print statistical summary, then write output
-    splat-transform bunny.ply --summary output.ply
-
-    # Print summary without writing a file (discard output)
-    splat-transform bunny.ply -m null
+    More examples: https://github.com/playcanvas/splat-transform#examples
 `;
 
 const main = async () => {
-    const startTime = hrtime();
+    const startTime = performance.now();
 
-    // read args
-    const { files, options } = await parseArguments();
+    // Kernel-tracked peak resident set size in bytes.
+    // `process.resourceUsage().maxRSS` is reported in kilobytes on
+    // Linux/macOS and bytes on Windows; normalize to bytes for fmtBytes.
+    // Note: V8 fatal OOM (`FATAL ERROR: Reached heap limit`) and external
+    // SIGKILL bypass all JS handlers (uncaughtException, beforeExit, exit),
+    // so peak rss cannot be reported in those cases - use an external wrapper
+    // such as `/usr/bin/time -l` (macOS) or `/usr/bin/time -v` (Linux).
+    const peakMemoryBytes = (): number => {
+        const raw = process.resourceUsage().maxRSS;
+        return process.platform === 'win32' ? raw : raw * 1024;
+    };
 
-    type Timing = [number, number];
+    // V8-tracked currently-live memory: heapUsed (JS objects) + external
+    // (C++-bound, includes ArrayBuffer storage for typed arrays — which is
+    // most of our memory in this app). Drops when GC reclaims, so the
+    // delta between phase boundaries reveals whether each phase actually
+    // releases its scratch buffers (vs the kernel maxRSS metric, which is
+    // monotonic).
+    const liveMemoryBytes = (): number => {
+        const u = process.memoryUsage();
+        return u.heapUsed + u.external;
+    };
 
-    // timing state for anonymous progress blocks
-    const hrtimeDelta = (start: Timing, end: Timing) => (end[0] - start[0]) + (end[1] - start[1]) / 1e9;
-
-    let start: Timing | null = null;
-
-    const err = console.error.bind(console);
-    const warn = console.warn.bind(console);
-
-    // inject Node.js-specific logger - logs go to stderr, data output goes to stdout
-    logger.setLogger({
-        log: err,
-        warn: warn,
-        error: err,
-        debug: err,
-        output: console.log.bind(console),
-        onProgress: (node) => {
-            if (node.stepName) {
-                err(`[${node.step}/${node.totalSteps}] ${node.stepName}`);
-            } else if (node.step === 0) {
-                start = hrtime();
-            } else {
-                const displaySteps = 10;
-                const curr = Math.round(displaySteps * node.step / node.totalSteps);
-                const prev = Math.round(displaySteps * (node.step - 1) / node.totalSteps);
-                if (curr > prev) process.stderr.write('#'.repeat(curr - prev));
-                if (node.step === node.totalSteps) {
-                    process.stderr.write(` (${hrtimeDelta(start, hrtime()).toFixed(3)}s)\n`);
-                }
-            }
+    // Emit the final timing line plus peak memory usage.
+    const reportDone = (failed = false) => {
+        const elapsedMs = performance.now() - startTime;
+        const verb = failed ? 'failed in' : 'done in';
+        const line = `${verb} ${fmtTime(elapsedMs)}  [peak ${fmtBytes(peakMemoryBytes())}]`;
+        if (failed) {
+            logger.error(line);
+        } else {
+            logger.info(line);
         }
+    };
+
+    const logDataTableInfo = (dataTable: DataTable) => {
+        logger.info(`${fmtCount(dataTable.numRows)} gaussians \u00b7 ${getSHBands(dataTable)} SH bands \u00b7 ${fmtBytes(dataTable.byteLength)}`);
+    };
+
+    // Centralised failure exit: emits the error, the final timing/peak-mem
+    // line, and terminates with status 1. Used by every non-success exit
+    // path (early arg/overwrite checks, the main try/catch, and the
+    // top-level uncaught{Exception,Rejection} handlers) so peak rss is
+    // always reported on failure - matching the success path. The optional
+    // `label` preserves the failure kind/context (e.g. uncaughtException
+    // origin) that Node's default crash reporter would have surfaced, since
+    // installing the handlers below suppresses it.
+    const failExit = (err: unknown, label?: string): never => {
+        if (label) {
+            logger.error(`${label}:`, err);
+        } else {
+            logger.error(err);
+        }
+        reportDone(true);
+        exit(1);
+    };
+
+    // stderr sink for the renderer. When `noTty` is on, line-buffer so the
+    // renderer's partial-line bar sequence (`▸ name [` + `#` ticks +
+    // `....] dur\n`) lands as one complete line per bar - what non-
+    // interactive log viewers want. Defaults to auto-detection from
+    // `stderr.isTTY`; the `--no-tty` / `--tty` flags applied below
+    // override either way for backends whose stderr-TTY status doesn't
+    // match what the user wants.
+    let noTty = !process.stderr.isTTY;
+    let lineBuf = '';
+
+    const write = (chunk: string) => {
+        if (noTty) {
+            lineBuf += chunk;
+            const lastNL = lineBuf.lastIndexOf('\n');
+            if (lastNL !== -1) {
+                process.stderr.write(lineBuf.slice(0, lastNL + 1));
+                lineBuf = lineBuf.slice(lastNL + 1);
+            }
+        } else {
+            process.stderr.write(chunk);
+        }
+    };
+
+    const renderer = new TextRenderer({
+        write,
+        output: chunk => process.stdout.write(chunk),
+        getPeakMemory: peakMemoryBytes,
+        getLiveMemory: liveMemoryBytes
+    });
+    logger.setRenderer(renderer);
+
+    process.on('uncaughtException', (err, origin) => {
+        failExit(err, `uncaughtException (${origin})`);
+    });
+    process.on('unhandledRejection', (reason) => {
+        failExit(reason, 'unhandledRejection');
     });
 
-    // configure logger
-    logger.setQuiet(options.quiet);
+    // read args
+    let files: File[];
+    let options: CliOptions;
+    try {
+        ({ files, options } = await parseArguments());
+    } catch (err) {
+        failExit(err);
+    }
 
-    logger.log(`splat-transform v${version}`);
+    // Apply post-parse flags. `--no-tty` forces line buffering even on a
+    // TTY (for backends that report stderr as a TTY but aren't really);
+    // `--tty` forces it off even on a piped stderr. When neither flag is
+    // passed, the auto-detected default sticks.
+    if (options.noTty !== undefined) {
+        noTty = options.noTty;
+    }
+    renderer.mem = options.mem;
+
+    if (options.quiet) {
+        logger.setVerbosity('quiet');
+    } else if (options.verbose) {
+        logger.setVerbosity('verbose');
+    } else {
+        logger.setVerbosity('normal');
+    }
+
+    logger.info(`splat-transform v${version} (${revision})`);
 
     // show version and exit
     if (options.version) {
@@ -539,20 +960,20 @@ const main = async () => {
 
     // list GPUs and exit
     if (options.listGpus) {
-        logger.log('Enumerating available GPU adapters...\n');
+        logger.info('Enumerating available GPU adapters...');
         try {
             const adapters = await enumerateAdapters();
             if (adapters.length === 0) {
-                logger.log('No GPU adapters found.');
-                logger.log('This could mean:');
-                logger.log('  - WebGPU is not available on your system');
-                logger.log('  - GPU drivers need to be updated');
-                logger.log('  - Your GPU does not support WebGPU');
+                logger.info('No GPU adapters found.');
+                logger.info('This could mean:');
+                logger.info('  - WebGPU is not available on your system');
+                logger.info('  - GPU drivers need to be updated');
+                logger.info('  - Your GPU does not support WebGPU');
             } else {
                 adapters.forEach((adapter) => {
-                    logger.log(`[${adapter.index}] ${adapter.name}`);
+                    logger.output(`[${adapter.index}] ${adapter.name}`);
                 });
-                logger.log('\nUse -g <index> to select a specific GPU adapter.');
+                logger.info('Use -g <index> to select a specific GPU adapter.');
             }
         } catch (err) {
             logger.error('Failed to enumerate GPU adapters:', err);
@@ -562,12 +983,24 @@ const main = async () => {
 
     // invalid args or show help
     if (files.length < 2 || options.help) {
-        logger.error(usage);
-        exit(1);
+        // trim leading/trailing whitespace because the renderer appends its
+        // own trailing newline (and the literal already starts/ends with one)
+        const formattedUsage = usage.trim();
+        if (options.help) {
+            // help: route to stdout via the pipeable output channel
+            logger.output(formattedUsage);
+            exit(0);
+        }
+        // invalid invocation: route usage to stderr as an error
+        failExit(formattedUsage);
     }
 
     const inputArgs = files.slice(0, -1);
     const outputArg = files[files.length - 1];
+
+    if (isHttpUrl(outputArg.filename)) {
+        failExit(`Output to a URL is not supported: ${outputArg.filename}`);
+    }
 
     const outputFilename = resolve(outputArg.filename);
 
@@ -585,8 +1018,7 @@ const main = async () => {
         } else {
             // check overwrite before doing any work
             if (await fileExists(outputFilename)) {
-                logger.error(`File '${outputFilename}' already exists. Use -w option to overwrite.`);
-                exit(1);
+                failExit(`File '${outputFilename}' already exists. Use -w option to overwrite.`);
             }
 
             // for unbundled HTML, also check for additional files
@@ -602,8 +1034,7 @@ const main = async () => {
 
                 for (const file of filesToCheck) {
                     if (await fileExists(file)) {
-                        logger.error(`File '${file}' already exists. Use -w option to overwrite.`);
-                        exit(1);
+                        failExit(`File '${file}' already exists. Use -w option to overwrite.`);
                     }
                 }
             }
@@ -611,30 +1042,73 @@ const main = async () => {
     }
 
     try {
-        // Create file system for reading (reused across all input files)
-        const nodeFs = new NodeReadFileSystem();
+        // Create device creator function with caching (needed for processDataTable + writeFile)
+        // deviceIdx: -1 = auto, -2 = CPU, 0+ = specific GPU index
+        let cachedDevice: GraphicsDevice | undefined;
+        const deviceCreator = options.deviceIdx === -2 ? undefined : async () => {
+            if (cachedDevice) {
+                return cachedDevice;
+            }
+
+            let adapterName: string | undefined;
+            if (options.deviceIdx >= 0) {
+                const adapters = await enumerateAdapters();
+                const adapter = adapters[options.deviceIdx];
+                if (adapter) {
+                    adapterName = adapter.name;
+                } else {
+                    logger.warn(`GPU adapter index ${options.deviceIdx} not found, using default`);
+                }
+            }
+
+            cachedDevice = await createDevice(adapterName);
+            return cachedDevice;
+        };
+
+        const processOptions = deviceCreator ? { createDevice: deviceCreator } : undefined;
+
+        // declare phase total: one Read phase per input + one Write phase
+        const phaseTotal = inputArgs.length + (isNullOutput ? 0 : 1);
 
         // read, filter, process input files
-        const inputDataTables = (await Promise.all(inputArgs.map(async (inputArg) => {
+        const inputDataTables: DataTable[] = [];
+        for (let inputIdx = 0; inputIdx < inputArgs.length; inputIdx++) {
+            const inputArg = inputArgs[inputIdx];
+            const phase = logger.group(`Input ${inputArg.filename}`, {
+                index: inputIdx + 1,
+                total: phaseTotal
+            });
+
             // extract params
             const params = inputArg.processActions.filter(a => a.kind === 'param').map((p) => {
                 return { name: p.name, value: p.value };
             });
 
-            // read input
-            const filename = resolve(inputArg.filename);
-            const inputFormat = getInputFormat(filename);
+            // read input - supports both local paths and http(s):// URLs
+            const { filename, fileSystem, classifyName } = resolveInput(inputArg.filename);
+            const inputFormat = getInputFormat(classifyName);
+
+            // mjs generators require local filesystem access (dynamic import)
+            if (inputFormat === 'mjs' && isHttpUrl(inputArg.filename)) {
+                throw new Error(`.mjs generator inputs cannot be loaded from a URL: ${inputArg.filename}`);
+            }
 
             // For mjs format, convert to file:// URL (Node.js-specific)
             const readFilename = inputFormat === 'mjs' ? `file://${filename}` : filename;
 
+            // Per-file progress bars are drawn by the readers themselves
+            // (see lib/read.ts and the SOG/LCC readers). The CLI wraps them
+            // in a "Reading" group so multi-file formats like SOG render as
+            // a coherent block under the Input phase.
+            const readingGroup = logger.group('Reading');
             const dataTables = await readFile({
                 filename: readFilename,
                 inputFormat,
                 options,
                 params,
-                fileSystem: nodeFs
+                fileSystem
             });
+            readingGroup.end();
 
             for (let i = 0; i < dataTables.length; ++i) {
                 const dataTable = dataTables[i];
@@ -643,59 +1117,46 @@ const main = async () => {
                     throw new Error(`Unsupported data in file '${inputArg.filename}'`);
                 }
 
-                dataTables[i] = processDataTable(dataTable, inputArg.processActions);
+                logDataTableInfo(dataTable);
+
+                const isEnv = dataTable.hasColumn('lod') && dataTable.getColumnByName('lod').data.every(v => v === -1);
+                if (!isEnv) {
+                    dataTables[i] = await processDataTable(dataTable, inputArg.processActions, processOptions);
+                }
             }
 
-            return dataTables;
-        }))).flat(1).filter(dataTable => dataTable !== null);
+            inputDataTables.push(...dataTables.filter(dt => dt !== null));
+            phase.end();
+        }
 
         // special-case the environment dataTable
         const envDataTables = inputDataTables.filter(dt => dt.hasColumn('lod') && dt.getColumnByName('lod').data.every(v => v === -1));
         const nonEnvDataTables = inputDataTables.filter(dt => !dt.hasColumn('lod') || dt.getColumnByName('lod').data.some(v => v !== -1));
 
         // combine inputs into a single output dataTable
-        const dataTable = nonEnvDataTables.length > 0 && processDataTable(
+        const dataTable = nonEnvDataTables.length > 0 && await processDataTable(
             combine(nonEnvDataTables),
-            outputArg.processActions
+            outputArg.processActions,
+            processOptions
         );
 
         if (!dataTable || dataTable.numRows === 0) {
             throw new Error('No Gaussians to write');
         }
 
-        const envDataTable = envDataTables.length > 0 && processDataTable(
+        const envDataTable = envDataTables.length > 0 && await processDataTable(
             combine(envDataTables),
-            outputArg.processActions
+            outputArg.processActions,
+            processOptions
         );
-
-        logger.log(`Total gaussians loaded: ${dataTable.numRows}`);
 
         // Skip file writing for null output
         if (!isNullOutput) {
-            // Create device creator function with caching
-            // deviceIdx: -1 = auto, -2 = CPU, 0+ = specific GPU index
-            let cachedDevice: GraphicsDevice | undefined;
-            const deviceCreator = options.deviceIdx === -2 ? undefined : async () => {
-                if (cachedDevice) {
-                    return cachedDevice;
-                }
-
-                let adapterName: string | undefined;
-                if (options.deviceIdx >= 0) {
-                    const adapters = await enumerateAdapters();
-                    const adapter = adapters[options.deviceIdx];
-                    if (adapter) {
-                        adapterName = adapter.name;
-                    } else {
-                        logger.warn(`GPU adapter index ${options.deviceIdx} not found, using default`);
-                    }
-                }
-
-                cachedDevice = await createDevice(adapterName);
-                return cachedDevice;
-            };
-
-            // write file
+            const phase = logger.group(`Output ${outputArg.filename}`, {
+                index: phaseTotal,
+                total: phaseTotal
+            });
+            logDataTableInfo(dataTable);
             await writeFile({
                 filename: outputFilename,
                 outputFormat: outputFormat!,
@@ -704,16 +1165,13 @@ const main = async () => {
                 options,
                 createDevice: deviceCreator
             }, new NodeFileSystem());
+            phase.end();
         }
     } catch (err) {
-        // handle errors
-        logger.error(err);
-        exit(1);
+        failExit(err);
     }
 
-    const endTime = hrtime(startTime);
-
-    logger.log(`done in ${endTime[0] + endTime[1] / 1e9}s`);
+    reportDone();
 
     // something in webgpu seems to keep the process alive after returning
     // from main so force exit

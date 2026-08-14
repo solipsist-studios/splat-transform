@@ -1,21 +1,14 @@
-import { DataTable } from './data-table/data-table';
+import { DataTable } from './data-table';
 import { type FileSystem } from './io/write';
-import { Options } from './types';
-import { logger } from './utils/logger';
-import { writeCompressedPly } from './writers/write-compressed-ply';
-import { writeCsv } from './writers/write-csv';
-import { writeGlb } from './writers/write-glb';
-import { writeHtml } from './writers/write-html';
-import { writeLod } from './writers/write-lod';
-import { writePly } from './writers/write-ply';
-import { writeSog, type DeviceCreator } from './writers/write-sog';
-import { writeVoxel } from './writers/write-voxel';
+import { type DeviceCreator, type Options } from './types';
+import { writeCompressedPly, writeCsv, writeGlb, writeHtml, writeImage, writeLod, writePly, writeSog, writeSpz, writeVoxel } from './writers';
 
 /**
  * Supported output file formats for Gaussian splat data.
  *
  * - `ply` - Standard PLY format
  * - `compressed-ply` - Compressed PLY format
+ * - `spz` - Niantic Labs SPZ format
  * - `glb` - Binary glTF with KHR_gaussian_splatting extension
  * - `csv` - CSV text format (for debugging/analysis)
  * - `sog` - PlayCanvas SOG format (separate files)
@@ -24,8 +17,9 @@ import { writeVoxel } from './writers/write-voxel';
  * - `html` - Self-contained HTML viewer (separate assets)
  * - `html-bundle` - Self-contained HTML viewer (all assets embedded)
  * - `voxel` - Sparse voxel octree format for collision detection
+ * - `image` - Rasterized RGBA image (lossless WebP) rendered from a camera view
  */
-type OutputFormat = 'csv' | 'sog' | 'sog-bundle' | 'lod' | 'compressed-ply' | 'ply' | 'glb' | 'html' | 'html-bundle' | 'voxel';
+type OutputFormat = 'csv' | 'sog' | 'sog-bundle' | 'lod' | 'compressed-ply' | 'ply' | 'spz' | 'glb' | 'html' | 'html-bundle' | 'voxel' | 'image';
 
 /**
  * Options for writing a Gaussian splat file.
@@ -76,10 +70,14 @@ const getOutputFormat = (filename: string, options: Options): OutputFormat => {
         return 'compressed-ply';
     } else if (lowerFilename.endsWith('.ply')) {
         return 'ply';
+    } else if (lowerFilename.endsWith('.spz')) {
+        return 'spz';
     } else if (lowerFilename.endsWith('.glb')) {
         return 'glb';
     } else if (lowerFilename.endsWith('.html')) {
         return options.unbundled ? 'html' : 'html-bundle';
+    } else if (lowerFilename.endsWith('.webp')) {
+        return 'image';
     }
 
     throw new Error(`Unsupported output file type: ${filename}`);
@@ -109,9 +107,8 @@ const getOutputFormat = (filename: string, options: Options): OutputFormat => {
 const writeFile = async (writeOptions: WriteOptions, fs: FileSystem) => {
     const { filename, outputFormat, dataTable, envDataTable, options, createDevice } = writeOptions;
 
-    logger.log(`writing '${filename}'...`);
-
-    // write the file data
+    // Each writer is responsible for opening its own `Writing` log group and
+    // emitting `filename (size)` info entries per output file.
     switch (outputFormat) {
         case 'csv':
             await writeCsv({ filename, dataTable }, fs);
@@ -147,9 +144,16 @@ const writeFile = async (writeOptions: WriteOptions, fs: FileSystem) => {
                     comments: [],
                     elements: [{
                         name: 'vertex',
-                        dataTable: dataTable
+                        dataTable
                     }]
                 }
+            }, fs);
+            break;
+        case 'spz':
+            await writeSpz({
+                filename,
+                dataTable,
+                version: options.spzVersion ?? 4
             }, fs);
             break;
         case 'glb':
@@ -166,23 +170,45 @@ const writeFile = async (writeOptions: WriteOptions, fs: FileSystem) => {
                 createDevice
             }, fs);
             break;
-        case 'voxel': {
-            const enableNav = options.navSimplify !== false;
-            const navCapsule = enableNav ? (options.navCapsule ?? { height: 1.6, radius: 0.2 }) : undefined;
-            const navSeed = enableNav ? (options.navSeed ?? { x: 0, y: 0, z: 0 }) : undefined;
+        case 'voxel':
             await writeVoxel({
                 filename,
                 dataTable,
                 voxelResolution: options.voxelResolution,
                 opacityCutoff: options.opacityCutoff,
+                navExteriorRadius: options.navExteriorRadius,
+                floorFill: options.floorFill,
+                floorFillDilation: options.floorFillDilation,
+                navCapsule: options.navCapsule,
+                navSeed: options.navSeed,
                 collisionMesh: options.collisionMesh,
-                meshSimplify: options.meshSimplify,
-                navCapsule,
-                navSeed,
                 createDevice
             }, fs);
             break;
-        }
+        case 'image':
+            await writeImage({
+                filename,
+                dataTable,
+                projection: options.renderProjection,
+                cameraPosition: options.renderCameraPosition,
+                lookAt: options.renderLookAt,
+                up: options.renderUp,
+                fov: options.renderFov,
+                width: options.renderWidth,
+                height: options.renderHeight,
+                near: options.renderNear,
+                background: options.renderBackground,
+                fStop: options.renderFStop,
+                focusDistance: options.renderFocusDistance,
+                sensorSize: options.renderSensorSize,
+                cameraEndPosition: options.renderCameraEndPosition,
+                lookAtEnd: options.renderLookAtEnd,
+                upEnd: options.renderUpEnd,
+                shutter: options.renderShutter,
+                motionSamples: options.renderMotionSamples,
+                createDevice
+            }, fs);
+            break;
     }
 };
 

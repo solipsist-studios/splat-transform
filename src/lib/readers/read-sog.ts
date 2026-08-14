@@ -1,9 +1,13 @@
-import { Column, DataTable } from '../data-table/data-table';
-import { dirname, join, ReadFileSystem, readFile } from '../io/read';
-import { WebPCodec } from '../utils/webp-codec';
+import { Column, DataTable } from '../data-table';
+import { basename, dirname, join, type ReadFileSystem, readFile } from '../io/read';
+import { logger, Transform, WebPCodec } from '../utils';
+import { readSogV1, type MetaV1 } from './read-sog-v1';
 
-type Meta = {
-    version: number;
+// V2 (current) SOG meta layout - codebook-based quantization for scales /
+// sh0 / shN. Legacy V1 uses a different per-channel mins/maxs scheme and is
+// handled separately in read-sog-v1.ts.
+type MetaV2 = {
+    version: 2;
     count: number;
     means: { mins: number[]; maxs: number[]; files: string[] };
     scales: { codebook: number[]; files: string[] };
@@ -14,18 +18,12 @@ type Meta = {
 
 const decodeMeans = (lo: Uint8Array, hi: Uint8Array, count: number) => {
     const xs = new Uint16Array(count);
-    for (let i = 0; i < count; i++) {
-        const o = i * 4;
-        xs[i] = lo[o + 0] | (hi[o + 0] << 8);
-    }
     const ys = new Uint16Array(count);
-    for (let i = 0; i < count; i++) {
-        const o = i * 4;
-        ys[i] = lo[o + 1] | (hi[o + 1] << 8);
-    }
     const zs = new Uint16Array(count);
     for (let i = 0; i < count; i++) {
         const o = i * 4;
+        xs[i] = lo[o + 0] | (hi[o + 0] << 8);
+        ys[i] = lo[o + 1] | (hi[o + 1] << 8);
         zs[i] = lo[o + 2] | (hi[o + 2] << 8);
     }
     return { xs, ys, zs };
@@ -67,24 +65,54 @@ const sigmoidInv = (y: number) => {
 
 /**
  * Read a SOG file from a ReadFileSystem.
+ *
+ * The current (V2) format is decoded inline. Legacy V1 files (no `version`
+ * field, per-channel mins/maxs instead of codebooks) are detected here and
+ * forwarded to {@link readSogV1} in read-sog-v1.ts.
+ *
  * @param fileSystem - The file system to read from
- * @param filename - Path to meta.json (relative paths resolved from its directory)
+ * @param filename - Path to meta.json (relative paths resolved from its directory).
+ * The basename is used verbatim for the initial meta fetch so
+ * any URL querystring/fragment (e.g. presigned `?token=...`)
+ * is preserved.
  * @returns DataTable with Gaussian splat data
  * @ignore
  */
 const readSog = async (fileSystem: ReadFileSystem, filename: string): Promise<DataTable> => {
-    const decoder = await WebPCodec.create();
-
-    // Resolve paths relative to the meta.json directory
     const baseDir = dirname(filename);
-    const load = (name: string) => readFile(fileSystem, baseDir ? join(baseDir, name) : name);
+    const metaName = basename(filename);
+    const resolve = (name: string) => (baseDir ? join(baseDir, name) : name);
 
-    // meta.json
-    const metaBytes = await load('meta.json');
-    const meta = JSON.parse(new TextDecoder().decode(metaBytes)) as Meta;
+    const metaBytes = await readFile(fileSystem, resolve(metaName));
+    const rawMeta = JSON.parse(new TextDecoder().decode(metaBytes)) as MetaV2 | (MetaV1 & { version?: number });
+
+    // Dispatch:
+    //   - V1 (legacy) has no `version` field        -> readSogV1
+    //   - V2 (current) has `version: 2`             -> handled inline below
+    //   - any other (future/unknown) version        -> hard error rather than
+    //     silently mis-routing to V1, which would surface as confusing
+    //     downstream failures (missing `means.shape`, etc.).
+    const version = rawMeta.version;
+    if (version === undefined) {
+        return readSogV1(fileSystem, baseDir, rawMeta as MetaV1);
+    }
+    if (version !== 2) {
+        throw new Error(`Unsupported SOG meta version: ${version}`);
+    }
+    const meta = rawMeta as MetaV2;
+
+    const decoder = await WebPCodec.create();
     const count = meta.count;
 
-    // Prepare output columns
+    const load = async (name: string): Promise<Uint8Array> => {
+        const src = await fileSystem.createSource(resolve(name));
+        try {
+            return await src.read().readAll();
+        } finally {
+            src.close();
+        }
+    };
+
     const columns: Column[] = [
         new Column('x', new Float32Array(count)),
         new Column('y', new Float32Array(count)),
@@ -102,13 +130,23 @@ const readSog = async (fileSystem: ReadFileSystem, filename: string): Promise<Da
         new Column('rot_3', new Float32Array(count))
     ];
 
-    // means: two textures means_l and means_u
+    // One bar across all per-gaussian decode passes. Total = passes * count
+    // (means, quats, scales, sh0, plus an optional shN pass). Each pass ticks
+    // with `count` once it has finished writing into the output columns.
+    const numPasses = 4 + (meta.shN ? 1 : 0);
+    const bar = logger.bar('decoding', numPasses * count);
+    let passesDone = 0;
+    const tickPass = () => {
+        bar.update(++passesDone * count);
+    };
+
+    // means: two textures means_l (low byte) + means_u (high byte) packed as
+    // a 16-bit lerp between mins/maxs of the logTransform'd positions.
     const meansLoWebp = await load(meta.means.files[0]);
     const meansHiWebp = await load(meta.means.files[1]);
     const { rgba: lo, width, height } = decoder.decodeRGBA(meansLoWebp);
     const { rgba: hi } = decoder.decodeRGBA(meansHiWebp);
-    const total = width * height;
-    if (total < count) throw new Error('SOG means texture too small for count');
+    if (width * height < count) throw new Error('SOG means texture too small for count');
     const { mins, maxs } = meta.means;
     const { xs, ys, zs } = decodeMeans(lo, hi, count);
     const xCol = columns[0].data as Float32Array;
@@ -118,15 +156,15 @@ const readSog = async (fileSystem: ReadFileSystem, filename: string): Promise<Da
     const yMin = mins[1], yScale = (maxs[1] - mins[1]) || 1;
     const zMin = mins[2], zScale = (maxs[2] - mins[2]) || 1;
     for (let i = 0; i < count; i++) {
-        const lx = xMin + xScale * (xs[i] / 65535);
-        const ly = yMin + yScale * (ys[i] / 65535);
-        const lz = zMin + zScale * (zs[i] / 65535);
-        xCol[i] = invLogTransform(lx);
-        yCol[i] = invLogTransform(ly);
-        zCol[i] = invLogTransform(lz);
+        xCol[i] = invLogTransform(xMin + xScale * (xs[i] / 65535));
+        yCol[i] = invLogTransform(yMin + yScale * (ys[i] / 65535));
+        zCol[i] = invLogTransform(zMin + zScale * (zs[i] / 65535));
     }
+    tickPass();
 
-    // quats
+    // quats: 4 bytes per splat, last byte is the "largest component" tag
+    // (252-255 -> w/x/y/z is largest); other 3 encode the smaller components
+    // scaled by sqrt(2).
     const quatsWebp = await load(meta.quats.files[0]);
     const { rgba: qr, width: qw, height: qh } = decoder.decodeRGBA(quatsWebp);
     if (qw * qh < count) throw new Error('SOG quats texture too small for count');
@@ -137,27 +175,34 @@ const readSog = async (fileSystem: ReadFileSystem, filename: string): Promise<Da
     for (let i = 0; i < count; i++) {
         const o = i * 4;
         const tag = qr[o + 3];
-        if (tag < 252 || tag > 255) { // invalid tag, default identity
-            r0[i] = 0; r1[i] = 0; r2[i] = 0; r3[i] = 1;
+        if (tag < 252 || tag > 255) { // invalid tag, default to identity (rot_0 = w)
+            r0[i] = 1; r1[i] = 0; r2[i] = 0; r3[i] = 0;
             continue;
         }
-        const [x, y, z, wq] = unpackQuat(qr[o], qr[o + 1], qr[o + 2], tag);
-        r0[i] = x; r1[i] = y; r2[i] = z; r3[i] = wq;
+        // unpackQuat returns components in (w, x, y, z) order; rot_0..rot_3 map to (w, x, y, z).
+        const [w, x, y, z] = unpackQuat(qr[o], qr[o + 1], qr[o + 2], tag);
+        r0[i] = w; r1[i] = x; r2[i] = y; r3[i] = z;
     }
+    tickPass();
 
-    // scales: labels + codebook
+    // scales: each byte indexes the shared 256-entry codebook.
     const scalesWebp = await load(meta.scales.files[0]);
     const { rgba: sl, width: sw, height: sh } = decoder.decodeRGBA(scalesWebp);
     if (sw * sh < count) throw new Error('SOG scales texture too small for count');
     const sCode = new Float32Array(meta.scales.codebook);
+    const s0 = columns[3].data as Float32Array;
+    const s1 = columns[4].data as Float32Array;
+    const s2 = columns[5].data as Float32Array;
     for (let i = 0; i < count; i++) {
         const o = i * 4;
-        (columns[3].data as Float32Array)[i] = sCode[sl[o]];
-        (columns[4].data as Float32Array)[i] = sCode[sl[o + 1]];
-        (columns[5].data as Float32Array)[i] = sCode[sl[o + 2]];
+        s0[i] = sCode[sl[o]];
+        s1[i] = sCode[sl[o + 1]];
+        s2[i] = sCode[sl[o + 2]];
     }
+    tickPass();
 
-    // colors + opacity: sh0.webp encodes 3 labels + opacity byte
+    // sh0: 3 color bytes index the shared codebook; opacity byte is a sigmoid
+    // value, decoded back to a logit via sigmoidInv.
     const sh0Webp = await load(meta.sh0.files[0]);
     const { rgba: c0, width: cw, height: ch } = decoder.decodeRGBA(sh0Webp);
     if (cw * ch < count) throw new Error('SOG sh0 texture too small for count');
@@ -173,9 +218,10 @@ const readSog = async (fileSystem: ReadFileSystem, filename: string): Promise<Da
         dc2[i] = cCode[c0[o + 2]];
         opCol[i] = sigmoidInv(c0[o + 3] / 255);
     }
+    tickPass();
 
-    // Note: If present, SH higher bands (shN) are reconstructed into columns below.
-    // Higher-order SH (optional)
+    // shN (optional): indirect lookup via labels -> centroids palette, with
+    // each centroid pixel byte indexing the shared codebook.
     if (meta.shN) {
         const { bands, count: paletteCount } = meta.shN;
         const shCoeffs = [0, 3, 8, 15][bands];
@@ -184,9 +230,15 @@ const readSog = async (fileSystem: ReadFileSystem, filename: string): Promise<Da
             const centroidsWebp = await load(meta.shN.files[0]);
             const labelsWebp = await load(meta.shN.files[1]);
             const { rgba: centroidsRGBA, width: cW, height: cH } = decoder.decodeRGBA(centroidsWebp);
-            const { rgba: labelsRGBA } = decoder.decodeRGBA(labelsWebp);
+            const { rgba: labelsRGBA, width: lW, height: lH } = decoder.decodeRGBA(labelsWebp);
 
-            // Prepare f_rest_i columns
+            // Validate texture geometry up-front: missing guards would let
+            // truncated textures silently produce zeros (out-of-bounds typed-
+            // array reads coerce to 0 via the bitwise ops below) instead of
+            // failing like the means/quats/scales/sh0 passes do.
+            if (lW * lH < count) throw new Error('SOG shN labels texture too small for count');
+            if (cW !== 64 * shCoeffs) throw new Error(`SOG shN centroids texture width ${cW} does not match expected ${64 * shCoeffs} for ${bands}-band palette`);
+
             const baseIdx = columns.length;
             for (let i = 0; i < shCoeffs * 3; i++) {
                 columns.push(new Column(`f_rest_${i}`, new Float32Array(count)));
@@ -213,9 +265,15 @@ const readSog = async (fileSystem: ReadFileSystem, filename: string): Promise<Da
                 }
             }
         }
+        tickPass();
     }
 
-    return new DataTable(columns);
+    // Close the bar only on success: leaving it open on the error path lets
+    // `logger.error() -> unwindAll(true)` mark it as failed instead of
+    // finalizing it as a successful bar first.
+    bar.end();
+
+    return new DataTable(columns, Transform.PLY);
 };
 
 export { readSog };

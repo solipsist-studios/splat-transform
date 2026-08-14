@@ -1,9 +1,9 @@
 import { GraphicsDevice } from 'playcanvas';
 
 import { KdTree } from './kd-tree';
-import { Column, DataTable } from '../data-table/data-table';
-import { GpuClustering } from '../gpu/gpu-clustering';
-import { logger } from '../utils/logger';
+import { Column, DataTable } from '../data-table';
+import { GpuClustering } from '../gpu';
+import { logger } from '../utils';
 
 // use floyd's algorithm to pick m unique random indices from 0..n-1
 const pickRandomIndices = (n: number, m: number) => {
@@ -62,44 +62,6 @@ const calcAverage = (dataTable: DataTable, cluster: number[], row: any) => {
         for (let i = 0; i < keys.length; ++i) {
             row[keys[i]] /= cluster.length;
         }
-    }
-};
-
-// cpu cluster
-const clusterCpu = (points: DataTable, centroids: DataTable, labels: Uint32Array) => {
-    const numColumns = points.numColumns;
-
-    const pData = points.columns.map(c => c.data);
-    const cData = centroids.columns.map(c => c.data);
-
-    const point = new Float32Array(numColumns);
-
-    const distance = (centroidIndex: number) => {
-        let result = 0;
-        for (let i = 0; i < numColumns; ++i) {
-            const v = point[i] - cData[i][centroidIndex];
-            result += v * v;
-        }
-        return result;
-    };
-
-    for (let i = 0; i < points.numRows; ++i) {
-        let mind = Infinity;
-        let mini = -1;
-
-        for (let c = 0; c < numColumns; ++c) {
-            point[c] = pData[c][i];
-        }
-
-        for (let j = 0; j < centroids.numRows; ++j) {
-            const d = distance(j);
-            if (d < mind) {
-                mind = d;
-                mini = j;
-            }
-        }
-
-        labels[i] = mini;
     }
 };
 
@@ -165,45 +127,46 @@ const kmeans = async (points: DataTable, k: number, iterations: number, device?:
     let converged = false;
     let steps = 0;
 
-    logger.debug(`running k-means clustering: dims=${points.numColumns} points=${points.numRows} clusters=${k} iterations=${iterations}...`);
+    logger.debug(`running k-means clustering: dims=${points.numColumns} points=${points.numRows} clusters=${k} iterations=${iterations}`);
 
-    // Report iterations as anonymous nested steps
-    logger.progress.begin(iterations);
-
-    while (!converged) {
-        if (gpuClustering) {
-            await gpuClustering.execute(points, centroids, labels);
-        } else {
-            clusterKdTreeCpu(points, centroids, labels);
-        }
-
-        // calculate the new centroid positions
-        const groups = groupLabels(labels, k);
-        for (let i = 0; i < centroids.numRows; ++i) {
-            if (groups[i].length === 0) {
-                // re-seed this centroid to a random point to avoid zero vector
-                const idx = Math.floor(Math.random() * points.numRows);
-                points.getRow(idx, row);
-                centroids.setRow(i, row);
+    const bar = logger.bar('k-means', iterations);
+    try {
+        while (!converged) {
+            if (gpuClustering) {
+                await gpuClustering.execute(points, centroids, labels);
             } else {
-                calcAverage(points, groups[i], row);
-                centroids.setRow(i, row);
+                clusterKdTreeCpu(points, centroids, labels);
             }
+
+            // calculate the new centroid positions
+            const groups = groupLabels(labels, k);
+            for (let i = 0; i < centroids.numRows; ++i) {
+                if (groups[i].length === 0) {
+                    // re-seed this centroid to a random point to avoid zero vector
+                    const idx = Math.floor(Math.random() * points.numRows);
+                    points.getRow(idx, row);
+                    centroids.setRow(i, row);
+                } else {
+                    calcAverage(points, groups[i], row);
+                    centroids.setRow(i, row);
+                }
+            }
+
+            steps++;
+
+            if (steps >= iterations) {
+                converged = true;
+            }
+
+            bar.tick();
         }
-
-        steps++;
-
-        if (steps >= iterations) {
-            converged = true;
-        }
-
-        // Report iteration as anonymous step
-        logger.progress.step();
+    } catch (e) {
+        gpuClustering?.destroy();
+        throw e;
     }
 
-    if (gpuClustering) {
-        gpuClustering.destroy();
-    }
+    bar.end();
+    gpuClustering?.destroy();
 
     return { centroids, labels };
 };

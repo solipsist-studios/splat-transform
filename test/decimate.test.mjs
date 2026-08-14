@@ -65,7 +65,7 @@ function createVisibilityTestData(options = {}) {
 }
 
 describe('sortByVisibility', () => {
-    it('should sort indices by visibility score (descending)', () => {
+    it('should sort indices by visibility score (descending)', async () => {
         const testData = createVisibilityTestData({
             count: 4,
             x: new Float32Array([0, 1, 2, 3]),
@@ -84,7 +84,7 @@ describe('sortByVisibility', () => {
         assert.strictEqual(indices[3], 2, 'Lowest visibility should be last');
     });
 
-    it('should handle empty indices', () => {
+    it('should handle empty indices', async () => {
         const testData = createVisibilityTestData({ count: 4 });
         const indices = new Uint32Array(0);
 
@@ -93,7 +93,7 @@ describe('sortByVisibility', () => {
         assert.strictEqual(indices.length, 0, 'Empty indices should remain empty');
     });
 
-    it('should handle missing columns gracefully', () => {
+    it('should handle missing columns gracefully', async () => {
         const testData = new DataTable([
             new Column('x', new Float32Array([0, 1, 2])),
             new Column('y', new Float32Array([0, 0, 0])),
@@ -109,7 +109,7 @@ describe('sortByVisibility', () => {
             'Indices should be unchanged when columns are missing');
     });
 
-    it('should handle single element', () => {
+    it('should handle single element', async () => {
         const testData = createVisibilityTestData({
             count: 1,
             x: new Float32Array([5]),
@@ -127,33 +127,48 @@ describe('sortByVisibility', () => {
 });
 
 describe('simplifyGaussians', () => {
-    it('should return all splats when targetCount >= numRows', () => {
+    it('should return all splats when targetCount >= numRows', async () => {
         const testData = createMinimalTestData();
-        const result = simplifyGaussians(testData, 1000);
+        const result = await simplifyGaussians(testData, 1000);
         assert.strictEqual(result.numRows, testData.numRows, 'Should keep all rows');
     });
 
-    it('should return empty DataTable when targetCount is 0', () => {
+    it('should return empty DataTable when targetCount is 0', async () => {
         const testData = createMinimalTestData();
-        const result = simplifyGaussians(testData, 0);
+        const result = await simplifyGaussians(testData, 0);
         assert.strictEqual(result.numRows, 0, 'Should have 0 rows');
     });
 
-    it('should reduce to target count', () => {
+    it('should not invoke createDevice on the early-return path', async () => {
         const testData = createMinimalTestData();
-        const result = simplifyGaussians(testData, 8);
+        let invoked = false;
+        const createDevice = async () => {
+            invoked = true;
+            throw new Error('should not be called');
+        };
+        // No work needed (target >= numRows): factory must not be touched.
+        await simplifyGaussians(testData, 1000, createDevice);
+        assert.strictEqual(invoked, false, 'createDevice should be lazy');
+        // Same for the empty-output early return.
+        await simplifyGaussians(testData, 0, createDevice);
+        assert.strictEqual(invoked, false, 'createDevice should be lazy on empty target too');
+    });
+
+    it('should reduce to target count', async () => {
+        const testData = createMinimalTestData();
+        const result = await simplifyGaussians(testData, 8);
         assert.strictEqual(result.numRows, 8, 'Should have exactly 8 rows');
     });
 
-    it('should preserve all columns', () => {
+    it('should preserve all columns', async () => {
         const testData = createMinimalTestData();
         const originalCols = testData.columnNames.sort();
-        const result = simplifyGaussians(testData, 8);
+        const result = await simplifyGaussians(testData, 8);
         const resultCols = result.columnNames.sort();
         assert.deepStrictEqual(resultCols, originalCols, 'Should have same columns');
     });
 
-    it('should produce merged positions within the bounding box of originals', () => {
+    it('should produce merged positions within the bounding box of originals', async () => {
         const testData = createMinimalTestData();
         const origX = testData.getColumnByName('x').data;
         const origZ = testData.getColumnByName('z').data;
@@ -163,7 +178,7 @@ describe('simplifyGaussians', () => {
         const minZ = Math.min(...origZ);
         const maxZ = Math.max(...origZ);
 
-        const result = simplifyGaussians(testData, 4);
+        const result = await simplifyGaussians(testData, 4);
 
         const resX = result.getColumnByName('x').data;
         const resZ = result.getColumnByName('z').data;
@@ -175,9 +190,9 @@ describe('simplifyGaussians', () => {
         }
     });
 
-    it('should produce valid opacity values', () => {
+    it('should produce valid opacity values', async () => {
         const testData = createMinimalTestData();
-        const result = simplifyGaussians(testData, 8);
+        const result = await simplifyGaussians(testData, 8);
 
         const opacityData = result.getColumnByName('opacity').data;
         for (let i = 0; i < result.numRows; i++) {
@@ -187,9 +202,9 @@ describe('simplifyGaussians', () => {
         }
     });
 
-    it('should produce finite scale values', () => {
+    it('should produce finite scale values', async () => {
         const testData = createMinimalTestData();
-        const result = simplifyGaussians(testData, 8);
+        const result = await simplifyGaussians(testData, 8);
 
         for (const col of ['scale_0', 'scale_1', 'scale_2']) {
             const data = result.getColumnByName(col).data;
@@ -199,9 +214,9 @@ describe('simplifyGaussians', () => {
         }
     });
 
-    it('should produce normalized quaternion rotations', () => {
+    it('should produce normalized quaternion rotations', async () => {
         const testData = createMinimalTestData();
-        const result = simplifyGaussians(testData, 8);
+        const result = await simplifyGaussians(testData, 8);
 
         const r0 = result.getColumnByName('rot_0').data;
         const r1 = result.getColumnByName('rot_1').data;
@@ -214,7 +229,76 @@ describe('simplifyGaussians', () => {
         }
     });
 
-    it('should fall back to visibility pruning when rotation columns are missing', () => {
+    it('should mass-conserve opacity and area-weight color when merging two equal overlapping splats', async () => {
+        // Two unit-sphere splats co-located at the origin, both with logit
+        // opacity 0 (sigmoid → 0.5), identity rotation, and opposite DC
+        // colors. With equal ellipsoid areas Ai=Aj and equal αi=αj=0.5, the
+        // merged covariance equals each input's (no δ-spread term), so the
+        // merged ellipsoid area equals each input's. Mass-conservation gives
+        // α_m = (Σ αₖ·areaₖ) / area_merged = (0.5+0.5)·A / A = 1.0 (capped
+        // at 1). Color is the area·α-weighted average → (0.5, 0.5, 0).
+        //
+        // This locks in the post-NanoGS behavior: a merge of two visible
+        // overlapping splats should fully saturate opacity (not Porter-Duff's
+        // 0.75) and produce an unbiased color blend.
+        const testData = new DataTable([
+            new Column('x', new Float32Array([0, 0])),
+            new Column('y', new Float32Array([0, 0])),
+            new Column('z', new Float32Array([0, 0])),
+            new Column('opacity', new Float32Array([0, 0])),    // logit(0.5)
+            new Column('scale_0', new Float32Array([0, 0])),    // exp(0) = 1
+            new Column('scale_1', new Float32Array([0, 0])),
+            new Column('scale_2', new Float32Array([0, 0])),
+            new Column('rot_0', new Float32Array([1, 1])),
+            new Column('rot_1', new Float32Array([0, 0])),
+            new Column('rot_2', new Float32Array([0, 0])),
+            new Column('rot_3', new Float32Array([0, 0])),
+            new Column('f_dc_0', new Float32Array([1, 0])),
+            new Column('f_dc_1', new Float32Array([0, 1])),
+            new Column('f_dc_2', new Float32Array([0, 0]))
+        ]);
+
+        const result = await simplifyGaussians(testData, 1);
+        assert.strictEqual(result.numRows, 1, 'Should merge to a single splat');
+
+        // Position: centroid of two co-located origins → origin.
+        assertClose(result.getColumnByName('x').data[0], 0, 1e-5, 'merged x');
+        assertClose(result.getColumnByName('y').data[0], 0, 1e-5, 'merged y');
+        assertClose(result.getColumnByName('z').data[0], 0, 1e-5, 'merged z');
+
+        // Opacity: stored as logit; sigmoid back to linear should be ≈ 1.
+        // The logit helper clamps p to 1 - 1e-7, so we expect ≥ 0.99.
+        const linearOp = 1 / (1 + Math.exp(-result.getColumnByName('opacity').data[0]));
+        assert(linearOp >= 0.99,
+            `merged opacity sigmoid=${linearOp} should be ≈ 1 (mass-conserving), not Porter-Duff's 0.75`);
+
+        // Color: equal area·α weights → simple average.
+        assertClose(result.getColumnByName('f_dc_0').data[0], 0.5, 1e-5, 'merged f_dc_0 (red avg)');
+        assertClose(result.getColumnByName('f_dc_1').data[0], 0.5, 1e-5, 'merged f_dc_1 (green avg)');
+        assertClose(result.getColumnByName('f_dc_2').data[0], 0,   1e-5, 'merged f_dc_2');
+    });
+
+    it('should fail loud (throw) when every edge cost is non-finite', async () => {
+        // Degenerate input: finite positions (so the k-NN graph still yields
+        // edges) but non-finite appearance, which drives every edge cost to
+        // NaN. With no finite-cost pair to merge, the no-progress guard must
+        // throw rather than silently return an incompletely-decimated scene —
+        // locking in the fail-loud contract (and, via the CLI, a non-zero exit).
+        const inf = Infinity;
+        const testData = createVisibilityTestData({
+            count: 4,
+            x: new Float32Array([0, 1, 2, 3]),
+            f_dc_0: new Float32Array([inf, inf, inf, inf])
+        });
+
+        await assert.rejects(
+            () => simplifyGaussians(testData, 2),
+            /no valid merge pairs/,
+            'should throw when every edge cost is non-finite'
+        );
+    });
+
+    it('should fall back to visibility pruning when rotation columns are missing', async () => {
         const testData = new DataTable([
             new Column('x', new Float32Array([0, 1, 2, 3])),
             new Column('y', new Float32Array([0, 0, 0, 0])),
@@ -225,17 +309,17 @@ describe('simplifyGaussians', () => {
             new Column('scale_2', new Float32Array([0, 0, 0, Math.log(2)]))
         ]);
 
-        const result = simplifyGaussians(testData, 2);
+        const result = await simplifyGaussians(testData, 2);
         assert.strictEqual(result.numRows, 2, 'Should produce 2 rows via fallback');
     });
 });
 
 describe('decimate - Count Mode', () => {
-    it('should produce exactly N splats in count mode', () => {
+    it('should produce exactly N splats in count mode', async () => {
         const testData = createMinimalTestData();
         const originalRows = testData.numRows;
 
-        const result = processDataTable(testData, [{
+        const result = await processDataTable(testData, [{
             kind: 'decimate',
             count: 5,
             percent: null
@@ -245,11 +329,11 @@ describe('decimate - Count Mode', () => {
         assert(result.numRows < originalRows, 'Should have fewer rows than original');
     });
 
-    it('should keep all splats when count exceeds numRows', () => {
+    it('should keep all splats when count exceeds numRows', async () => {
         const testData = createMinimalTestData();
         const originalRows = testData.numRows;
 
-        const result = processDataTable(testData, [{
+        const result = await processDataTable(testData, [{
             kind: 'decimate',
             count: 1000,
             percent: null
@@ -258,10 +342,10 @@ describe('decimate - Count Mode', () => {
         assert.strictEqual(result.numRows, originalRows, 'Should keep all rows when count > numRows');
     });
 
-    it('should handle count of 0', () => {
+    it('should handle count of 0', async () => {
         const testData = createMinimalTestData();
 
-        const result = processDataTable(testData, [{
+        const result = await processDataTable(testData, [{
             kind: 'decimate',
             count: 0,
             percent: null
@@ -270,7 +354,7 @@ describe('decimate - Count Mode', () => {
         assert.strictEqual(result.numRows, 0, 'Should have 0 rows when count is 0');
     });
 
-    it('should produce merged splats with reasonable positions', () => {
+    it('should produce merged splats with reasonable positions', async () => {
         const testData = createVisibilityTestData({
             count: 4,
             x: new Float32Array([0, 1, 2, 3]),
@@ -280,7 +364,7 @@ describe('decimate - Count Mode', () => {
             scale_2: new Float32Array([0, 0, 0, Math.log(2)])
         });
 
-        const result = processDataTable(testData, [{
+        const result = await processDataTable(testData, [{
             kind: 'decimate',
             count: 2,
             percent: null
@@ -297,10 +381,10 @@ describe('decimate - Count Mode', () => {
 });
 
 describe('decimate - Percent Mode', () => {
-    it('should keep approximately X% of splats', () => {
+    it('should keep approximately X% of splats', async () => {
         const testData = createMinimalTestData();
 
-        const result = processDataTable(testData, [{
+        const result = await processDataTable(testData, [{
             kind: 'decimate',
             count: null,
             percent: 50
@@ -309,11 +393,11 @@ describe('decimate - Percent Mode', () => {
         assert.strictEqual(result.numRows, 8, 'Should have 50% of rows (8)');
     });
 
-    it('should keep all splats at 100%', () => {
+    it('should keep all splats at 100%', async () => {
         const testData = createMinimalTestData();
         const originalRows = testData.numRows;
 
-        const result = processDataTable(testData, [{
+        const result = await processDataTable(testData, [{
             kind: 'decimate',
             count: null,
             percent: 100
@@ -322,10 +406,10 @@ describe('decimate - Percent Mode', () => {
         assert.strictEqual(result.numRows, originalRows, 'Should keep all rows at 100%');
     });
 
-    it('should remove all splats at 0%', () => {
+    it('should remove all splats at 0%', async () => {
         const testData = createMinimalTestData();
 
-        const result = processDataTable(testData, [{
+        const result = await processDataTable(testData, [{
             kind: 'decimate',
             count: null,
             percent: 0
@@ -334,10 +418,10 @@ describe('decimate - Percent Mode', () => {
         assert.strictEqual(result.numRows, 0, 'Should have 0 rows at 0%');
     });
 
-    it('should handle 25%', () => {
+    it('should handle 25%', async () => {
         const testData = createMinimalTestData();
 
-        const result = processDataTable(testData, [{
+        const result = await processDataTable(testData, [{
             kind: 'decimate',
             count: null,
             percent: 25
@@ -348,7 +432,7 @@ describe('decimate - Percent Mode', () => {
 });
 
 describe('Visibility Score Calculation', () => {
-    it('should correctly compute visibility from logit opacity and log scales', () => {
+    it('should correctly compute visibility from logit opacity and log scales', async () => {
         const testData = createVisibilityTestData({
             count: 2,
             x: new Float32Array([0, 1]),
@@ -365,7 +449,7 @@ describe('Visibility Score Calculation', () => {
         assert.strictEqual(indices[1], 0, 'Lower opacity splat should be second');
     });
 
-    it('should correctly incorporate scale into visibility', () => {
+    it('should correctly incorporate scale into visibility', async () => {
         const testData = createVisibilityTestData({
             count: 2,
             x: new Float32Array([0, 1]),
@@ -382,7 +466,7 @@ describe('Visibility Score Calculation', () => {
         assert.strictEqual(indices[1], 0, 'Smaller scale splat should be second');
     });
 
-    it('should handle negative log scales (small splats)', () => {
+    it('should handle negative log scales (small splats)', async () => {
         const testData = createVisibilityTestData({
             count: 2,
             x: new Float32Array([0, 1]),
@@ -399,7 +483,7 @@ describe('Visibility Score Calculation', () => {
         assert.strictEqual(indices[1], 0, 'Small scale splat should be second');
     });
 
-    it('should handle very low opacity', () => {
+    it('should handle very low opacity', async () => {
         const testData = createVisibilityTestData({
             count: 2,
             x: new Float32Array([0, 1]),
@@ -418,7 +502,7 @@ describe('Visibility Score Calculation', () => {
 });
 
 describe('clone with row selection', () => {
-    it('should create smaller DataTable when indices.length < numRows', () => {
+    it('should create smaller DataTable when indices.length < numRows', async () => {
         const testData = new DataTable([
             new Column('a', new Float32Array([10, 20, 30, 40, 50, 60, 70, 80, 90, 100])),
             new Column('b', new Float32Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]))
@@ -440,7 +524,7 @@ describe('clone with row selection', () => {
         );
     });
 
-    it('should handle selecting just one row', () => {
+    it('should handle selecting just one row', async () => {
         const testData = new DataTable([
             new Column('a', new Float32Array([10, 20, 30, 40, 50]))
         ]);
@@ -452,7 +536,7 @@ describe('clone with row selection', () => {
         assert.strictEqual(result.getColumnByName('a').data[0], 30, 'Should have value from index 2');
     });
 
-    it('should handle empty indices', () => {
+    it('should handle empty indices', async () => {
         const testData = new DataTable([
             new Column('a', new Float32Array([10, 20, 30]))
         ]);
@@ -465,7 +549,7 @@ describe('clone with row selection', () => {
 });
 
 describe('clone with column selection', () => {
-    it('should return only the requested columns', () => {
+    it('should return only the requested columns', async () => {
         const testData = new DataTable([
             new Column('x', new Float32Array([1, 2, 3])),
             new Column('y', new Float32Array([4, 5, 6])),
@@ -481,7 +565,7 @@ describe('clone with column selection', () => {
         assert.strictEqual(result.getColumnByName('y'), undefined, 'Should not include y');
     });
 
-    it('should preserve typed array types', () => {
+    it('should preserve typed array types', async () => {
         const testData = new DataTable([
             new Column('a', new Uint8Array([1, 2, 3])),
             new Column('b', new Int32Array([4, 5, 6])),
@@ -494,7 +578,7 @@ describe('clone with column selection', () => {
         assert(result.getColumnByName('c').data instanceof Float64Array, 'Should preserve Float64Array');
     });
 
-    it('should produce an independent copy', () => {
+    it('should produce an independent copy', async () => {
         const testData = new DataTable([
             new Column('x', new Float32Array([1, 2, 3])),
             new Column('y', new Float32Array([4, 5, 6]))
@@ -506,7 +590,7 @@ describe('clone with column selection', () => {
         assert.strictEqual(testData.getColumnByName('x').data[0], 1, 'Source should be unmodified');
     });
 
-    it('should throw on unknown column names', () => {
+    it('should throw on unknown column names', async () => {
         const testData = new DataTable([
             new Column('x', new Float32Array([1, 2, 3]))
         ]);
@@ -517,7 +601,7 @@ describe('clone with column selection', () => {
         );
     });
 
-    it('should throw on empty columns array', () => {
+    it('should throw on empty columns array', async () => {
         const testData = new DataTable([
             new Column('x', new Float32Array([1, 2, 3]))
         ]);
@@ -530,7 +614,7 @@ describe('clone with column selection', () => {
 });
 
 describe('clone with rows and columns combined', () => {
-    it('should select specific rows and columns', () => {
+    it('should select specific rows and columns', async () => {
         const testData = new DataTable([
             new Column('x', new Float32Array([10, 20, 30, 40])),
             new Column('y', new Float32Array([1, 2, 3, 4])),
@@ -545,7 +629,7 @@ describe('clone with rows and columns combined', () => {
         assert.deepStrictEqual(Array.from(result.getColumnByName('z').data), [200, 400]);
     });
 
-    it('should handle rows reordering with column filter', () => {
+    it('should handle rows reordering with column filter', async () => {
         const testData = new DataTable([
             new Column('a', new Float32Array([10, 20, 30])),
             new Column('b', new Float32Array([1, 2, 3]))
@@ -559,10 +643,10 @@ describe('clone with rows and columns combined', () => {
 });
 
 describe('decimate Integration', () => {
-    it('should chain with other transforms', () => {
+    it('should chain with other transforms', async () => {
         const testData = createMinimalTestData();
 
-        const result = processDataTable(testData, [
+        const result = await processDataTable(testData, [
             { kind: 'translate', value: new Vec3(10, 0, 0) },
             { kind: 'decimate', count: 8, percent: null },
             { kind: 'scale', value: 2.0 }
@@ -570,13 +654,13 @@ describe('decimate Integration', () => {
 
         assert.strictEqual(result.numRows, 8, 'Should have 8 rows after filtering');
 
-        const xCol = result.getColumnByName('x').data;
-        for (let i = 0; i < result.numRows; i++) {
-            assert(xCol[i] > 10, `x[${i}] should be > 10 after transforms`);
-        }
+        // Raw data is unchanged by translate/scale (they compose into transform)
+        // scale(2) from origin after translate(10) doubles the translation too
+        assertClose(result.transform.translation.x, 20, 1e-5, 'tx');
+        assertClose(result.transform.scale, 2.0, 1e-5, 'scale');
     });
 
-    it('should preserve all columns after merging', () => {
+    it('should preserve all columns after merging', async () => {
         const testData = createVisibilityTestData({
             count: 4,
             x: new Float32Array([100, 200, 300, 400]),
@@ -588,7 +672,7 @@ describe('decimate Integration', () => {
             scale_2: new Float32Array([0, 0, 0, Math.log(2)])
         });
 
-        const result = processDataTable(testData, [{
+        const result = await processDataTable(testData, [{
             kind: 'decimate',
             count: 2,
             percent: null
@@ -605,10 +689,10 @@ describe('decimate Integration', () => {
         assert(result.hasColumn('f_dc_0'), 'Should have f_dc_0 column');
     });
 
-    it('should work with Morton ordering after filtering', () => {
+    it('should work with Morton ordering after filtering', async () => {
         const testData = createMinimalTestData();
 
-        const result = processDataTable(testData, [
+        const result = await processDataTable(testData, [
             { kind: 'decimate', count: 8, percent: null },
             { kind: 'mortonOrder' }
         ]);
@@ -620,10 +704,10 @@ describe('decimate Integration', () => {
         assert(result.hasColumn('z'), 'Should have z column');
     });
 
-    it('should produce finite values in all columns', () => {
+    it('should produce finite values in all columns', async () => {
         const testData = createMinimalTestData();
 
-        const result = processDataTable(testData.clone(), [{
+        const result = await processDataTable(testData.clone(), [{
             kind: 'decimate',
             count: 8,
             percent: null

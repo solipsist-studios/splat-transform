@@ -1,5 +1,8 @@
-import { Column, DataTable } from '../data-table/data-table';
+import { Column, DataTable } from '../data-table';
 import { ReadSource } from '../io/read';
+import { logger, Transform } from '../utils';
+
+const TICK_BATCH = 1 << 16;
 
 /**
  * Reads an Antimatter15 .splat file containing Gaussian splat data.
@@ -52,6 +55,8 @@ const readSplat = async (source: ReadSource): Promise<DataTable> => {
         new Column('rot_2', new Float32Array(numSplats)),
         new Column('rot_3', new Float32Array(numSplats))
     ];
+
+    const bar = logger.bar('decoding', numSplats);
 
     // Create a DataView for reading binary data
     const dataView = new DataView(fileBuffer.buffer, fileBuffer.byteOffset, fileBuffer.byteLength);
@@ -117,15 +122,22 @@ const readSplat = async (source: ReadSource): Promise<DataTable> => {
             (columns[12].data as Float32Array)[splatIndex] = rot2Norm / length;
             (columns[13].data as Float32Array)[splatIndex] = rot3Norm / length;
         } else {
-            // Default to identity quaternion if invalid
-            (columns[10].data as Float32Array)[splatIndex] = 0.0;
+            // Default to identity quaternion if invalid (rot_0 = w)
+            (columns[10].data as Float32Array)[splatIndex] = 1.0;
             (columns[11].data as Float32Array)[splatIndex] = 0.0;
             (columns[12].data as Float32Array)[splatIndex] = 0.0;
-            (columns[13].data as Float32Array)[splatIndex] = 1.0;
+            (columns[13].data as Float32Array)[splatIndex] = 0.0;
+        }
+
+        if ((splatIndex & (TICK_BATCH - 1)) === (TICK_BATCH - 1)) {
+            bar.update(splatIndex + 1);
         }
     }
 
-    return new DataTable(columns);
+    bar.update(numSplats);
+    bar.end();
+
+    return new DataTable(columns, Transform.PLY);
 };
 
 export { readSplat };

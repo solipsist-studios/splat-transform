@@ -1,27 +1,12 @@
-import { dirname, resolve } from 'pathe';
-import { GraphicsDevice } from 'playcanvas';
+import { basename, dirname, resolve } from 'pathe';
 
-import { version } from '../../../package.json';
-import { Column, DataTable } from '../data-table/data-table';
-import { sortMortonOrder } from '../data-table/morton-order';
+import { logWrittenFile } from './utils';
+import { Column, DataTable, sortMortonOrder, convertToSpace, getSHBands, shRestNames } from '../data-table';
 import { type FileSystem, writeFile, ZipFileSystem } from '../io/write';
-import { kmeans } from '../spatial/k-means';
-import { quantize1d } from '../spatial/quantize-1d';
-import { logger } from '../utils/logger';
-import { sigmoid } from '../utils/math';
-import { WebPCodec } from '../utils/webp-codec';
-
-/**
- * A function that creates a PlayCanvas GraphicsDevice on demand.
- *
- * Used for GPU-accelerated k-means clustering during SOG compression.
- * The application is responsible for caching if needed.
- *
- * @returns Promise resolving to a GraphicsDevice instance.
- */
-type DeviceCreator = () => Promise<GraphicsDevice>;
-
-const shNames = new Array(45).fill('').map((_, i) => `f_rest_${i}`);
+import { kmeans, quantize1d } from '../spatial';
+import type { DeviceCreator } from '../types';
+import { logger, sigmoid, Transform, WebPCodec } from '../utils';
+import { version } from '../version';
 
 const calcMinMax = (dataTable: DataTable, columnNames: string[], indices: Uint32Array) => {
     const columns = columnNames.map(name => dataTable.getColumnByName(name));
@@ -46,7 +31,7 @@ const logTransform = (value: number) => {
 };
 
 // no packing
-const identity = (index: number, width: number) => {
+const identity = (index: number) => {
     return index;
 };
 
@@ -68,6 +53,16 @@ type WriteSogOptions = {
     bundle: boolean;
     iterations: number;
     createDevice?: DeviceCreator;
+    // Controls how writeSog reports its own progress. This only affects
+    // writeSog's `Writing` group and per-file size lines; nested algorithm
+    // logging (e.g. `kmeans()` SH compression progress bars) still goes to
+    // the global logger and is not suppressed by 'silent'.
+    //   'own'    — open a `Writing` group and emit per-file info lines (default)
+    //   'flat'   — no group; emit per-file info lines into caller's scope
+    //   'silent' — suppress writeSog's own group/per-file info lines (use
+    //              when writing to an in-memory fs and the caller will log
+    //              the final bundled size itself)
+    logging?: 'own' | 'flat' | 'silent';
 };
 
 /**
@@ -82,10 +77,18 @@ type WriteSogOptions = {
  * @ignore
  */
 const writeSog = async (options: WriteSogOptions, fs: FileSystem) => {
-    const { filename: outputFilename, bundle, dataTable, iterations, createDevice } = options;
+    const { filename: outputFilename, bundle, iterations, createDevice } = options;
+    const logging = options.logging ?? 'own';
+    const emitInfo = logging !== 'silent';
+    const openGroup = logging === 'own';
+    const dataTable = convertToSpace(options.dataTable, Transform.PLY);
 
-    // initialize output stream - use ZipFileSystem for bundled output
-    const zipFs = bundle ? new ZipFileSystem(await fs.createWriter(outputFilename)) : null;
+    // initialize output stream - use ZipFileSystem for bundled output. The
+    // underlying writer's `bytesWritten` is read after close to report the
+    // final archive size as a single log entry instead of per-internal-file
+    // lines.
+    const bundleWriter = bundle ? await fs.createWriter(outputFilename) : null;
+    const zipFs = bundleWriter ? new ZipFileSystem(bundleWriter) : null;
     const outputFs = zipFs || fs;
 
     const indices = options.indices || generateIndices(dataTable);
@@ -94,12 +97,11 @@ const writeSog = async (options: WriteSogOptions, fs: FileSystem) => {
     const height = Math.ceil(numRows / width / 4) * 4;
     const channels = 4;
 
-    // the layout function determines how the data is packed into the output texture.
-    const layout = identity; // rectChunks;
+    // Texture texels follow the provided or generated index order.
+    const layout = identity;
 
     const writeWebp = async (filename: string, data: Uint8Array, w = width, h = height) => {
         const pathname = zipFs ? filename : resolve(dirname(outputFilename), filename);
-        logger.log(`writing '${pathname}'...`);
 
         // construct the encoder on first use
         if (!webPCodec) {
@@ -109,6 +111,12 @@ const writeSog = async (options: WriteSogOptions, fs: FileSystem) => {
         const webp = await webPCodec.encodeLosslessRGBA(data, w, h);
 
         await writeFile(outputFs, pathname, webp);
+
+        // For bundled output the per-file sizes are an internal detail; we
+        // report a single bundle size after the archive closes.
+        if (emitInfo && !zipFs) {
+            logWrittenFile(filename, webp.byteLength);
+        }
     };
 
     const writeTableData = (filename: string, dataTable: DataTable, w = width, h = height) => {
@@ -118,7 +126,7 @@ const writeSog = async (options: WriteSogOptions, fs: FileSystem) => {
 
         for (let i = 0; i < indices.length; ++i) {
             const idx = indices[i];
-            const ti = layout(i, width);
+            const ti = layout(i);
             data[ti * channels + 0] = columns[0][idx];
             data[ti * channels + 1] = numColumns > 1 ? columns[1][idx] : 0;
             data[ti * channels + 2] = numColumns > 2 ? columns[2][idx] : 0;
@@ -143,7 +151,7 @@ const writeSog = async (options: WriteSogOptions, fs: FileSystem) => {
             const y = 65535 * (logTransform(row.y) - meansMinMax[1][0]) / (meansMinMax[1][1] - meansMinMax[1][0]);
             const z = 65535 * (logTransform(row.z) - meansMinMax[2][0]) / (meansMinMax[2][1] - meansMinMax[2][0]);
 
-            const ti = layout(i, width);
+            const ti = layout(i);
 
             meansL[ti * 4] = x & 0xff;
             meansL[ti * 4 + 1] = y & 0xff;
@@ -189,14 +197,14 @@ const writeSog = async (options: WriteSogOptions, fs: FileSystem) => {
 
             // invert if max component is negative
             if (q[maxComp] < 0) {
-                q.forEach((v, j) => {
+                q.forEach((_v, j) => {
                     q[j] *= -1;
                 });
             }
 
             // scale by sqrt(2) to fit in [-1, 1] range
             const sqrt2 = Math.sqrt(2);
-            q.forEach((v, j) => {
+            q.forEach((_v, j) => {
                 q[j] *= sqrt2;
             });
 
@@ -207,7 +215,7 @@ const writeSog = async (options: WriteSogOptions, fs: FileSystem) => {
                 [0, 1, 2]
             ][maxComp];
 
-            const ti = layout(i, width);
+            const ti = layout(i);
 
             quats[ti * 4]     = 255 * (q[idx[0]] * 0.5 + 0.5);
             quats[ti * 4 + 1] = 255 * (q[idx[1]] * 0.5 + 0.5);
@@ -247,7 +255,7 @@ const writeSog = async (options: WriteSogOptions, fs: FileSystem) => {
 
     const writeSH = async (shBands: number) => {
         const shCoeffs = [0, 3, 8, 15][shBands];
-        const shColumnNames = shNames.slice(0, shCoeffs * 3);
+        const shColumnNames = shRestNames.slice(0, shCoeffs * 3);
         const shColumns = shColumnNames.map(name => dataTable.getColumnByName(name));
 
         // create a table with just spherical harmonics data
@@ -262,10 +270,8 @@ const writeSog = async (options: WriteSogOptions, fs: FileSystem) => {
         // Create GPU device lazily — only needed for SH k-means clustering
         const gpuDevice = createDevice ? await createDevice() : undefined;
 
-        logger.progress.step('Compressing spherical harmonics');
         const { centroids, labels } = await kmeans(shDataTable, paletteSize, iterations, gpuDevice);
 
-        logger.progress.step('Quantizing spherical harmonics');
         const codebook = quantize1d(centroids);
 
         // write centroids
@@ -291,7 +297,7 @@ const writeSog = async (options: WriteSogOptions, fs: FileSystem) => {
         const labelsBuf = new Uint8Array(width * height * channels);
         for (let i = 0; i < indices.length; ++i) {
             const label = labels[indices[i]];
-            const ti = layout(i, width);
+            const ti = layout(i);
 
             labelsBuf[ti * 4 + 0] = 0xff & label;
             labelsBuf[ti * 4 + 1] = 0xff & (label >> 8);
@@ -311,72 +317,84 @@ const writeSog = async (options: WriteSogOptions, fs: FileSystem) => {
         };
     };
 
-    const shBands = { '9': 1, '24': 2, '-1': 3 }[shNames.findIndex(v => !dataTable.hasColumn(v))] ?? 0;
-    const totalSteps = shBands > 0 ? 8 : 6;
+    const shBands = getSHBands(dataTable);
 
-    // convert and write attributes
-    logger.progress.begin(totalSteps);
+    const writingGroup = openGroup ? logger.group('Writing') : null;
 
-    logger.progress.step('Generating morton order');
-    // indices already generated above
+    try {
+        const meansMinMax = await writeMeans();
+        await writeQuaternions();
+        const scalesCodebook = await writeScales();
+        const colorsCodebook = await writeColors();
 
-    logger.progress.step('Writing positions');
-    const meansMinMax = await writeMeans();
+        let shN = null;
+        if (shBands > 0) {
+            shN = await writeSH(shBands);
+        }
 
-    logger.progress.step('Writing quaternions');
-    await writeQuaternions();
+        // construct meta.json
+        const meta: any = {
+            version: 2,
+            asset: {
+                generator: `splat-transform v${version}`
+            },
+            count: numRows,
+            means: {
+                mins: meansMinMax.mins,
+                maxs: meansMinMax.maxs,
+                files: [
+                    'means_l.webp',
+                    'means_u.webp'
+                ]
+            },
+            scales: {
+                codebook: scalesCodebook,
+                files: ['scales.webp']
+            },
+            quats: {
+                files: ['quats.webp']
+            },
+            sh0: {
+                codebook: colorsCodebook,
+                files: ['sh0.webp']
+            },
+            ...(shN ? { shN } : {})
+        };
 
-    logger.progress.step('Compressing scales');
-    const scalesCodebook = await writeScales();
+        const metaJson = (new TextEncoder()).encode(JSON.stringify(meta));
 
-    logger.progress.step('Compressing colors');
-    const colorsCodebook = await writeColors();
+        const metaFilename = zipFs ? 'meta.json' : outputFilename;
 
-    let shN = null;
-    if (shBands > 0) {
-        shN = await writeSH(shBands);
-    }
+        await writeFile(outputFs, metaFilename, metaJson);
 
-    logger.progress.step('Finalizing');
+        if (emitInfo && !zipFs) {
+            logWrittenFile(basename(outputFilename), metaJson.byteLength);
+        }
 
-    // construct meta.json
-    const meta: any = {
-        version: 2,
-        asset: {
-            generator: `splat-transform v${version}`
-        },
-        count: numRows,
-        means: {
-            mins: meansMinMax.mins,
-            maxs: meansMinMax.maxs,
-            files: [
-                'means_l.webp',
-                'means_u.webp'
-            ]
-        },
-        scales: {
-            codebook: scalesCodebook,
-            files: ['scales.webp']
-        },
-        quats: {
-            files: ['quats.webp']
-        },
-        sh0: {
-            codebook: colorsCodebook,
-            files: ['sh0.webp']
-        },
-        ...(shN ? { shN } : {})
-    };
+        // Close zip archive if bundling
+        if (zipFs) {
+            await zipFs.close();
+        }
 
-    const metaJson = (new TextEncoder()).encode(JSON.stringify(meta));
+        if (emitInfo && bundleWriter) {
+            logWrittenFile(basename(outputFilename), bundleWriter.bytesWritten);
+        }
 
-    const metaFilename = zipFs ? 'meta.json' : outputFilename;
-    await writeFile(outputFs, metaFilename, metaJson);
-
-    // Close zip archive if bundling
-    if (zipFs) {
-        await zipFs.close();
+        writingGroup?.end();
+    } catch (err) {
+        // Best-effort close of the underlying bundle writer to avoid a file
+        // handle leak / partially-written zip on failure. Leave `writingGroup`
+        // open so the caller's `logger.error()` -> `unwindAll(true)` marks it
+        // as failed.
+        if (bundleWriter) {
+            try {
+                await bundleWriter.close();
+            } catch {
+                // already failing — swallow secondary close errors
+            }
+        }
+        throw err;
     }
 };
 
-export { writeSog, type DeviceCreator };
+export { writeSog };

@@ -1,11 +1,10 @@
-import { Quat, Vec3 } from 'playcanvas';
+import { Vec3 } from 'playcanvas';
 
-import { Column, DataTable } from './data-table/data-table';
-import { simplifyGaussians } from './data-table/decimate';
-import { sortMortonOrder } from './data-table/morton-order';
-import { computeSummary, type SummaryData } from './data-table/summary';
-import { transform } from './data-table/transform';
-import { logger } from './utils/logger';
+import { Column, DataTable, simplifyGaussians, sortMortonOrder, computeSummary, type SummaryData, convertToSpace, getSHBands } from './data-table';
+import type { DeviceCreator } from './types';
+import { fmtCount, type Group, logger, Transform } from './utils';
+import { filterCluster as filterClusterFn } from './voxel/filter-cluster';
+import { filterFloaters as filterFloatersFn } from './voxel/filter-floaters';
 
 /**
  * Translate splats by a 3D vector offset.
@@ -52,8 +51,12 @@ type FilterNaN = {
  * (transformed) space: linear opacity (0-1), linear scale, and linear color (0-1).
  * The value is automatically converted to raw PLY space before comparison.
  *
- * To compare against raw PLY values directly, use the `_raw` suffix
- * (e.g. `opacity_raw`, `scale_0_raw`, `f_dc_0_raw`).
+ * To compare against raw PLY values directly (without the user-friendly conversion),
+ * use the `_raw` suffix (e.g. `opacity_raw`, `scale_0_raw`, `f_dc_0_raw`).
+ *
+ * If the DataTable has a pending spatial transform and the column is affected by it
+ * (position, rotation, scale, or SH columns), the transform is applied (baked in)
+ * before comparison. This applies to both regular and `_raw` columns.
  */
 type FilterByValue = {
     /** Action type identifier. */
@@ -155,6 +158,52 @@ type Decimate = {
 };
 
 /**
+ * Remove Gaussians that don't meaningfully contribute to any solid voxel.
+ *
+ * GPU-voxelizes the scene at a given resolution, then evaluates each Gaussian's
+ * opacity contribution at occupied voxel centers. Discards Gaussians whose
+ * contribution is below a minimum threshold at every solid voxel.
+ */
+type FilterFloaters = {
+    /** Action type identifier. */
+    kind: 'filterFloaters';
+    /** Voxel size in world units. Default: 0.05 */
+    voxelResolution?: number;
+    /** Opacity threshold for solid voxels. Default: 0.1 */
+    opacityCutoff?: number;
+    /** Minimum Gaussian contribution at a voxel center to be kept. Default: 1/255 */
+    minContribution?: number;
+};
+
+/**
+ * Filter Gaussians to keep only those in the connected cluster at a seed position.
+ *
+ * GPU-voxelizes the scene at a coarse resolution, finds the connected component
+ * of occupied blocks containing the seed, and keeps only Gaussians whose AABB
+ * overlaps that cluster.
+ */
+type FilterCluster = {
+    /** Action type identifier. */
+    kind: 'filterCluster';
+    /** Voxel size in world units for coarse voxelization. Default: 1.0 */
+    voxelResolution?: number;
+    /** Seed position for finding the connected component. Default: Vec3(0,0,0) */
+    seed?: Vec3;
+    /** Opacity threshold for solid voxels. Default: 0.999 */
+    opacityCutoff?: number;
+    /** Minimum Gaussian contribution at a cluster voxel center to be kept. Default: 0.1 */
+    minContribution?: number;
+};
+
+/**
+ * Options for processing actions that require external resources.
+ */
+type ProcessOptions = {
+    /** Function to create a GPU device (required for filterFloaters, filterCluster). */
+    createDevice?: DeviceCreator;
+};
+
+/**
  * A processing action to apply to splat data.
  *
  * Actions can transform, filter, or analyze the data:
@@ -166,14 +215,14 @@ type Decimate = {
  * - `filterBands` - Remove spherical harmonic bands above a threshold
  * - `filterBox` - Keep splats within a bounding box
  * - `filterSphere` - Keep splats within a sphere
+ * - `filterFloaters` - Remove splats not contributing to any occupied voxel (GPU)
+ * - `filterCluster` - Keep splats in the connected cluster at a seed position (GPU)
  * - `lod` - Assign LOD level to all splats
  * - `summary` - Print statistical summary to logger
  * - `mortonOrder` - Reorder splats by Morton code for spatial locality
  * - `decimate` - Simplify to target count via progressive pairwise merging
  */
-type ProcessAction = Translate | Rotate | Scale | FilterNaN | FilterByValue | FilterBands | FilterBox | FilterSphere | Param | Lod | Summary | MortonOrder | Decimate;
-
-const shNames = new Array(45).fill('').map((_, i) => `f_rest_${i}`);
+type ProcessAction = Translate | Rotate | Scale | FilterNaN | FilterByValue | FilterBands | FilterBox | FilterSphere | FilterFloaters | FilterCluster | Param | Lod | Summary | MortonOrder | Decimate;
 
 const SH_C0 = 0.28209479177387814;
 
@@ -209,6 +258,32 @@ const rawColumnMap: Record<string, string> = {
     'f_dc_0_raw': 'f_dc_0',
     'f_dc_1_raw': 'f_dc_1',
     'f_dc_2_raw': 'f_dc_2'
+};
+
+const transformColumnNames = new Set([
+    'x', 'y', 'z',
+    'rot_0', 'rot_1', 'rot_2', 'rot_3',
+    'scale_0', 'scale_1', 'scale_2'
+]);
+
+const isTransformColumn = (name: string): boolean => transformColumnNames.has(name) || /^f_rest_\d+$/.test(name);
+
+// Describe a delta as "removed N" / "added N" relative to the previous count.
+const describeDelta = (delta: number, noun: string): string => {
+    return delta > 0 ? `removed ${fmtCount(delta)} ${noun}` : `added ${fmtCount(-delta)} ${noun}`;
+};
+
+// Close a filter's group, emitting a single result line that summarizes the
+// row/column delta. Each filter case opens its own group at the top; this is
+// the symmetric "finish" that runs at the bottom.
+const endFilterGroup = (g: Group, prev: DataTable, next: DataTable) => {
+    const removedRows = prev.numRows - next.numRows;
+    const removedCols = prev.columnNames.length - next.columnNames.length;
+    const parts: string[] = [];
+    if (removedRows !== 0) parts.push(describeDelta(removedRows, 'gaussians'));
+    if (removedCols !== 0) parts.push(describeDelta(removedCols, 'columns'));
+    logger.info(parts.length > 0 ? parts.join(', ') : 'no change');
+    g.end();
 };
 
 const formatMarkdown = (summary: SummaryData): string => {
@@ -283,13 +358,14 @@ const filter = (dataTable: DataTable, predicate: (row: any, rowIndex: number) =>
  *
  * @param dataTable - The input splat data.
  * @param processActions - Array of actions to apply in sequence.
+ * @param options - Optional resources for GPU-dependent actions (e.g. filterCluster).
  * @returns The processed DataTable (may be a new instance if filtered).
  *
  * @example
  * ```ts
  * import { Vec3 } from 'playcanvas';
  *
- * const processed = processDataTable(dataTable, [
+ * const processed = await processDataTable(dataTable, [
  *     { kind: 'scale', value: 0.5 },
  *     { kind: 'translate', value: new Vec3(0, 1, 0) },
  *     { kind: 'filterNaN' },
@@ -298,7 +374,7 @@ const filter = (dataTable: DataTable, predicate: (row: any, rowIndex: number) =>
  * ]);
  * ```
  */
-const processDataTable = (dataTable: DataTable, processActions: ProcessAction[]) => {
+const processDataTable = async (dataTable: DataTable, processActions: ProcessAction[], options?: ProcessOptions): Promise<DataTable> => {
     let result = dataTable;
 
     for (let i = 0; i < processActions.length; i++) {
@@ -306,28 +382,30 @@ const processDataTable = (dataTable: DataTable, processActions: ProcessAction[])
 
         switch (processAction.kind) {
             case 'translate':
-                transform(result, processAction.value, Quat.IDENTITY, 1);
+                result.transform = new Transform(processAction.value).mul(result.transform);
                 break;
             case 'rotate':
-                transform(result, Vec3.ZERO, new Quat().setFromEulerAngles(
+                result.transform = new Transform().fromEulers(
                     processAction.value.x,
                     processAction.value.y,
                     processAction.value.z
-                ), 1);
+                ).mul(result.transform);
                 break;
             case 'scale':
-                transform(result, Vec3.ZERO, Quat.IDENTITY, processAction.value);
+                result.transform = new Transform(undefined, undefined, processAction.value).mul(result.transform);
                 break;
             case 'filterNaN': {
+                const g = logger.group('Filter NaN');
+                const prev = result;
                 const infOk = new Set(['opacity']);
                 const negInfOk = new Set(['scale_0', 'scale_1', 'scale_2']);
-                const columnNames = dataTable.columnNames;
+                const columnNames = result.columnNames;
 
-                const predicate = (row: any, rowIndex: number) => {
+                const predicate = (row: any) => {
                     for (const key of columnNames) {
                         const value = row[key];
                         if (!isFinite(value)) {
-                            if (value === -Infinity && (infOk.has(key) || negInfOk.has(key))) continue;
+                            if (value === -Infinity && negInfOk.has(key)) continue;
                             if (value === Infinity && infOk.has(key)) continue;
                             return false;
                         }
@@ -335,32 +413,53 @@ const processDataTable = (dataTable: DataTable, processActions: ProcessAction[])
                     return true;
                 };
                 result = filter(result, predicate);
+                endFilterGroup(g, prev, result);
                 break;
             }
             case 'filterByValue': {
+                const g = logger.group('Filter by value');
+                const prev = result;
                 const { comparator } = processAction;
                 let { columnName, value } = processAction;
 
                 if (rawColumnMap[columnName]) {
                     columnName = rawColumnMap[columnName];
                 } else if (inverseTransforms[columnName]) {
+                    if (columnName === 'opacity' && (value <= 0 || value >= 1)) {
+                        throw new Error(`filterByValue: opacity value must be between 0 and 1 (exclusive), got ${value}`);
+                    }
                     value = inverseTransforms[columnName](value);
                 }
 
+                if (!result.hasColumn(columnName)) {
+                    throw new Error(`filterByValue: column '${columnName}' not found in DataTable`);
+                }
+
+                if (!result.transform.isIdentity() && isTransformColumn(columnName)) {
+                    result = convertToSpace(result, Transform.IDENTITY);
+                }
+
                 const Predicates = {
-                    'lt': (row: any, rowIndex: number) => row[columnName] < value,
-                    'lte': (row: any, rowIndex: number) => row[columnName] <= value,
-                    'gt': (row: any, rowIndex: number) => row[columnName] > value,
-                    'gte': (row: any, rowIndex: number) => row[columnName] >= value,
-                    'eq': (row: any, rowIndex: number) => row[columnName] === value,
-                    'neq': (row: any, rowIndex: number) => row[columnName] !== value
+                    'lt': (row: any) => row[columnName] < value,
+                    'lte': (row: any) => row[columnName] <= value,
+                    'gt': (row: any) => row[columnName] > value,
+                    'gte': (row: any) => row[columnName] >= value,
+                    'eq': (row: any) => row[columnName] === value,
+                    'neq': (row: any) => row[columnName] !== value
                 };
-                const predicate = Predicates[comparator] ?? ((row: any, rowIndex: number) => true);
+                const predicate = Predicates[comparator as keyof typeof Predicates];
+                if (!predicate) {
+                    throw new Error(`filterByValue: unknown comparator '${comparator}', expected one of: ${Object.keys(Predicates).join(', ')}`);
+                }
                 result = filter(result, predicate);
+                endFilterGroup(g, prev, result);
                 break;
             }
             case 'filterBands': {
-                const inputBands = { '9': 1, '24': 2, '-1': 3 }[shNames.findIndex(v => !dataTable.hasColumn(v))] ?? 0;
+                const g = logger.group('Filter bands');
+                const prev = result;
+                const currentTable = result;
+                const inputBands = getSHBands(currentTable);
                 const outputBands = processAction.value;
 
                 if (outputBands < inputBands) {
@@ -382,27 +481,77 @@ const processDataTable = (dataTable: DataTable, processActions: ProcessAction[])
                         }
                         return column;
 
-                    }).filter(c => c !== null));
+                    }).filter(c => c !== null), result.transform);
                 }
+                endFilterGroup(g, prev, result);
                 break;
             }
             case 'filterBox': {
+                const g = logger.group('Filter box');
+                const prev = result;
                 const { min, max } = processAction;
-                const predicate = (row: any, rowIndex: number) => {
-                    const { x, y, z } = row;
-                    return x >= min.x && x <= max.x && y >= min.y && y <= max.y && z >= min.z && z <= max.z;
-                };
-                result = filter(result, predicate);
+
+                if (result.transform.isIdentity()) {
+                    const predicate = (row: any) => {
+                        const { x, y, z } = row;
+                        return x >= min.x && x <= max.x &&
+                               y >= min.y && y <= max.y &&
+                               z >= min.z && z <= max.z;
+                    };
+                    result = filter(result, predicate);
+                } else {
+                    const { translation, scale } = result.transform;
+                    if (scale === 0) {
+                        throw new Error('Cannot apply filterBox with scale 0');
+                    }
+                    const invRot = result.transform.rotation.clone().invert();
+
+                    const axes = [new Vec3(1, 0, 0), new Vec3(0, 1, 0), new Vec3(0, 0, 1)];
+                    const rawAxes = axes.map((a) => {
+                        const r = new Vec3();
+                        invRot.transformVector(a, r);
+                        return r;
+                    });
+
+                    const minArr = [min.x, min.y, min.z];
+                    const maxArr = [max.x, max.y, max.z];
+                    const rawMin = new Array(3);
+                    const rawMax = new Array(3);
+                    for (let j = 0; j < 3; j++) {
+                        const dot = axes[j].dot(translation);
+                        rawMin[j] = (minArr[j] - dot) / scale;
+                        rawMax[j] = (maxArr[j] - dot) / scale;
+                    }
+
+                    const predicate = (row: any) => {
+                        const { x, y, z } = row;
+                        for (let j = 0; j < 3; j++) {
+                            const proj = rawAxes[j].x * x + rawAxes[j].y * y + rawAxes[j].z * z;
+                            if (proj < rawMin[j] || proj > rawMax[j]) return false;
+                        }
+                        return true;
+                    };
+                    result = filter(result, predicate);
+                }
+                endFilterGroup(g, prev, result);
                 break;
             }
             case 'filterSphere': {
-                const { center, radius } = processAction;
-                const radiusSq = radius * radius;
-                const predicate = (row: any, rowIndex: number) => {
+                const g = logger.group('Filter sphere');
+                const prev = result;
+                const rawCenter = processAction.center.clone();
+                let rawRadius = processAction.radius;
+                if (!result.transform.isIdentity()) {
+                    result.transform.clone().invert().transformPoint(rawCenter, rawCenter);
+                    rawRadius /= result.transform.scale;
+                }
+                const radiusSq = rawRadius * rawRadius;
+                const predicate = (row: any) => {
                     const { x, y, z } = row;
-                    return (x - center.x) ** 2 + (y - center.y) ** 2 + (z - center.z) ** 2 < radiusSq;
+                    return (x - rawCenter.x) ** 2 + (y - rawCenter.y) ** 2 + (z - rawCenter.z) ** 2 < radiusSq;
                 };
                 result = filter(result, predicate);
+                endFilterGroup(g, prev, result);
                 break;
             }
             case 'param': {
@@ -440,10 +589,44 @@ const processDataTable = (dataTable: DataTable, processActions: ProcessAction[])
                 }
                 keepCount = Math.max(0, keepCount);
 
-                result = simplifyGaussians(result, keepCount);
+                // Pass the factory (not an eagerly-created device) so
+                // `simplifyGaussians` can create the device lazily — and skip
+                // creation entirely when the input is already at or below the
+                // target count. The caller of `processDataTable` is
+                // responsible for caching the device if it should be reused
+                // across actions (see `DeviceCreator` contract in types.ts).
+                result = await simplifyGaussians(result, keepCount, options?.createDevice);
+                break;
+            }
+            case 'filterFloaters': {
+                if (!options?.createDevice) {
+                    throw new Error('filterFloaters requires a createDevice function (GPU voxelization)');
+                }
+                result = await filterFloatersFn(
+                    result,
+                    options.createDevice,
+                    processAction.voxelResolution,
+                    processAction.opacityCutoff,
+                    processAction.minContribution
+                );
+                break;
+            }
+            case 'filterCluster': {
+                if (!options?.createDevice) {
+                    throw new Error('filterCluster requires a createDevice function (GPU voxelization)');
+                }
+                result = await filterClusterFn(
+                    result,
+                    options.createDevice,
+                    processAction.voxelResolution,
+                    processAction.seed,
+                    processAction.opacityCutoff,
+                    processAction.minContribution
+                );
                 break;
             }
         }
+
     }
 
     return result;
@@ -452,6 +635,7 @@ const processDataTable = (dataTable: DataTable, processActions: ProcessAction[])
 export {
     processDataTable,
     type ProcessAction,
+    type ProcessOptions,
     type Translate,
     type Rotate,
     type Scale,
@@ -460,6 +644,8 @@ export {
     type FilterBands,
     type FilterBox,
     type FilterSphere,
+    type FilterFloaters,
+    type FilterCluster,
     type Param,
     type Lod,
     type Summary,

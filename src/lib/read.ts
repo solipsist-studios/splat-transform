@@ -1,16 +1,7 @@
-import { DataTable } from './data-table/data-table';
-import { ReadFileSystem } from './io/read';
-import { ZipReadFileSystem } from './io/read/zip-file-system';
-import { readKsplat } from './readers/read-ksplat';
-import { readLcc } from './readers/read-lcc';
-import { readMjs } from './readers/read-mjs';
-import { readPly } from './readers/read-ply';
-import { readSog } from './readers/read-sog';
-import { readSplat } from './readers/read-splat';
-import { readSpz } from './readers/read-spz';
-import { readVoxel } from './readers/read-voxel';
+import { DataTable } from './data-table';
+import { ReadFileSystem, ZipReadFileSystem } from './io/read';
+import { readKsplat, readLcc, readMjs, readPly, readSog, readSplat, readSpz } from './readers';
 import { Options, Param } from './types';
-import { logger } from './utils/logger';
 
 /**
  * Supported input file formats for Gaussian splat data.
@@ -22,9 +13,8 @@ import { logger } from './utils/logger';
  * - `sog` - PlayCanvas SOG format (WebP-compressed)
  * - `lcc` - XGrids LCC format
  * - `mjs` - JavaScript module generator
- * - `voxel` - Sparse voxel octree format
  */
-type InputFormat = 'mjs' | 'ksplat' | 'splat' | 'sog' | 'ply' | 'spz' | 'lcc' | 'voxel';
+type InputFormat = 'mjs' | 'ksplat' | 'splat' | 'sog' | 'ply' | 'spz' | 'lcc';
 
 /**
  * Determines the input format based on file extension.
@@ -39,8 +29,24 @@ type InputFormat = 'mjs' | 'ksplat' | 'splat' | 'sog' | 'ply' | 'spz' | 'lcc' | 
  * const format2 = getInputFormat('scene.splat');  // returns 'splat'
  * ```
  */
+// Strip a trailing `?...` querystring and/or `#...` fragment from the
+// *basename* so that extension sniffing works for URL-shaped inputs:
+//   - full URLs:   `https://host/scene.sog?token=...`
+//   - CLI splits:  `scene.sog?token=...` (resolveInput passes the bare leaf
+//                  + query down to readFile so the initial fetch carries it)
+// Only the basename (text after the last `/` or `\`) is considered, so
+// POSIX paths containing `?` or `#` in *directory* segments are left
+// untouched. Local files literally named with `?`/`#` in the basename are
+// an unsupported edge case (the extension would be ambiguous anyway).
+const stripQueryAndHash = (filename: string): string => {
+    const lastSep = Math.max(filename.lastIndexOf('/'), filename.lastIndexOf('\\'));
+    const basenameStart = lastSep + 1;
+    const q = filename.slice(basenameStart).search(/[?#]/);
+    return q < 0 ? filename : filename.slice(0, basenameStart + q);
+};
+
 const getInputFormat = (filename: string): InputFormat => {
-    const lowerFilename = filename.toLowerCase();
+    const lowerFilename = stripQueryAndHash(filename).toLowerCase();
 
     if (lowerFilename.endsWith('.mjs')) {
         return 'mjs';
@@ -56,8 +62,6 @@ const getInputFormat = (filename: string): InputFormat => {
         return 'spz';
     } else if (lowerFilename.endsWith('.lcc')) {
         return 'lcc';
-    } else if (lowerFilename.endsWith('.voxel.json')) {
-        return 'voxel';
     }
 
     throw new Error(`Unsupported input file type: ${filename}`);
@@ -85,6 +89,10 @@ type ReadFileOptions = {
  * Supports multiple input formats including PLY, splat, ksplat, spz, SOG, and LCC.
  * Some formats (like LCC) may return multiple DataTables for different LOD levels.
  *
+ * Per-format progress (decoding bars, multi-payload bars) is emitted directly
+ * by each reader through the global {@link logger}; install a renderer via
+ * `logger.setRenderer(...)` to consume those events.
+ *
  * @param readFileOptions - Options specifying the file to read and how to read it.
  * @returns Promise resolving to an array of DataTables containing the splat data.
  *
@@ -108,13 +116,13 @@ const readFile = async (readFileOptions: ReadFileOptions): Promise<DataTable[]> 
 
     let result: DataTable[];
 
-    logger.log(`reading '${filename}'...`);
-
     if (inputFormat === 'mjs') {
         result = [await readMjs(filename, params)];
     } else if (inputFormat === 'sog') {
-        const lowerFilename = filename.toLowerCase();
+        const lowerFilename = stripQueryAndHash(filename).toLowerCase();
         if (lowerFilename.endsWith('.sog')) {
+            // Outer .sog is a ZIP container - mount it and let the inner SOG
+            // reader drive its own decode bar against the zipped payloads.
             const source = await fileSystem.createSource(filename);
             const zipFs = new ZipReadFileSystem(source);
             try {
@@ -126,12 +134,8 @@ const readFile = async (readFileOptions: ReadFileOptions): Promise<DataTable[]> 
             result = [await readSog(fileSystem, filename)];
         }
     } else if (inputFormat === 'lcc') {
-        // LCC uses ReadFileSystem for multi-file access
         result = await readLcc(fileSystem, filename, options);
-    } else if (inputFormat === 'voxel') {
-        result = [await readVoxel(fileSystem, filename)];
     } else {
-        // All other formats use ReadSource
         const source = await fileSystem.createSource(filename);
         try {
             if (inputFormat === 'ply') {
