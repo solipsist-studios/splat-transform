@@ -1,7 +1,7 @@
 import { DataTable } from './data-table';
 import { type FileSystem } from './io/write';
 import { type DeviceCreator, type Options } from './types';
-import { writeCompressedPly, writeCsv, writeGlb, writeHtml, writeImage, writeLod, writePly, writeSog, writeSpz, writeVoxel } from './writers';
+import { writeCompressedPly, writeCsv, writeGlb, writeHtml, writeImage, writeLod, writePly, writeSog, writeSogst, writeSpz, writeVoxel } from './writers';
 
 /**
  * Supported output file formats for Gaussian splat data.
@@ -13,13 +13,14 @@ import { writeCompressedPly, writeCsv, writeGlb, writeHtml, writeImage, writeLod
  * - `csv` - CSV text format (for debugging/analysis)
  * - `sog` - PlayCanvas SOG format (separate files)
  * - `sog-bundle` - PlayCanvas SOG format (bundled into single .sog file)
+ * - `sogst` - SOG spacetime format (animated splats, bundled into a single .sogst file)
  * - `lod` - Multi-LOD format with chunked data
  * - `html` - Self-contained HTML viewer (separate assets)
  * - `html-bundle` - Self-contained HTML viewer (all assets embedded)
  * - `voxel` - Sparse voxel octree format for collision detection
  * - `image` - Rasterized RGBA image (lossless WebP) rendered from a camera view
  */
-type OutputFormat = 'csv' | 'sog' | 'sog-bundle' | 'lod' | 'compressed-ply' | 'ply' | 'spz' | 'glb' | 'html' | 'html-bundle' | 'voxel' | 'image';
+type OutputFormat = 'csv' | 'sog' | 'sog-bundle' | 'sogst' | 'lod' | 'compressed-ply' | 'ply' | 'spz' | 'glb' | 'html' | 'html-bundle' | 'voxel' | 'image';
 
 /**
  * Options for writing a Gaussian splat file.
@@ -62,6 +63,8 @@ const getOutputFormat = (filename: string, options: Options): OutputFormat => {
         return 'voxel';
     } else if (lowerFilename.endsWith('lod-meta.json')) {
         return 'lod';
+    } else if (lowerFilename.endsWith('.sogst')) {
+        return 'sogst';
     } else if (lowerFilename.endsWith('.sog')) {
         return 'sog-bundle';
     } else if (lowerFilename.endsWith('meta.json')) {
@@ -120,6 +123,16 @@ const writeFile = async (writeOptions: WriteOptions, fs: FileSystem) => {
                 dataTable,
                 bundle: outputFormat === 'sog-bundle',
                 iterations: options.iterations,
+                createDevice
+            }, fs);
+            break;
+        case 'sogst':
+            await writeSogst({
+                filename,
+                dataTable,
+                iterations: options.iterations,
+                clip: options.sogstClip,
+                segmentDuration: options.segmentDuration,
                 createDevice
             }, fs);
             break;

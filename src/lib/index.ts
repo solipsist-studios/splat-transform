@@ -47,8 +47,10 @@ export type { FileSystem, Writer } from './io/write';
 export { readKsplat, readLcc, readMjs, readPly, readSog, readSplat, readSpz } from './readers';
 
 // Individual writers (for advanced use)
-export { writeSog, writeSpz, writePly, writeCompressedPly, writeCsv, writeHtml, writeImage, writeLod, writeGlb, writeVoxel } from './writers';
+export { writeSog, writeSogst, writeSpz, writePly, writeCompressedPly, writeCsv, writeHtml, writeImage, writeLod, writeGlb, writeVoxel } from './writers';
+export { parseSogstComments, requireSogstClip } from './writers';
 export type { WriteImageOptions, WriteVoxelOptions, VoxelMetadata } from './writers';
+export type { WriteSogstOptions, Segment, Segments, SogstClip } from './writers';
 
 // Renderer (for advanced use)
 export { renderSplats, buildCameraBasis } from './render';

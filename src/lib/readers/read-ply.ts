@@ -315,6 +315,9 @@ const readPly = async (source: ReadSource): Promise<DataTable> => {
 
     result.transform = Transform.PLY.clone();
 
+    // surface the header comments — some formats carry file-level scalars there
+    result.comments = header.comments;
+
     // Close the bar only on success: leaving it open on any earlier error
     // path (missing `vertex` element, `decompressPly` failure, etc.) lets
     // `logger.error() -> unwindAll(true)` mark it as failed instead of

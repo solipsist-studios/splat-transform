@@ -1,3 +1,5 @@
+import { type SogstClip } from './writers/sogst-clip';
+
 /**
  * Collision mesh shape generated alongside voxel output.
  *
@@ -30,6 +32,16 @@ type Options = {
 
     /** SPZ format version to write. Default: 4. */
     spzVersion?: 3 | 4;
+
+    /** Temporal segment length in seconds for .sogst output. 0 disables segmentation. Default: 0.1 */
+    segmentDuration?: number;
+
+    /**
+     * Clip-level scalars for .sogst output. Normally read from the input PLY's
+     * `comment sogst.*` header lines; anything set here overrides them. There
+     * are no defaults for timeMin, timeMax and fps.
+     */
+    sogstClip?: Partial<SogstClip>;
 
     /** Size of each voxel in world units for voxel output. Default: 0.05 */
     voxelResolution?: number;

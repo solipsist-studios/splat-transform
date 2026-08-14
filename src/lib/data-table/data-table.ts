@@ -88,6 +88,16 @@ class DataTable {
     columns: Column[];
     transform: Transform;
 
+    /**
+     * File-level comment lines from the source file, when the reader had any.
+     * Formats that carry clip-level scalars out of band (see the `.sogst`
+     * interchange PLY) read them from here.
+     *
+     * Not preserved by `clone()` or `combine()` — read it off the table the
+     * reader returned, before processing.
+     */
+    comments?: string[];
+
     constructor(columns: Column[], transform?: Transform) {
         if (columns.length === 0) {
             throw new Error('DataTable must have at least one column');

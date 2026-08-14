@@ -19,6 +19,7 @@ import {
     getOutputFormat,
     writeFile,
     processDataTable,
+    parseSogstComments,
     revision,
     TextRenderer,
     UrlReadFileSystem,
@@ -132,6 +133,8 @@ const cliOptionsConfig = {
     'lod-chunk-count': { type: 'string', short: 'C', default: '512' },
     'lod-chunk-extent': { type: 'string', short: 'X', default: '16' },
     'spz-version': { type: 'string', default: '4' },
+    'segment-duration': { type: 'string', short: 'T', default: '0.1' },
+    fps: { type: 'string', short: 'f', default: '' },
     unbundled: { type: 'boolean', short: 'U', default: false },
     'voxel-params': { type: 'string', default: '' },
     'voxel-external-fill': { type: 'string' },
@@ -482,6 +485,10 @@ const parseArguments = async () => {
         lodChunkCount: parseInteger(v['lod-chunk-count']),
         lodChunkExtent: parseInteger(v['lod-chunk-extent']),
         spzVersion: spzVersion as 3 | 4,
+        segmentDuration: parseNumber(v['segment-duration']),
+        // clip scalars normally come from the input PLY's sogst.* comments;
+        // -f overrides only the frame rate
+        sogstClip: v.fps ? { fps: parseNumber(v.fps) } : {},
         voxelResolution,
         opacityCutoff,
         navExteriorRadius,
@@ -508,6 +515,14 @@ const parseArguments = async () => {
         renderShutter,
         renderMotionSamples
     };
+
+    if (!Number.isFinite(options.segmentDuration) || options.segmentDuration < 0) {
+        throw new Error(`Invalid segment-duration value: ${options.segmentDuration}. Must be a finite number >= 0 (0 disables segmentation).`);
+    }
+
+    if (options.sogstClip.fps !== undefined && (!Number.isFinite(options.sogstClip.fps) || options.sogstClip.fps <= 0)) {
+        throw new Error(`Invalid fps value: ${options.sogstClip.fps}. Must be a finite number > 0.`);
+    }
 
     for (const t of tokens) {
         if (t.kind === 'positional') {
@@ -727,7 +742,10 @@ SUPPORTED INPUTS
     .mjs generators are local-only).
 
 SUPPORTED OUTPUTS
-    .ply   .compressed.ply   .sog   .spz   meta.json   lod-meta.json   .glb   .csv   .html   .voxel.json   .webp   null
+    .ply   .compressed.ply   .sog   .sogst   .spz   meta.json   lod-meta.json   .glb   .csv   .html   .voxel.json   .webp   null
+
+    .sogst is SOG extended to spacetime: it needs an input PLY carrying the standard
+    3DGS columns plus vx, vy, vz, t_center, t_sigma (and optionally ax, ay, az).
 
 ACTIONS (executed in order; can be repeated)
     -t, --translate        <x,y,z>          Translate Gaussians by (x, y, z)
@@ -763,6 +781,10 @@ GPU (used by SOG compression and GPU voxelization: --filter-cluster, --filter-fl
 
 SOG COMPRESSION (.sog, meta.json, lod-meta.json, .html outputs)
     -i, --iterations       <n>              SH compression iterations (more=better). Default: 10
+
+SOGST OUTPUT (.sogst)
+    -T, --segment-duration <n>              Temporal segment length in seconds. 0 disables. Default: 0.1
+    -f, --fps              <n>              Override the playback rate recorded in the file
 
 SPZ OUTPUT (.spz)
         --spz-version      <3|4>            The SPZ format version to write. Default: 4
@@ -1070,6 +1092,9 @@ const main = async () => {
         // declare phase total: one Read phase per input + one Write phase
         const phaseTotal = inputArgs.length + (isNullOutput ? 0 : 1);
 
+        // sogst clip scalars discovered in the inputs' PLY comments
+        const clipFromInputs: Partial<LibOptions['sogstClip']> = {};
+
         // read, filter, process input files
         const inputDataTables: DataTable[] = [];
         for (let inputIdx = 0; inputIdx < inputArgs.length; inputIdx++) {
@@ -1119,6 +1144,10 @@ const main = async () => {
 
                 logDataTableInfo(dataTable);
 
+                // clip scalars ride in the PLY header, and processing does not
+                // carry comments through — read them off the table as it arrives
+                Object.assign(clipFromInputs, parseSogstComments(dataTable.comments));
+
                 const isEnv = dataTable.hasColumn('lod') && dataTable.getColumnByName('lod').data.every(v => v === -1);
                 if (!isEnv) {
                     dataTables[i] = await processDataTable(dataTable, inputArg.processActions, processOptions);
@@ -1149,6 +1178,9 @@ const main = async () => {
             outputArg.processActions,
             processOptions
         );
+
+        // explicit flags win over whatever the inputs declared
+        options.sogstClip = { ...clipFromInputs, ...options.sogstClip };
 
         // Skip file writing for null output
         if (!isNullOutput) {
