@@ -1,5 +1,6 @@
 import { basename, dirname, resolve } from 'pathe';
 
+import { calcMinMax, logTransform, texDims } from './sog-common';
 import { logWrittenFile } from './utils';
 import { Column, DataTable, sortMortonOrder, convertToSpace, getSHBands, shRestNames } from '../data-table';
 import { type FileSystem, writeFile, ZipFileSystem } from '../io/write';
@@ -7,28 +8,6 @@ import { kmeans, quantize1d } from '../spatial';
 import type { DeviceCreator } from '../types';
 import { logger, sigmoid, Transform, WebPCodec } from '../utils';
 import { version } from '../version';
-
-const calcMinMax = (dataTable: DataTable, columnNames: string[], indices: Uint32Array) => {
-    const columns = columnNames.map(name => dataTable.getColumnByName(name));
-    const minMax = columnNames.map(() => [Infinity, -Infinity]);
-    const row = {};
-
-    for (let i = 0; i < indices.length; ++i) {
-        const r = dataTable.getRow(indices[i], row, columns);
-
-        for (let j = 0; j < columnNames.length; ++j) {
-            const value = r[columnNames[j]];
-            if (value < minMax[j][0]) minMax[j][0] = value;
-            if (value > minMax[j][1]) minMax[j][1] = value;
-        }
-    }
-
-    return minMax;
-};
-
-const logTransform = (value: number) => {
-    return Math.sign(value) * Math.log(Math.abs(value) + 1);
-};
 
 // no packing
 const identity = (index: number) => {
@@ -93,8 +72,7 @@ const writeSog = async (options: WriteSogOptions, fs: FileSystem) => {
 
     const indices = options.indices || generateIndices(dataTable);
     const numRows = indices.length;
-    const width = Math.ceil(Math.sqrt(numRows) / 4) * 4;
-    const height = Math.ceil(numRows / width / 4) * 4;
+    const { width, height } = texDims(numRows);
     const channels = 4;
 
     // Texture texels follow the provided or generated index order.
