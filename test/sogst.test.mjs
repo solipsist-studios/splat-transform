@@ -16,11 +16,11 @@ import {
     MemoryFileSystem,
     WebPCodec,
     writeSogst,
-    parseSogstComments,
-    computeSummary
+    parseSogstComments
 } from '../src/lib/index.js';
 
 import { createTestDataTable, addSpacetimeColumns } from './helpers/test-utils.mjs';
+import { computeStatsView } from './helpers/summary-compare.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 WebPCodec.wasmUrl = join(__dirname, '..', 'lib', 'webp.wasm');
@@ -641,7 +641,7 @@ describe('SOGST Format', () => {
 
     it('should preserve per-column ranges within quantization tolerance', async () => {
         const source = makeFixture(64);
-        const expected = computeSummary(source);
+        const expected = await computeStatsView(source);
         const { fields, meta } = decodeSogst(await writeToMemory(source));
 
         assert.strictEqual(meta.count, expected.rowCount);

@@ -177,9 +177,10 @@ function addSpacetimeColumns(dataTable, options = {}) {
 /**
  * Encodes a DataTable to PLY binary format.
  * @param {DataTable} dataTable - The data to encode
+ * @param {string[]} comments - Header comments (without the leading `comment `)
  * @returns {Uint8Array} PLY file as binary data
  */
-function encodePlyBinary(dataTable) {
+function encodePlyBinary(dataTable, comments = []) {
     const columns = dataTable.columns;
     const numRows = dataTable.numRows;
 
@@ -200,6 +201,7 @@ function encodePlyBinary(dataTable) {
     const headerLines = [
         'ply',
         'format binary_little_endian 1.0',
+        ...comments.map(c => `comment ${c}`),
         `element vertex ${numRows}`,
         ...columns.map(c => `property ${columnTypeToPlyType(c.dataType)} ${c.name}`),
         'end_header'

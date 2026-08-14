@@ -1,4 +1,15 @@
-import { DataTable } from '../data-table';
+/**
+ * KD-tree over raw column arrays: a pointer-node tree for CPU queries
+ * (`KdTree`), and a direct-to-flat builder (`buildFlatKdTree`) emitting the
+ * GPU traversal layout without intermediate node objects.
+ *
+ * Engine-free by contract: worker tasks build trees off-thread, and the
+ * worker bundle inlines its whole import graph — an engine import here would
+ * embed playcanvas into dist/worker.mjs (see the note atop workers/tasks.ts).
+ *
+ * `KdTree` dimensionality is the number of columns: 3 for spatial consumers,
+ * arbitrary for k-means centroid assignment. `buildFlatKdTree` is 3D only.
+ */
 
 interface KdTreeNode {
     index: number;
@@ -7,7 +18,23 @@ interface KdTreeNode {
     right?: KdTreeNode;
 }
 
-const nthElement = (arr: Uint32Array, lo: number, hi: number, k: number, values: any) => {
+/**
+ * A kd-tree in GPU-friendly flat typed arrays (the exact layout GpuKnn
+ * uploads). For tree index `t`, the node holds splat `nodeSplatIdx[t]` at
+ * position `nodePositions[t*3 + 0/1/2]`; children are
+ * `nodeChildren[t*2 + 0/1]` (left, right) with the sentinel `0xFFFFFFFF`
+ * for missing children. The root is at index 0. Node positions are
+ * denormalised (rather than indirected through `nodeSplatIdx` + the source
+ * position arrays) so a tree-walk does one read per visit instead of two.
+ */
+type FlatKdTree = {
+    nodeSplatIdx: Uint32Array;
+    nodePositions: Float32Array;
+    nodeChildren: Uint32Array;
+    rootIdx: number;
+};
+
+const nthElement = (arr: Uint32Array, lo: number, hi: number, k: number, values: ArrayLike<number>) => {
     while (lo < hi) {
         const mid = (lo + hi) >> 1;
         const va = values[arr[lo]], vb = values[arr[mid]], vc = values[arr[hi]];
@@ -17,32 +44,111 @@ const nthElement = (arr: Uint32Array, lo: number, hi: number, k: number, values:
         else pivotIdx = hi;
 
         const pivotVal = values[arr[pivotIdx]];
-        let tmp = arr[pivotIdx]; arr[pivotIdx] = arr[hi]; arr[hi] = tmp;
-        let store = lo;
-        for (let i = lo; i < hi; i++) {
-            if (values[arr[i]] < pivotVal) {
-                tmp = arr[i]; arr[i] = arr[store]; arr[store] = tmp;
-                store++;
+
+        // 3-way (Dutch National Flag) partition around pivotVal:
+        //   [lo..lt-1] < pivot, [lt..gt] == pivot, [gt+1..hi] > pivot.
+        // The 2-way Lomuto partition this replaces moved only strictly-less
+        // elements, so an all-equal range shrank by one per pass and degenerated
+        // to O(N^2) — fatal for inputs where many points share a coordinate
+        // (e.g. a splat with every gaussian at the origin).
+        let lt = lo, gt = hi, i = lo;
+        let tmp: number;
+        while (i <= gt) {
+            const v = values[arr[i]];
+            if (v < pivotVal) {
+                tmp = arr[i]; arr[i] = arr[lt]; arr[lt] = tmp;
+                lt++; i++;
+            } else if (v > pivotVal) {
+                tmp = arr[i]; arr[i] = arr[gt]; arr[gt] = tmp;
+                gt--;
+            } else {
+                i++;
             }
         }
-        tmp = arr[store]; arr[store] = arr[hi]; arr[hi] = tmp;
 
-        if (store === k) return;
-        else if (store < k) lo = store + 1;
-        else hi = store - 1;
+        if (k < lt) hi = lt - 1;
+        else if (k > gt) lo = gt + 1;
+        else return; // k within the equal block; arr[k] is the order statistic
     }
 };
 
+/**
+ * Build a 3D kd-tree directly into the flat GPU layout — no intermediate
+ * pointer-node graph (which costs ~50-80 B/node of JS objects and GC
+ * pressure, prohibitive at part-scale point counts).
+ *
+ * Same structure as `KdTree`'s build: median split via `nthElement`, axis
+ * cycling x→y→z by depth, two-point ranges ordered so the smaller value is
+ * the node and the larger its right child. Nodes are emitted in pre-order
+ * DFS (left subtree before right), root at index 0. Recursion depth is
+ * bounded by the median split (≈ log2 n).
+ *
+ * @param x - Point x column.
+ * @param y - Point y column.
+ * @param z - Point z column.
+ * @returns The flat tree over all points.
+ */
+const buildFlatKdTree = (x: Float32Array, y: Float32Array, z: Float32Array): FlatKdTree => {
+    const n = x.length;
+    const cols = [x, y, z];
+    const indices = new Uint32Array(n);
+    for (let i = 0; i < n; i++) indices[i] = i;
+
+    const nodeSplatIdx = new Uint32Array(n);
+    const nodePositions = new Float32Array(n * 3);
+    const nodeChildren = new Uint32Array(n * 2).fill(0xFFFFFFFF);
+
+    let cursor = 0;
+    const emit = (splat: number): number => {
+        const t = cursor++;
+        nodeSplatIdx[t] = splat;
+        const t3 = t * 3;
+        nodePositions[t3] = x[splat];
+        nodePositions[t3 + 1] = y[splat];
+        nodePositions[t3 + 2] = z[splat];
+        return t;
+    };
+
+    const build = (lo: number, hi: number, depth: number): number => {
+        const count = hi - lo + 1;
+
+        if (count === 1) return emit(indices[lo]);
+
+        const values = cols[depth % 3];
+
+        if (count === 2) {
+            if (values[indices[lo]] > values[indices[hi]]) {
+                const tmp = indices[lo]; indices[lo] = indices[hi]; indices[hi] = tmp;
+            }
+            const t = emit(indices[lo]);
+            nodeChildren[t * 2 + 1] = emit(indices[hi]);
+            return t;
+        }
+
+        const mid = lo + (count >> 1);
+        nthElement(indices, lo, hi, mid, values);
+
+        const t = emit(indices[mid]);
+        nodeChildren[t * 2] = build(lo, mid - 1, depth + 1);
+        nodeChildren[t * 2 + 1] = build(mid + 1, hi, depth + 1);
+        return t;
+    };
+
+    if (n > 0) build(0, n - 1, 0);
+
+    return { nodeSplatIdx, nodePositions, nodeChildren, rootIdx: 0 };
+};
+
 class KdTree {
-    centroids: DataTable;
     root: KdTreeNode;
-    private colData: any[];
+    readonly colData: ArrayLike<number>[];
+    readonly numRows: number;
 
-    constructor(centroids: DataTable) {
-        const numCols = centroids.numColumns;
-        const colData = centroids.columns.map(c => c.data);
+    constructor(colData: ArrayLike<number>[]) {
+        const numCols = colData.length;
+        const numRows = colData[0].length;
 
-        const indices = new Uint32Array(centroids.numRows);
+        const indices = new Uint32Array(numRows);
         for (let i = 0; i < indices.length; ++i) {
             indices[i] = i;
         }
@@ -81,12 +187,12 @@ class KdTree {
             };
         };
 
-        this.centroids = centroids;
         this.colData = colData;
+        this.numRows = numRows;
         this.root = build(0, indices.length - 1, 0);
     }
 
-    findNearest(point: Float32Array, filterFunc?: (index: number) => boolean) {
+    findNearest(point: ArrayLike<number>, filterFunc?: (index: number) => boolean) {
         const colData = this.colData;
         const numCols = colData.length;
 
@@ -130,11 +236,11 @@ class KdTree {
         return { index: mini, distanceSqr: mind, cnt };
     }
 
-    findKNearest(point: Float32Array, k: number, filterFunc?: (index: number) => boolean) {
+    findKNearest(point: ArrayLike<number>, k: number, filterFunc?: (index: number) => boolean) {
         if (k <= 0) {
             return { indices: new Int32Array(0), distances: new Float32Array(0) };
         }
-        k = Math.min(k, this.centroids.numRows);
+        k = Math.min(k, this.numRows);
 
         const colData = this.colData;
         const numCols = colData.length;
@@ -231,98 +337,6 @@ class KdTree {
 
         return { indices: resultIndices, distances: resultDist };
     }
-
-    /**
-     * Flatten the tree into GPU-friendly typed arrays. Each tree node is
-     * assigned a tree-index in pre-order DFS. The arrays are parallel:
-     * for tree-index `t`, the node holds splat `nodeSplatIdx[t]` whose
-     * position is `(nodeX[t], nodeY[t], nodeZ[t])`. Children live at
-     * `nodeLeft[t]` and `nodeRight[t]` (tree indices), with the sentinel
-     * `0xFFFFFFFF` for missing children.
-     *
-     * Positions are denormalised at each tree node (rather than indirected
-     * through `nodeSplatIdx` + the source position arrays) so a tree-walk
-     * does one read per visit instead of two. Costs 12 bytes/node extra.
-     *
-     * Layout assumes the underlying `centroids` DataTable has columns
-     * `x`, `y`, `z` (the first three columns). The constructor accepts
-     * any column set, so callers must ensure these are present and first.
-     *
-     * @returns Parallel arrays of length N where N = number of points.
-     * The root is at index 0.
-     */
-    flattenForGpu(): {
-        nodeSplatIdx: Uint32Array;
-        nodeX: Float32Array;
-        nodeY: Float32Array;
-        nodeZ: Float32Array;
-        nodeLeft: Uint32Array;
-        nodeRight: Uint32Array;
-        rootIdx: number;
-        } {
-        const n = this.centroids.numRows;
-        const nodeSplatIdx = new Uint32Array(n);
-        const nodeX = new Float32Array(n);
-        const nodeY = new Float32Array(n);
-        const nodeZ = new Float32Array(n);
-        const nodeLeft = new Uint32Array(n);
-        const nodeRight = new Uint32Array(n);
-        nodeLeft.fill(0xFFFFFFFF);
-        nodeRight.fill(0xFFFFFFFF);
-
-        const x = this.colData[0], y = this.colData[1], z = this.colData[2];
-
-        // Iterative pre-order DFS: assign tree indices, then patch the parent's
-        // left/right slot when each child is visited. JS recursion blows the
-        // stack on heavily unbalanced trees, so we maintain the work stack
-        // ourselves. Encoded entries: nodeRef + (parentTreeIdx, side) where
-        // side ∈ {0 = left of parent, 1 = right of parent, 2 = root}.
-        //
-        // Max DFS depth is the tree's height. `KdTree.build` is recursive and
-        // splits at the nthElement median, so the tree is near-balanced and
-        // its height is bounded by JS's recursion limit (~10K). A fixed 64
-        // entries is enough for any tree this codebase can actually build
-        // (2^64 ≫ 10K) and avoids an `n+1`-sized scratch (~85 MB at N=17.9M).
-        const stackCap = 64;
-        const stackNode: KdTreeNode[] = [this.root];
-        const stackParent = new Int32Array(stackCap);
-        const stackSide = new Uint8Array(stackCap);
-        stackParent[0] = -1;
-        stackSide[0] = 2;
-        let sp = 1;
-
-        let cursor = 0;
-        const rootIdx = cursor;
-        while (sp > 0) {
-            sp--;
-            const node = stackNode[sp];
-            const parent = stackParent[sp];
-            const side = stackSide[sp];
-            const treeIdx = cursor++;
-            const splat = node.index;
-            nodeSplatIdx[treeIdx] = splat;
-            nodeX[treeIdx] = x[splat];
-            nodeY[treeIdx] = y[splat];
-            nodeZ[treeIdx] = z[splat];
-            if (side === 0) nodeLeft[parent] = treeIdx;
-            else if (side === 1) nodeRight[parent] = treeIdx;
-            // Push right then left so left is popped first (pre-order).
-            if (node.right) {
-                stackNode[sp] = node.right;
-                stackParent[sp] = treeIdx;
-                stackSide[sp] = 1;
-                sp++;
-            }
-            if (node.left) {
-                stackNode[sp] = node.left;
-                stackParent[sp] = treeIdx;
-                stackSide[sp] = 0;
-                sp++;
-            }
-        }
-
-        return { nodeSplatIdx, nodeX, nodeY, nodeZ, nodeLeft, nodeRight, rootIdx };
-    }
 }
 
-export { KdTreeNode, KdTree };
+export { KdTree, buildFlatKdTree, type KdTreeNode, type FlatKdTree };

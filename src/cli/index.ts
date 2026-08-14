@@ -1,29 +1,46 @@
-import { lstat, mkdir, readFile as pathReadFile } from 'node:fs/promises';
+import { lstat, mkdir, readFile as pathReadFile, unlink } from 'node:fs/promises';
+import { totalmem } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import process, { exit } from 'node:process';
 import { parseArgs } from 'node:util';
 
 import { GraphicsDevice, Vec3 } from 'playcanvas';
 
-import { createDevice, enumerateAdapters } from './node-device';
+import { createDevice, enumerateAdapters, getPeakGpuMemory } from './node-device';
 import { NodeFileSystem, NodeReadFileSystem } from './node-file-system';
 import {
+    bakeTransform,
     combine,
+    concatSource,
+    createChunkDataPool,
     DataTable,
+    dataTableToChunkSource,
+    decimateSource,
+    decimateSourceAdaptive,
     fmtBytes,
     fmtCount,
     fmtTime,
     getInputFormat,
-    getSHBands,
-    readFile,
     getOutputFormat,
-    writeFile,
-    processDataTable,
+    materializeToDataTable,
     parseSogstComments,
+    processSourceBridged,
+    readFile,
+    readPly,
+    readPlyComments,
+    resolveSplatModel,
     revision,
+    selectLod,
+    stackLods,
     TextRenderer,
+    Transform,
     UrlReadFileSystem,
     version,
+    WorkerQueue,
+    writeLodSource,
+    writeSource,
+    type ChunkSource,
+    type ChunkSourceMetadata,
     type ProcessAction,
     type FilterFloaters,
     type FilterCluster,
@@ -32,6 +49,13 @@ import {
     type ReadFileSystem,
     logger
 } from '../lib';
+// CLI-only internals (deliberately off the public lib surface): the LOD-path
+// level resolver and the container source readers the LOD writer drives
+// directly (single-scene callers get these via readFile).
+import { resolveLodLevels } from '../lib/ops';
+import { readLccSource, readLccEnvironmentSource } from '../lib/readers/read-lcc';
+import { readLcc2Source, readLcc2EnvironmentSource } from '../lib/readers/read-lcc2';
+import { readLodSource, readLodEnvironmentSource } from '../lib/readers/read-lod';
 
 /**
  * CLI-specific options extending library options.
@@ -46,6 +70,8 @@ interface CliOptions extends LibOptions {
     noTty: boolean | undefined;
     listGpus: boolean;
     deviceIdx: number;  // -1 = auto, -2 = CPU, 0+ = GPU index
+    scratchDir: string | undefined;  // decimation spill location (default: output directory)
+    memoryBudgetBytes: number;  // decimation residency policy ceiling (not an allocation, not user-facing)
 }
 
 const fileExists = async (filename: string) => {
@@ -98,22 +124,26 @@ const resolveInput = (arg: string): ResolvedInput => {
     };
 };
 
-const isGSDataTable = (dataTable: DataTable) => {
-    if (![
-        'x', 'y', 'z',
-        'rot_0', 'rot_1', 'rot_2', 'rot_3',
-        'scale_0', 'scale_1', 'scale_2',
-        'f_dc_0', 'f_dc_1', 'f_dc_2',
-        'opacity'
-    ].every(c => dataTable.hasColumn(c))) {
-        return false;
-    }
-    return true;
+// CLI action list: the library's ProcessAction plus the CLI-only `--tag-lod`
+// grouping tag (consumed while assembling the LOD writer's level stack —
+// never dispatched as a data operation).
+type CliAction = ProcessAction | { kind: 'lod'; value: number };
+
+// `--decimate` and `--decimate-adaptive` both produce a decimate action, so
+// which decimator to run rides on the action itself rather than on global
+// options — that way it always describes the action actually executed, with no
+// dependence on flag ordering or on the "exactly one decimate action" check.
+// The extra field is stripped before actions reach the library.
+type CliDecimate = Extract<ProcessAction, { kind: 'decimate' }> & { adaptive: boolean };
+
+// Strip the CLI-only lod tags, narrowing back to dispatchable actions.
+const stripLodTags = (actions: CliAction[]): ProcessAction[] => {
+    return actions.filter((a): a is ProcessAction => a.kind !== 'lod');
 };
 
 type File = {
     filename: string;
-    processActions: ProcessAction[];
+    processActions: CliAction[];
 };
 
 const cliOptionsConfig = {
@@ -123,41 +153,45 @@ const cliOptionsConfig = {
     version: { type: 'boolean', short: 'v', default: false },
     quiet: { type: 'boolean', short: 'q', default: false },
     verbose: { type: 'boolean', default: false },
-    mem: { type: 'boolean', default: false },
+    memory: { type: 'boolean', default: false },
     tty: { type: 'boolean' },
-    iterations: { type: 'string', short: 'i', default: '10' },
-    'list-gpus': { type: 'boolean', short: 'L', default: false },
+    'sh-iterations': { type: 'string', short: 'i', default: '10' },
+    'max-workers': { type: 'string' },
+    'list-gpus': { type: 'boolean', default: false },
     gpu: { type: 'string', short: 'g', default: '-1' },
-    'lod-select': { type: 'string', short: 'O', default: '' },
-    'viewer-settings': { type: 'string', short: 'E', default: '' },
-    'lod-chunk-count': { type: 'string', short: 'C', default: '512' },
-    'lod-chunk-extent': { type: 'string', short: 'X', default: '16' },
+    'select-lod': { type: 'string', short: 'L', default: '' },
+    'viewer-settings': { type: 'string', default: '' },
+    'lod-chunk-count': { type: 'string', default: '512' },
+    'lod-chunk-extent': { type: 'string', default: '16' },
     'spz-version': { type: 'string', default: '4' },
     'segment-duration': { type: 'string', short: 'T', default: '0.1' },
     fps: { type: 'string', short: 'f', default: '' },
-    unbundled: { type: 'boolean', short: 'U', default: false },
-    'voxel-params': { type: 'string', default: '' },
+    unbundled: { type: 'boolean', default: false },
+    'voxel-size': { type: 'string' },
+    'voxel-opacity': { type: 'string' },
     'voxel-external-fill': { type: 'string' },
     'voxel-floor-fill': { type: 'string' },
     'voxel-carve': { type: 'string' },
     'seed-pos': { type: 'string', default: '' },
-    'collision-mesh': { type: 'string', short: 'K' },
+    'collision-mesh': { type: 'string' },
     'projection': { type: 'string' },
-    'camera': { type: 'string' },
-    'look-at': { type: 'string' },
-    'up': { type: 'string' },
-    'fov': { type: 'string' },
+    'camera-pos': { type: 'string' },
+    'camera-target': { type: 'string' },
+    'camera-up': { type: 'string' },
+    'camera-fov': { type: 'string' },
     'resolution': { type: 'string' },
-    'near': { type: 'string' },
+    'camera-near': { type: 'string' },
     'background': { type: 'string' },
     'f-stop': { type: 'string' },
     'focus-distance': { type: 'string' },
     'sensor-size': { type: 'string' },
-    'camera-end': { type: 'string' },
-    'look-at-end': { type: 'string' },
-    'up-end': { type: 'string' },
+    'camera-pos-end': { type: 'string' },
+    'camera-target-end': { type: 'string' },
+    'camera-up-end': { type: 'string' },
     'shutter': { type: 'string' },
     'motion-samples': { type: 'string' },
+
+    'scratch-dir': { type: 'string' },
 
     // per-file options
     translate: { type: 'string', short: 't', multiple: true },
@@ -168,13 +202,15 @@ const cliOptionsConfig = {
     'filter-harmonics': { type: 'string', short: 'H', multiple: true },
     'filter-box': { type: 'string', short: 'B', multiple: true },
     'filter-sphere': { type: 'string', short: 'S', multiple: true },
-    'decimate': { type: 'string', short: 'F', multiple: true },
-    'filter-cluster': { type: 'string', short: 'D', multiple: true },
-    'filter-floaters': { type: 'string', short: 'G', multiple: true },
+    'decimate': { type: 'string', short: 'd', multiple: true },
+    'decimate-adaptive': { type: 'string', multiple: true },
+    'filter-cluster': { type: 'string', short: 'C', multiple: true },
+    'filter-floaters': { type: 'string', short: 'F', multiple: true },
     params: { type: 'string', short: 'p', multiple: true },
-    lod: { type: 'string', short: 'l', multiple: true },
-    summary: { type: 'boolean', short: 'm', multiple: true },
-    'morton-order': { type: 'boolean', short: 'M', multiple: true }
+    'tag-lod': { type: 'string', short: 'l', multiple: true },
+    stats: { type: 'string', multiple: true },
+    info: { type: 'string', multiple: true },
+    'morton-order': { type: 'boolean', short: 'm', multiple: true }
 } as const;
 
 const stringOptionNames = new Set(Object.entries(cliOptionsConfig)
@@ -184,6 +220,7 @@ const stringOptionNames = new Set(Object.entries(cliOptionsConfig)
 
 const isNumericValue = (s: string) => /^-?\d[\d.,e+-]*$/.test(s);
 const isCollisionMeshShape = (s: string) => /^(?:smooth|faces)$/i.test(s);
+const isTextJsonFormat = (s: string) => /^(?:text|json)$/i.test(s);
 
 // Options that may appear without a value. The predicate gates whether the
 // next argv token is consumed as the value; when omitted (or rejected) the
@@ -191,15 +228,15 @@ const isCollisionMeshShape = (s: string) => /^(?:smooth|faces)$/i.test(s);
 type OptionalValueValidator = (next: string) => boolean;
 const optionalValueOptions: Map<string, OptionalValueValidator> = new Map([
     ['--filter-cluster', isNumericValue],
-    ['-D', isNumericValue],
+    ['-C', isNumericValue],
     ['--filter-floaters', isNumericValue],
-    ['-G', isNumericValue],
+    ['-F', isNumericValue],
     ['--voxel-external-fill', isNumericValue],
     ['--voxel-floor-fill', isNumericValue],
     ['--voxel-carve', isNumericValue],
-    ['--voxel-params', isNumericValue],
     ['--collision-mesh', isCollisionMeshShape],
-    ['-K', isCollisionMeshShape]
+    ['--info', isTextJsonFormat],
+    ['--stats', isTextJsonFormat]
 ]);
 
 const shortToLong = new Map<string, string>(
@@ -280,6 +317,14 @@ const parseArguments = async () => {
         return parts;
     };
 
+    const parseOutputFormat = (value: string, option: string): 'text' | 'json' => {
+        const format = value ? value.trim().toLowerCase() : 'text';
+        if (format !== 'text' && format !== 'json') {
+            throw new Error(`Invalid ${option} format: ${value}. Must be 'text' or 'json'.`);
+        }
+        return format;
+    };
+
     const parseCollisionMesh = (value: string | undefined): false | CollisionMeshShape => {
         if (value === undefined) return false;
         if (value === '') return 'smooth';
@@ -315,6 +360,16 @@ const parseArguments = async () => {
         }
     }
 
+    // Cap the SOG worker pool (0 = inline/serial). Lower trades speed for peak
+    // memory, since each worker holds its own WebP WASM heap.
+    if (v['max-workers'] !== undefined) {
+        const maxWorkers = parseInteger(v['max-workers']);
+        if (maxWorkers < 0) {
+            throw new Error(`Invalid max-workers: ${maxWorkers}. Must be >= 0.`);
+        }
+        WorkerQueue.maxWorkers = maxWorkers;
+    }
+
     const readJsonFile = async (path: string) => {
         const content = await pathReadFile(path, 'utf-8');
         try {
@@ -327,21 +382,19 @@ const parseArguments = async () => {
     const viewerSettingsPath = v['viewer-settings'];
 
     // Parse voxel processing options
-    const voxelParamsStr = v['voxel-params'];
+    const voxelSizeStr = v['voxel-size'];
+    const voxelOpacityStr = v['voxel-opacity'];
     const externalFillStr = v['voxel-external-fill'];
     const carveStr = v['voxel-carve'];
     const seedPosStr = v['seed-pos'];
 
     let voxelResolution = 0.05;
     let opacityCutoff = 0.1;
-    if (voxelParamsStr) {
-        const parts = voxelParamsStr.split(',').map((p: string) => p.trim());
-        if (parts.length >= 1 && parts[0] !== '') {
-            voxelResolution = parseNumber(parts[0], 0);
-        }
-        if (parts.length >= 2) {
-            opacityCutoff = parseNumber(parts[1], 0);
-        }
+    if (voxelSizeStr) {
+        voxelResolution = parseNumber(voxelSizeStr, 0);
+    }
+    if (voxelOpacityStr) {
+        opacityCutoff = parseNumber(voxelOpacityStr, 0);
     }
 
     let navExteriorRadius: number | undefined;
@@ -378,6 +431,18 @@ const parseArguments = async () => {
     }
 
     const collisionMesh = parseCollisionMesh(v['collision-mesh']);
+    const segmentDuration = parseNumber(v['segment-duration']);
+    if (!Number.isFinite(segmentDuration) || segmentDuration < 0) {
+        throw new Error(`Invalid segment-duration value: ${v['segment-duration']}. Must be a finite number >= 0 (0 disables segmentation).`);
+    }
+
+    if (v.fps) {
+        const fps = parseNumber(v.fps);
+        if (!Number.isFinite(fps) || fps <= 0) {
+            throw new Error(`Invalid fps value: ${v.fps}. Must be a finite number > 0.`);
+        }
+    }
+
     const spzVersion = parseInteger(v['spz-version']);
     if (spzVersion !== 3 && spzVersion !== 4) {
         throw new Error(`Invalid spz-version value: ${v['spz-version']}. Must be 3 or 4.`);
@@ -392,21 +457,21 @@ const parseArguments = async () => {
         renderProjection = v.projection;
     }
     let renderCameraPosition: { x: number; y: number; z: number } | undefined;
-    if (v.camera !== undefined) {
-        const [cx, cy, cz] = parseVec(v.camera, 3);
+    if (v['camera-pos'] !== undefined) {
+        const [cx, cy, cz] = parseVec(v['camera-pos'], 3);
         renderCameraPosition = { x: cx, y: cy, z: cz };
     }
     let renderLookAt: { x: number; y: number; z: number } | undefined;
-    if (v['look-at'] !== undefined) {
-        const [lx, ly, lz] = parseVec(v['look-at'], 3);
+    if (v['camera-target'] !== undefined) {
+        const [lx, ly, lz] = parseVec(v['camera-target'], 3);
         renderLookAt = { x: lx, y: ly, z: lz };
     }
     let renderUp: { x: number; y: number; z: number } | undefined;
-    if (v.up !== undefined) {
-        const [ux, uy, uz] = parseVec(v.up, 3);
+    if (v['camera-up'] !== undefined) {
+        const [ux, uy, uz] = parseVec(v['camera-up'], 3);
         renderUp = { x: ux, y: uy, z: uz };
     }
-    const renderFov = v.fov !== undefined ? parseNumber(v.fov, 0) : undefined;
+    const renderFov = v['camera-fov'] !== undefined ? parseNumber(v['camera-fov'], 0) : undefined;
     let renderWidth: number | undefined;
     let renderHeight: number | undefined;
     if (v.resolution !== undefined) {
@@ -417,7 +482,7 @@ const parseArguments = async () => {
         renderWidth = parseInteger(m[1]);
         renderHeight = parseInteger(m[2]);
     }
-    const renderNear = v.near !== undefined ? parseNumber(v.near, 0) : undefined;
+    const renderNear = v['camera-near'] !== undefined ? parseNumber(v['camera-near'], 0) : undefined;
     const renderFStop = v['f-stop'] !== undefined ? parseNumber(v['f-stop'], 0) : undefined;
     if (renderFStop !== undefined && renderFStop <= 0) {
         throw new Error(`Invalid --f-stop value: ${v['f-stop']}. Must be > 0.`);
@@ -431,18 +496,18 @@ const parseArguments = async () => {
         throw new Error(`Invalid --sensor-size value: ${v['sensor-size']}. Must be > 0.`);
     }
     let renderCameraEndPosition: { x: number; y: number; z: number } | undefined;
-    if (v['camera-end'] !== undefined) {
-        const [cx, cy, cz] = parseVec(v['camera-end'], 3);
+    if (v['camera-pos-end'] !== undefined) {
+        const [cx, cy, cz] = parseVec(v['camera-pos-end'], 3);
         renderCameraEndPosition = { x: cx, y: cy, z: cz };
     }
     let renderLookAtEnd: { x: number; y: number; z: number } | undefined;
-    if (v['look-at-end'] !== undefined) {
-        const [lx, ly, lz] = parseVec(v['look-at-end'], 3);
+    if (v['camera-target-end'] !== undefined) {
+        const [lx, ly, lz] = parseVec(v['camera-target-end'], 3);
         renderLookAtEnd = { x: lx, y: ly, z: lz };
     }
     let renderUpEnd: { x: number; y: number; z: number } | undefined;
-    if (v['up-end'] !== undefined) {
-        const [ux, uy, uz] = parseVec(v['up-end'], 3);
+    if (v['camera-up-end'] !== undefined) {
+        const [ux, uy, uz] = parseVec(v['camera-up-end'], 3);
         renderUpEnd = { x: ux, y: uy, z: uz };
     }
     const renderShutter = v.shutter !== undefined ? parseNumber(v.shutter) : undefined;
@@ -474,12 +539,17 @@ const parseArguments = async () => {
         version: v.version,
         quiet: v.quiet,
         verbose: v.verbose,
-        mem: v.mem,
+        mem: v.memory,
         noTty: v.tty === undefined ? undefined : !v.tty,
-        iterations: parseInteger(v.iterations),
+        iterations: parseInteger(v['sh-iterations']),
         listGpus: v['list-gpus'],
         deviceIdx,
-        lodSelect: v['lod-select'].split(',').filter(v => !!v).map(parseInteger),
+        scratchDir: v['scratch-dir'],
+        // Residency policy ceiling for decimation (not an upfront allocation).
+        // Half the machine's RAM, capped at 48 GiB — derived here because the
+        // library is node-free and cannot read os.totalmem() itself.
+        memoryBudgetBytes: Math.min(48 * 2 ** 30, Math.floor(totalmem() / 2)),
+        lodSelect: v['select-lod'].split(',').filter(v => !!v).map(parseInteger),
         viewerSettingsJson: viewerSettingsPath && await readJsonFile(viewerSettingsPath),
         unbundled: v.unbundled,
         lodChunkCount: parseInteger(v['lod-chunk-count']),
@@ -515,14 +585,6 @@ const parseArguments = async () => {
         renderShutter,
         renderMotionSamples
     };
-
-    if (!Number.isFinite(options.segmentDuration) || options.segmentDuration < 0) {
-        throw new Error(`Invalid segment-duration value: ${options.segmentDuration}. Must be a finite number >= 0 (0 disables segmentation).`);
-    }
-
-    if (options.sogstClip.fps !== undefined && (!Number.isFinite(options.sogstClip.fps) || options.sogstClip.fps <= 0)) {
-        throw new Error(`Invalid fps value: ${options.sogstClip.fps}. Must be a finite number > 0.`);
-    }
 
     for (const t of tokens) {
         if (t.kind === 'positional') {
@@ -633,10 +695,10 @@ const parseArguments = async () => {
                     }
                     break;
                 }
-                case 'lod': {
+                case 'tag-lod': {
                     const lod = parseInteger(t.value);
-                    if (lod < 0) {
-                        throw new Error(`Invalid lod value: ${t.value}. Must be a non-negative integer.`);
+                    if (lod < -1) {
+                        throw new Error(`Invalid --tag-lod value: ${t.value}. Must be >= 0, or -1 for environment.`);
                     }
                     current.processActions.push({
                         kind: 'lod',
@@ -644,9 +706,16 @@ const parseArguments = async () => {
                     });
                     break;
                 }
-                case 'summary':
+                case 'stats':
                     current.processActions.push({
-                        kind: 'summary'
+                        kind: 'stats',
+                        format: parseOutputFormat(t.value, 'stats')
+                    });
+                    break;
+                case 'info':
+                    current.processActions.push({
+                        kind: 'info',
+                        format: parseOutputFormat(t.value, 'info')
                     });
                     break;
                 case 'morton-order':
@@ -654,7 +723,8 @@ const parseArguments = async () => {
                         kind: 'mortonOrder'
                     });
                     break;
-                case 'decimate': {
+                case 'decimate':
+                case 'decimate-adaptive': {
                     const value = t.value.trim();
                     let count: number | null = null;
                     let percent: number | null = null;
@@ -673,11 +743,13 @@ const parseArguments = async () => {
                         }
                     }
 
-                    current.processActions.push({
+                    const decimate: CliDecimate = {
                         kind: 'decimate',
                         count,
-                        percent
-                    });
+                        percent,
+                        adaptive: t.name === 'decimate-adaptive'
+                    };
+                    current.processActions.push(decimate);
                     break;
                 }
                 case 'filter-cluster': {
@@ -736,7 +808,7 @@ USAGE
   • Use 'null' as output to discard file output.
 
 SUPPORTED INPUTS
-    .ply   .compressed.ply   .sog   .spz   meta.json   .ksplat   .splat   .mjs   .lcc
+    .ply   .compressed.ply   .sog   .spz   meta.json   lod-meta.json   .ksplat   .splat   .mjs   .lcc   .lcc2
 
     Input filenames may also be http(s):// URLs (downloaded on demand;
     .mjs generators are local-only).
@@ -752,35 +824,44 @@ ACTIONS (executed in order; can be repeated)
     -r, --rotate           <x,y,z>          Rotate Gaussians by Euler angles, in degrees
     -s, --scale            <factor>         Uniformly scale Gaussians by factor
     -H, --filter-harmonics <0|1|2|3>        Remove spherical harmonic bands > n
-    -N, --filter-nan                        Remove Gaussians with NaN values and most Inf values
+    -N, --filter-nan                        Remove Gaussians with NaN values, most Inf values, or a zero-norm rotation
     -B, --filter-box       <x,y,z,X,Y,Z>    Remove Gaussians outside box (min, max corners)
     -S, --filter-sphere    <x,y,z,radius>   Remove Gaussians outside sphere
     -V, --filter-value     <name,cmp,value> Keep Gaussians where <name> <cmp> <value>;
                                               cmp ∈ {lt,lte,gt,gte,eq,neq}
-    -F, --decimate         <n|n%>           Simplify to n (or n%) Gaussians via pairwise merging
-    -G, --filter-floaters  [size,op,min]    Remove Gaussians not contributing to any solid voxel. Default: 0.05,0.1,0.004
-    -D, --filter-cluster   [res,op,min]     Keep only the connected cluster at --seed-pos. Default: 1.0,0.999,0.1
+    -d, --decimate         <n|n%>           Simplify at a uniform rate everywhere (default).
+                                              Lower memory, and better at depth on uniformly-sized
+                                              Gaussians: uniform texture, single objects, snow.
+        --decimate-adaptive <n|n%>          Simplify, allocating removal by local error (adaptive).
+                                              Much better on mixed-scale content such as skies.
+                                              Either must be the final action, with a .ply output
+        --scratch-dir      <path>           Directory for decimation spill files (deep targets on huge
+                                              scenes). Default: the output file's directory
+    -F, --filter-floaters  [size,op,min]    Remove Gaussians not contributing to any solid voxel. Default: 0.05,0.1,0.004
+    -C, --filter-cluster   [res,op,min]     Keep only the connected cluster at --seed-pos. Default: 1.0,0.999,0.1
     -p, --params           <key=val,...>    Pass parameters to .mjs generator script
-    -l, --lod              <n>              Tag the Gaussians with LOD level n (n >= 0)
-    -m, --summary                           Print per-column statistics to stdout
-    -M, --morton-order                      Reorder Gaussians by Morton code (Z-order curve)
+    -l, --tag-lod          <n>              Tag the Gaussians with LOD level n (n >= 0, or -1 for environment)
+        --stats            [text|json]      Print file info, per-column statistics and the fill/overdraw ratio to stdout. Default: text
+        --info             [text|json]      Print structural metadata (format, per-LOD counts, extra columns) to stdout. Default: text
+    -m, --morton-order                      Reorder Gaussians by Morton code (Z-order curve)
 
 GENERAL
     -h, --help                              Show this help and exit
     -v, --version                           Show version and exit
     -q, --quiet                             Suppress non-error output
         --verbose                           Show debug-level diagnostics
-        --mem                               Show peak memory in progress output
+        --memory                            Show peak memory in progress output
         --tty                               Interactive bar rendering (--no-tty to disable)
     -w, --overwrite                         Overwrite output file if it exists
 
 GPU (used by SOG compression and GPU voxelization: --filter-cluster, --filter-floaters, .voxel.json output)
-    -L, --list-gpus                         List available GPU adapters and exit
+        --list-gpus                         List available GPU adapters and exit
     -g, --gpu              <n|cpu>          Device for GPU operations: GPU adapter index | 'cpu'
                                               ('cpu' disables GPU and is incompatible with GPU-only features)
 
 SOG COMPRESSION (.sog, meta.json, lod-meta.json, .html outputs)
-    -i, --iterations       <n>              SH compression iterations (more=better). Default: 10
+    -i, --sh-iterations    <n>              SH compression iterations (more=better). Default: 10
+        --max-workers      <n>              Worker threads for SOG encoding (0 = inline/serial). Default: 4
 
 SOGST OUTPUT (.sogst)
     -T, --segment-duration <n>              Temporal segment length in seconds. 0 disables. Default: 0.1
@@ -790,51 +871,52 @@ SPZ OUTPUT (.spz)
         --spz-version      <3|4>            The SPZ format version to write. Default: 4
 
 HTML VIEWER OUTPUT (.html)
-    -E, --viewer-settings  <settings.json>  HTML viewer settings JSON file
-    -U, --unbundled                         Generate unbundled HTML viewer with separate files
+        --viewer-settings  <settings.json>  HTML viewer settings JSON file
+        --unbundled                         Generate unbundled HTML viewer with separate files
 
-LCC INPUT (.lcc)
-    -O, --lod-select       <n,n,...>        Comma-separated LOD levels to read from LCC input
+LOD INPUT (lod-meta.json, .lcc, .lcc2)
+    -L, --select-lod       <n,n,...>        Comma-separated LOD levels to read from streamed SOG / LCC / LCC2 input
 
 LOD OUTPUT (lod-meta.json)
-    -C, --lod-chunk-count  <n>              Approximate number of Gaussians per LOD chunk in K. Default: 512
-    -X, --lod-chunk-extent <n>              Approximate size of an LOD chunk in world units (m). Default: 16
+        --lod-chunk-count  <n>              Approximate number of Gaussians per LOD chunk in K. Default: 512
+        --lod-chunk-extent <n>              Approximate size of an LOD chunk in world units (m). Default: 16
 
 VOXEL OUTPUT (.voxel.json)
-        --voxel-params     [size,opacity]   Voxel size and opacity threshold for .voxel.json. Default: 0.05,0.1
+        --voxel-size       <n>              Voxel size for .voxel.json. Default: 0.05
+        --voxel-opacity    <n>              Voxel opacity threshold for .voxel.json. Default: 0.1
         --voxel-external-fill [size]        Fill exterior voxels via boundary flood fill (interior scenes). Default: 1.6
         --voxel-floor-fill [size]           Fill columns upward from bottom (exterior scenes). Default: 1.6
         --voxel-carve [h,r]                 Carve navigable space using capsule flood fill from seed. Default: 1.6,0.2
         --seed-pos         <x,y,z>          Seed position for voxel processing and --filter-cluster. Default: 0,0,0
-    -K, --collision-mesh   [smooth|faces]   Generate collision mesh (.collision.glb). Default shape: smooth
+        --collision-mesh   [smooth|faces]   Generate collision mesh (.collision.glb). Default shape: smooth
 
 IMAGE OUTPUT (.webp) — lossless WebP rendered via GPU rasterizer
         --projection       <pinhole|equirect>  Camera projection. Default: pinhole.
-                                            equirect = 360°×180° panorama from --camera; --fov must be omitted;
+                                            equirect = 360°×180° panorama from --camera-pos; --camera-fov must be omitted;
                                             --resolution must be 2:1 (default 2048x1024).
-        --camera           <x,y,z>          Camera position in world space. Default: 2,1,-2
-        --look-at          <x,y,z>          Camera target point. Default: 0,0,0
-        --up               <x,y,z>          World up vector. Default: 0,1,0
-        --fov              <degrees>        Vertical field of view in degrees. Default: 60. Rejected with --projection equirect.
+        --camera-pos       <x,y,z>          Camera position in world space. Default: 2,1,-2
+        --camera-target    <x,y,z>          Camera target point. Default: 0,0,0
+        --camera-up        <x,y,z>          World up vector. Default: 0,1,0
+        --camera-fov       <degrees>        Vertical field of view in degrees. Default: 60. Rejected with --projection equirect.
         --resolution       <WxH>            Output resolution, e.g. 1920x1080. Default: 1280x720 (pinhole) or 2048x1024 (equirect)
-        --near             <n>              Near clip distance. Default: 0.2 (matches reference 3DGS)
+        --camera-near      <n>              Near clip distance. Default: 0.2 (matches reference 3DGS)
         --background       <r,g,b[,a]>      Background color in [0,1]. Default: 0,0,0,1
         --f-stop           <N>              Aperture as a photographic f-stop (e.g. 2.8, 5.6, 11). Enables defocus blur;
                                             smaller = more blur. Pinhole only. Default: disabled (no defocus).
-        --focus-distance   <n>              Camera-space Z of the focus plane (world units). Default: distance to --look-at.
+        --focus-distance   <n>              Camera-space Z of the focus plane (world units). Default: distance to --camera-target.
                                             Pinhole only; only meaningful with --f-stop.
         --sensor-size      <n>              Vertical sensor height in world units. Gives --f-stop a physical meaning.
                                             Default: 0.024 (35mm full-frame, world units = meters). Scale to your world:
                                             world unit = decimeter → 0.24, world unit = millimeter → 24.
-        --camera-end       <x,y,z>          End camera position. When set, enables camera motion blur: the renderer
-                                            averages sub-frames with the camera interpolated from --camera (shutter open)
-                                            to --camera-end (shutter close). Default: disabled (no motion blur).
-        --look-at-end      <x,y,z>          End camera target. Default: same as --look-at. Only with --camera-end.
-        --up-end           <x,y,z>          End up vector. Default: same as --up. Only with --camera-end.
+        --camera-pos-end   <x,y,z>          End camera position. When set, enables camera motion blur: the renderer
+                                            averages sub-frames with the camera interpolated from --camera-pos (shutter open)
+                                            to --camera-pos-end (shutter close). Default: disabled (no motion blur).
+        --camera-target-end <x,y,z>         End camera target. Default: same as --camera-target. Only with --camera-pos-end.
+        --camera-up-end    <x,y,z>          End up vector. Default: same as --camera-up. Only with --camera-pos-end.
         --shutter          <0..1>           Fraction of the start→end segment integrated, centered on the midpoint
-                                            (1.0 = full motion; 0.5 = 180° shutter). Default: 1. Only with --camera-end.
+                                            (1.0 = full motion; 0.5 = 180° shutter). Default: 1. Only with --camera-pos-end.
         --motion-samples   <n>              Sub-frames to accumulate for motion blur. Cost is N× a single render.
-                                            Default: 16. Only with --camera-end.
+                                            Default: 16. Only with --camera-pos-end.
 
 EXAMPLES
     # Convert formats
@@ -853,42 +935,29 @@ const main = async () => {
     const startTime = performance.now();
 
     // Kernel-tracked peak resident set size in bytes.
-    // `process.resourceUsage().maxRSS` is reported in kilobytes on
-    // Linux/macOS and bytes on Windows; normalize to bytes for fmtBytes.
+    // `process.resourceUsage().maxRSS` is kilobytes on every platform from
+    // node 20.3+ (libuv 1.45 normalized macOS, which previously reported
+    // bytes — on node 18/macOS this over-reports 1024×).
     // Note: V8 fatal OOM (`FATAL ERROR: Reached heap limit`) and external
     // SIGKILL bypass all JS handlers (uncaughtException, beforeExit, exit),
     // so peak rss cannot be reported in those cases - use an external wrapper
     // such as `/usr/bin/time -l` (macOS) or `/usr/bin/time -v` (Linux).
-    const peakMemoryBytes = (): number => {
-        const raw = process.resourceUsage().maxRSS;
-        return process.platform === 'win32' ? raw : raw * 1024;
-    };
+    const peakCpuMemoryBytes = (): number => process.resourceUsage().maxRSS * 1024;
 
-    // V8-tracked currently-live memory: heapUsed (JS objects) + external
-    // (C++-bound, includes ArrayBuffer storage for typed arrays — which is
-    // most of our memory in this app). Drops when GC reclaims, so the
-    // delta between phase boundaries reveals whether each phase actually
-    // releases its scratch buffers (vs the kernel maxRSS metric, which is
-    // monotonic).
-    const liveMemoryBytes = (): number => {
-        const u = process.memoryUsage();
-        return u.heapUsed + u.external;
-    };
-
-    // Emit the final timing line plus peak memory usage.
+    // Emit the final timing line plus peak memory usage. Peak GPU memory
+    // (engine-tracked VRAM, see node-device.ts) is included only when a GPU
+    // device was actually created — CPU-only runs keep the shorter line.
     const reportDone = (failed = false) => {
         const elapsedMs = performance.now() - startTime;
         const verb = failed ? 'failed in' : 'done in';
-        const line = `${verb} ${fmtTime(elapsedMs)}  [peak ${fmtBytes(peakMemoryBytes())}]`;
+        const gpu = getPeakGpuMemory();
+        const gpuEntry = gpu > 0 ? ` gpu=${fmtBytes(gpu)}` : '';
+        const line = `${verb} ${fmtTime(elapsedMs)}  [peak cpu=${fmtBytes(peakCpuMemoryBytes())}${gpuEntry}]`;
         if (failed) {
             logger.error(line);
         } else {
             logger.info(line);
         }
-    };
-
-    const logDataTableInfo = (dataTable: DataTable) => {
-        logger.info(`${fmtCount(dataTable.numRows)} gaussians \u00b7 ${getSHBands(dataTable)} SH bands \u00b7 ${fmtBytes(dataTable.byteLength)}`);
     };
 
     // Centralised failure exit: emits the error, the final timing/peak-mem
@@ -935,8 +1004,8 @@ const main = async () => {
     const renderer = new TextRenderer({
         write,
         output: chunk => process.stdout.write(chunk),
-        getPeakMemory: peakMemoryBytes,
-        getLiveMemory: liveMemoryBytes
+        getPeakCpuMemory: peakCpuMemoryBytes,
+        getPeakGpuMemory
     });
     logger.setRenderer(renderer);
 
@@ -1064,7 +1133,8 @@ const main = async () => {
     }
 
     try {
-        // Create device creator function with caching (needed for processDataTable + writeFile)
+        // GPU device creator (cached): used by processSourceBridged's DataTable-island
+        // ops (decimate / voxel filters) and the GPU writers (image / voxel).
         // deviceIdx: -1 = auto, -2 = CPU, 0+ = specific GPU index
         let cachedDevice: GraphicsDevice | undefined;
         const deviceCreator = options.deviceIdx === -2 ? undefined : async () => {
@@ -1087,118 +1157,320 @@ const main = async () => {
             return cachedDevice;
         };
 
-        const processOptions = deviceCreator ? { createDevice: deviceCreator } : undefined;
+        // A single input has an unambiguous format for --info/--stats to report;
+        // with multiple (combined) inputs the format is omitted.
+        const soleInputFormat = inputArgs.length === 1 ?
+            getInputFormat(resolveInput(inputArgs[0].filename).classifyName) : undefined;
+        const processOptions = { createDevice: deviceCreator, sourceFormat: soleInputFormat };
 
         // declare phase total: one Read phase per input + one Write phase
         const phaseTotal = inputArgs.length + (isNullOutput ? 0 : 1);
 
-        // sogst clip scalars discovered in the inputs' PLY comments
-        const clipFromInputs: Partial<LibOptions['sogstClip']> = {};
+        // LODs are overlapping representations of the *same* scene — alternatives,
+        // not additive layers. A single-scene WRITER takes exactly one LOD: the
+        // finest (LOD 0) by default, or the one --select-lod picks (reject multiple).
+        // Selection is applied as a selectLod node right after the reader (below),
+        // so the pipeline operates on that single level. `null` output has no
+        // writer, so it keeps the full multi-LOD source — `--info`/`--stats`
+        // there report every level. lod-meta output keeps every level (path below).
+        if (outputFormat !== null && outputFormat !== 'lod' && options.lodSelect.length > 1) {
+            throw new Error('Cannot write multiple LOD levels (--select-lod) to a single-scene output; select one level, or output lod-meta.json.');
+        }
 
-        // read, filter, process input files
-        const inputDataTables: DataTable[] = [];
-        for (let inputIdx = 0; inputIdx < inputArgs.length; inputIdx++) {
-            const inputArg = inputArgs[inputIdx];
-            const phase = logger.group(`Input ${inputArg.filename}`, {
-                index: inputIdx + 1,
-                total: phaseTotal
-            });
+        // Single-scene pipeline (one chunk-native path for every non-lod output).
+        // Each input is read as a ChunkSource; its actions are applied by
+        // processSourceBridged (chunk-native runs stream — transforms, filters,
+        // band drop, morton reorder; the remaining DataTable-only ops, the GPU
+        // voxel filters, bridge inline as islands; decimate is applied terminally
+        // below); the inputs are stitched (concatSource when uniform, else a
+        // DataTable combine() bridge for mismatched layouts), the output actions
+        // applied, and the result written by writeSource (streaming for
+        // ply/sog/compressed-ply; materialize-at-the-writer for csv/glb/html/image/
+        // voxel/spz). LOD output has its own structural path below; this pipeline
+        // also handles null output (processing for side-effects, skipping the
+        // write). A --tag-lod tag on single-scene output is rejected after the LOD path.
+        const singleSceneActions = [...inputArgs.flatMap(a => a.processActions), ...outputArg.processActions];
 
-            // extract params
-            const params = inputArg.processActions.filter(a => a.kind === 'param').map((p) => {
-                return { name: p.name, value: p.value };
-            });
+        // v1 decimation is terminal: the merge stream writes straight into the
+        // destination, so decimate must be the last action and the output must
+        // be plain PLY. Anything else needs two invocations (decimate to PLY,
+        // then convert).
+        const decimateIdx = singleSceneActions.map((a, i) => (a.kind === 'decimate' ? i : -1)).filter(i => i >= 0);
+        if (decimateIdx.length > 0) {
+            const ok = decimateIdx.length === 1 &&
+                decimateIdx[0] === singleSceneActions.length - 1 &&
+                !isNullOutput &&
+                outputFormat === 'ply';
+            if (!ok) {
+                failExit(
+                    '--decimate must be the final action and the output must be .ply ' +
+                    `(got ${isNullOutput ? 'no output' : `.${outputFormat}`}${decimateIdx[0] !== singleSceneActions.length - 1 || decimateIdx.length > 1 ? ', with actions after decimate' : ''}). ` +
+                    'Write a decimated PLY first, then convert in a second invocation.'
+                );
+            }
+        }
+        const decimateAction = decimateIdx.length === 1 ?
+            singleSceneActions[decimateIdx[0]] as CliDecimate :
+            null;
 
-            // read input - supports both local paths and http(s):// URLs
-            const { filename, fileSystem, classifyName } = resolveInput(inputArg.filename);
-            const inputFormat = getInputFormat(classifyName);
+        if (
+            isNullOutput ||
+            (outputFormat !== 'lod' && singleSceneActions.every(a => a.kind !== 'lod'))
+        ) {
+            const pool = createChunkDataPool();
 
-            // mjs generators require local filesystem access (dynamic import)
-            if (inputFormat === 'mjs' && isHttpUrl(inputArg.filename)) {
-                throw new Error(`.mjs generator inputs cannot be loaded from a URL: ${inputArg.filename}`);
+            // Open one input as a full (all-LOD) ChunkSource via readFile — native
+            // for ply/splat/spz/sog/lcc/lcc2, eager-bridged for ksplat/mjs, plus URL
+            // inputs. LOD selection is a selectLod node below (real single-LOD
+            // writers only), so readFile always reads every level. mjs generators
+            // need their params + a file:// URL.
+            const openInput = async (inputArg: typeof inputArgs[number]): Promise<ChunkSource> => {
+                const { filename: inFile, fileSystem, classifyName } = resolveInput(inputArg.filename);
+                const fmt = getInputFormat(classifyName);
+                if (fmt === 'mjs' && isHttpUrl(inputArg.filename)) {
+                    throw new Error(`.mjs generator inputs cannot be loaded from a URL: ${inputArg.filename}`);
+                }
+                const params = inputArg.processActions.filter(a => a.kind === 'param').map((p) => {
+                    return { name: p.name, value: p.value };
+                });
+                const readFilename = fmt === 'mjs' ? `file://${inFile}` : inFile;
+                const srcs = await readFile({ filename: readFilename, inputFormat: fmt, options: { ...options, lodSelect: [] }, params, fileSystem });
+                return srcs.length === 1 ? srcs[0] : concatSource(srcs, pool);
+            };
+
+            // Stitch inputs: uniform layout -> concatSource (transforms unified as
+            // combine() does); mixed layout -> bridge through the DataTable combine().
+            const combineSources = async (sources: ChunkSource[]): Promise<ChunkSource> => {
+                if (sources.length === 1) return sources[0];
+                const sig = (m: ChunkSourceMetadata) => `${m.shBands}|${[...m.availableLayers].sort().join(',')}|${m.extraColumns.map(e => `${e.name}:${e.type}`).join(',')}`;
+                if (sources.every(s => sig(s.meta) === sig(sources[0].meta))) {
+                    const ref = sources[0].meta.transform;
+                    const unified = sources.every(s => s.meta.transform.equals(ref)) ?
+                        sources :
+                        sources.map(s => bakeTransform(s, Transform.IDENTITY));
+                    return concatSource(unified, pool);
+                }
+                // Mismatched layouts: combine() can union them, concatSource can't.
+                // A DataTable carries no model tag, so resolve it here as
+                // concatSource would (mixed -> 'default', with a warning).
+                const model = resolveSplatModel(sources.map(s => s.meta.model));
+                if (sources.some(s => s.meta.model !== model)) {
+                    const seen = [...new Set(sources.map(s => s.meta.model))].join(', ');
+                    logger.warn(`mixed splat models (${seen}); writing the result as '${model}'`);
+                }
+                const dts: DataTable[] = [];
+                for (const s of sources) {
+                    dts.push(await materializeToDataTable(s, pool));
+                    await s.close();
+                }
+                return dataTableToChunkSource(combine(dts), pool.chunkSize, undefined, model);
+            };
+
+            const phase = logger.group(`Output ${outputArg.filename}`, { index: phaseTotal, total: phaseTotal });
+
+            // A real single-LOD writer collapses each multi-LOD input to the
+            // selected level (finest by default) via a selectLod node, so
+            // transforms operate on one LOD; null output keeps every level (so an
+            // --info/--stats action there reports the whole source). `--tag-lod`
+            // actions are lod-meta grouping metadata (never data ops), so strip them.
+            const selectSingleLod = outputFormat !== null;
+            const processed: ChunkSource[] = [];
+            for (const inputArg of inputArgs) {
+                let src = await openInput(inputArg);
+                if (selectSingleLod && src.meta.numLods > 1) {
+                    const level = resolveLodLevels(options.lodSelect, src.meta.numLods)[0] ?? 0;
+                    src = selectLod(src, level);
+                }
+                const actions = stripLodTags(inputArg.processActions).filter(a => a.kind !== 'decimate');
+                processed.push(await processSourceBridged(src, actions, pool, processOptions));
             }
 
-            // For mjs format, convert to file:// URL (Node.js-specific)
-            const readFilename = inputFormat === 'mjs' ? `file://${filename}` : filename;
+            let combined = await combineSources(processed);
+            combined = await processSourceBridged(combined, stripLodTags(outputArg.processActions).filter(a => a.kind !== 'decimate'), pool, processOptions);
 
-            // Per-file progress bars are drawn by the readers themselves
-            // (see lib/read.ts and the SOG/LCC readers). The CLI wraps them
-            // in a "Reading" group so multi-file formats like SOG render as
-            // a coherent block under the Input phase.
-            const readingGroup = logger.group('Reading');
-            const dataTables = await readFile({
-                filename: readFilename,
-                inputFormat,
-                options,
-                params,
-                fileSystem
-            });
-            readingGroup.end();
-
-            for (let i = 0; i < dataTables.length; ++i) {
-                const dataTable = dataTables[i];
-
-                if (dataTable.numRows === 0 || !isGSDataTable(dataTable)) {
-                    throw new Error(`Unsupported data in file '${inputArg.filename}'`);
-                }
-
-                logDataTableInfo(dataTable);
-
-                // clip scalars ride in the PLY header, and processing does not
-                // carry comments through — read them off the table as it arrives
-                Object.assign(clipFromInputs, parseSogstComments(dataTable.comments));
-
-                const isEnv = dataTable.hasColumn('lod') && dataTable.getColumnByName('lod').data.every(v => v === -1);
-                if (!isEnv) {
-                    dataTables[i] = await processDataTable(dataTable, inputArg.processActions, processOptions);
-                }
+            if (combined.meta.numGaussians === 0) {
+                throw new Error('No Gaussians to write');
             }
 
-            inputDataTables.push(...dataTables.filter(dt => dt !== null));
+            if (decimateAction) {
+                const n = combined.meta.numGaussians;
+                const keepCount = decimateAction.count !== null ?
+                    Math.min(decimateAction.count, n) :
+                    Math.round(n * (decimateAction.percent ?? 100) / 100);
+                if (keepCount < 1) {
+                    failExit(`--decimate target resolves to ${keepCount} gaussians; must keep at least 1`);
+                }
+                const spill = {
+                    writeFs: new NodeFileSystem(),
+                    readFs: new NodeReadFileSystem(),
+                    scratchDir: options.scratchDir ?? dirname(outputFilename),
+                    remove: (path: string) => unlink(path)
+                };
+                combined = decimateAction.adaptive ?
+                    await decimateSourceAdaptive(combined, pool, {
+                        targetCount: keepCount,
+                        createDevice: deviceCreator,
+                        memoryBudgetBytes: options.memoryBudgetBytes,
+                        spill
+                    }) :
+                    await decimateSource(combined, pool, {
+                        targetCount: keepCount,
+                        createDevice: deviceCreator,
+                        memoryBudgetBytes: options.memoryBudgetBytes,
+                        spill
+                    });
+            }
+
+            logger.info(`${fmtCount(combined.meta.numGaussians)} gaussians · ${combined.meta.shBands} SH bands`);
+            if (outputFormat !== null) { // null output: process for side-effects (e.g. --stats), skip the write
+                // .sogst clip scalars (time range, frame rate) ride in the
+                // input PLY's header comments. A ChunkSource deliberately
+                // carries no comments, so read the headers directly here.
+                // Explicit flags win over whatever the inputs declared.
+                if (outputFormat === 'sogst') {
+                    const fromInputs: Partial<LibOptions['sogstClip']> = {};
+                    for (const inputArg of inputArgs) {
+                        const resolved = resolveInput(inputArg.filename);
+                        if (getInputFormat(resolved.classifyName) !== 'ply') continue;
+                        const src = await resolved.fileSystem.createSource(resolved.filename);
+                        Object.assign(fromInputs, parseSogstComments(await readPlyComments(src)));
+                    }
+                    options.sogstClip = { ...fromInputs, ...options.sogstClip };
+                }
+
+                await writeSource({
+                    filename: outputFilename,
+                    outputFormat,
+                    source: combined,
+                    pool,
+                    options,
+                    createDevice: deviceCreator
+                }, new NodeFileSystem());
+            }
+
+            await combined.close();
             phase.end();
+            reportDone();
+            exit(0);
         }
 
-        // special-case the environment dataTable
-        const envDataTables = inputDataTables.filter(dt => dt.hasColumn('lod') && dt.getColumnByName('lod').data.every(v => v === -1));
-        const nonEnvDataTables = inputDataTables.filter(dt => !dt.hasColumn('lod') || dt.getColumnByName('lod').data.some(v => v !== -1));
+        // LOD-meta output: keep every level, structurally separate — LODs are
+        // overlapping surfaces and are NEVER combined. Levels come from a single
+        // streamed-SOG/lcc/lcc2 intrinsic LODs, or from PLY inputs tagged with --tag-lod (env = -1,
+        // untagged = level 0). Each level (and the env) is processed independently
+        // via processSourceBridged, the levels are stacked, and writeLodSource
+        // streams them. With no actions this matches the previous streaming-LOD
+        // output byte-for-byte.
+        if (!isNullOutput && outputFormat === 'lod') {
+            const pool = createChunkDataPool();
+            const single = inputArgs.length === 1 && !isHttpUrl(inputArgs[0].filename) ?
+                getInputFormat(resolveInput(inputArgs[0].filename).classifyName) : null;
 
-        // combine inputs into a single output dataTable
-        const dataTable = nonEnvDataTables.length > 0 && await processDataTable(
-            combine(nonEnvDataTables),
-            outputArg.processActions,
-            processOptions
-        );
+            let perLevel: ChunkSource[] = [];
+            let envSource: ChunkSource | null = null;
+            let container: ChunkSource | null = null; // shared intrinsic multi-LOD parent
+            let inputActions: CliAction[] = [];
 
-        if (!dataTable || dataTable.numRows === 0) {
-            throw new Error('No Gaussians to write');
-        }
+            if (single === 'lcc' || single === 'lcc2' || single === 'lod') {
+                // Intrinsic multi-LOD: view each level with selectLod (shared parent);
+                // env fetched separately. The input's own actions apply per level.
+                const { filename: inFile, fileSystem } = resolveInput(inputArgs[0].filename);
+                const multi = single === 'lcc2' ?
+                    await readLcc2Source(fileSystem, inFile, { ...options, lodSelect: [] }, pool) :
+                    single === 'lod' ?
+                        await readLodSource(fileSystem, inFile, { ...options, lodSelect: [] }, pool) :
+                        await readLccSource(fileSystem, inFile, { ...options, lodSelect: [] }, pool);
+                container = multi;
+                envSource = single === 'lcc2' ?
+                    await readLcc2EnvironmentSource(fileSystem, inFile, pool) :
+                    single === 'lod' ?
+                        await readLodEnvironmentSource(fileSystem, inFile, pool) :
+                        await readLccEnvironmentSource(fileSystem, inFile, pool);
+                // --select-lod picks which levels go into the lod-meta (default all).
+                perLevel = resolveLodLevels(options.lodSelect, multi.meta.numLods).map(lvl => selectLod(multi, lvl));
+                inputActions = inputArgs[0].processActions;
+            } else {
+                // PLY inputs grouped by --tag-lod tag (env = -1, untagged = level 0);
+                // each input's own actions applied before grouping.
+                const tagged = inputArgs.map((a) => {
+                    const ply = !isHttpUrl(a.filename) && getInputFormat(resolveInput(a.filename).classifyName) === 'ply';
+                    const lods = a.processActions.filter(act => act.kind === 'lod');
+                    const tag = lods.length > 0 ? (lods[lods.length - 1] as { value: number }).value : 0;
+                    const rest = stripLodTags(a.processActions);
+                    return { arg: a, ply, tag, rest };
+                });
+                if (!tagged.every(t => t.ply)) {
+                    throw new Error('lod-meta.json output requires a single streamed-SOG/LCC/LCC2 input, or local PLY input(s) (optionally --tag-lod tagged).');
+                }
+                const opened = await Promise.all(tagged.map(async (t) => {
+                    const { filename: inFile, fileSystem } = resolveInput(t.arg.filename);
+                    const src = await processSourceBridged(
+                        await readPly(await fileSystem.createSource(inFile), pool),
+                        t.rest, pool, processOptions
+                    );
+                    return { src, tag: t.tag };
+                }));
+                const mains = opened.filter(o => o.tag >= 0);
+                if (mains.length === 0) {
+                    throw new Error('No Gaussians to write');
+                }
+                const mainTags = [...new Set(mains.map(m => m.tag))].sort((a, b) => a - b);
+                perLevel = mainTags.map((tag) => {
+                    const group = mains.filter(m => m.tag === tag).map(m => m.src);
+                    return group.length === 1 ? group[0] : concatSource(group, pool);
+                });
+                const envs = opened.filter(o => o.tag === -1).map(o => o.src);
+                envSource = envs.length === 0 ? null : (envs.length === 1 ? envs[0] : concatSource(envs, pool));
+            }
 
-        const envDataTable = envDataTables.length > 0 && await processDataTable(
-            combine(envDataTables),
-            outputArg.processActions,
-            processOptions
-        );
+            // Output (and single-input) actions apply PER LEVEL and to the env —
+            // never across levels.
+            const perLevelActions = stripLodTags([...inputActions, ...outputArg.processActions]);
+            if (perLevelActions.length > 0) {
+                perLevel = await Promise.all(perLevel.map(s => processSourceBridged(s, perLevelActions, pool, processOptions)));
+                if (envSource) envSource = await processSourceBridged(envSource, perLevelActions, pool, processOptions);
+            }
 
-        // explicit flags win over whatever the inputs declared
-        options.sogstClip = { ...clipFromInputs, ...options.sogstClip };
+            // Levels must share a coordinate space before stacking (stackLods
+            // validates and the LOD writer bakes one delta over all levels), so
+            // bake to identity when per-input actions left transforms diverged.
+            if (perLevel.length > 1) {
+                const refTransform = perLevel[0].meta.transform;
+                if (!perLevel.every(s => s.meta.transform.equals(refTransform))) {
+                    perLevel = perLevel.map(s => bakeTransform(s, Transform.IDENTITY));
+                }
+            }
+            const mainSource = perLevel.length === 1 ? perLevel[0] : stackLods(perLevel);
+            const total = mainSource.meta.lodCounts.reduce((a, c) => a + c, 0);
+            if (total === 0) {
+                throw new Error('No Gaussians to write');
+            }
 
-        // Skip file writing for null output
-        if (!isNullOutput) {
-            const phase = logger.group(`Output ${outputArg.filename}`, {
-                index: phaseTotal,
-                total: phaseTotal
-            });
-            logDataTableInfo(dataTable);
-            await writeFile({
+            const phase = logger.group(`Output ${outputArg.filename}`, { index: phaseTotal, total: phaseTotal });
+            logger.info(`${fmtCount(total)} gaussians · ${mainSource.meta.shBands} SH bands · ${mainSource.meta.numLods} LODs (streaming LOD)`);
+            await writeLodSource({
                 filename: outputFilename,
-                outputFormat: outputFormat!,
-                dataTable,
-                envDataTable,
-                options,
-                createDevice: deviceCreator
+                mainSource,
+                envSource,
+                iterations: options.iterations,
+                createDevice: deviceCreator,
+                chunkCount: options.lodChunkCount,
+                chunkExtent: options.lodChunkExtent
             }, new NodeFileSystem());
+
+            await mainSource.close();
+            if (container) await container.close();
+            if (envSource) await envSource.close();
             phase.end();
+            reportDone();
+            exit(0);
         }
+
+        // Anything reaching here is a single-scene (non-lod) output carrying --tag-lod
+        // *tags*: tags build lod-meta.json levels and don't apply to single-scene
+        // output. (Tag-free non-lod conversions and null output ran the single-scene
+        // pipeline above; lod-meta output ran the LOD path.)
+        throw new Error('--tag-lod tags apply to lod-meta.json output; for single-scene output choose a level with --select-lod (-L).');
     } catch (err) {
         failExit(err);
     }

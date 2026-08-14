@@ -5,10 +5,11 @@ import { requireSogstClip, type SogstClip } from './sogst-clip';
 import { logWrittenFile } from './utils';
 import { Column, DataTable, sortMortonOrder } from '../data-table';
 import { type FileSystem, writeStoredZip, type StoredZipEntry } from '../io/write';
-import { kmeans, quantize1d } from '../spatial';
+import { kmeansInterleaved } from '../spatial';
 import type { DeviceCreator } from '../types';
 import { logger, sigmoid, WebPCodec } from '../utils';
 import { version } from '../version';
+import { runQuantize1dColumns } from '../workers';
 
 // Temporal segment length in seconds. Splats are bucketed by t_center into
 // segments of this length so a player can cull by time.
@@ -223,9 +224,23 @@ const computeOrder = (
  * @param alpha - Value for the alpha channel.
  * @returns The packed plane.
  */
-const packLabels = (labels: DataTable, indices: Uint32Array, alpha: number): Uint8Array => {
+/**
+ * Quantizes a set of DataTable columns to a shared 256-entry codebook.
+ *
+ * @param dataTable - Table holding the source columns.
+ * @param columnNames - Columns to quantize together.
+ * @returns The codebook centroids and one uint8 label column per input.
+ */
+const quantizeColumns = (dataTable: DataTable, columnNames: string[]) => {
+    return runQuantize1dColumns(columnNames.map(name => ({
+        name,
+        data: dataTable.getColumnByName(name).data
+    })));
+};
+
+const packLabels = (labels: { name: string, data: Uint8Array }[], indices: Uint32Array, alpha: number): Uint8Array => {
     const numRows = indices.length;
-    const columns = labels.columns.map(c => c.data);
+    const columns = labels.map(c => c.data);
     const plane = new Uint8Array(numRows * 4);
 
     for (let i = 0; i < numRows; ++i) {
@@ -364,15 +379,11 @@ const writeSogst = async (options: WriteSogstOptions, fs: FileSystem) => {
     })();
 
     bar.tick();
-    const scales = quantize1d(
-        new DataTable(['scale_0', 'scale_1', 'scale_2'].map(name => dataTable.getColumnByName(name)))
-    );
+    const scales = await quantizeColumns(dataTable, ['scale_0', 'scale_1', 'scale_2']);
     const scalesPlane = packLabels(scales.labels, indices, 255);
 
     bar.tick();
-    const colors = quantize1d(
-        new DataTable(['f_dc_0', 'f_dc_1', 'f_dc_2'].map(name => dataTable.getColumnByName(name)))
-    );
+    const colors = await quantizeColumns(dataTable, ['f_dc_0', 'f_dc_1', 'f_dc_2']);
     const sh0Plane = packLabels(colors.labels, indices, 255);
     const opacity = dataTable.getColumnByName('opacity').data;
     for (let i = 0; i < numRows; ++i) {
@@ -389,7 +400,7 @@ const writeSogst = async (options: WriteSogstOptions, fs: FileSystem) => {
     }
 
     bar.tick();
-    const trbfCenter = quantize1d(new DataTable([dataTable.getColumnByName('t_center')]));
+    const trbfCenter = await quantizeColumns(dataTable, ['t_center']);
 
     // sigma is heavy-tailed, so cluster in the log domain: a linear codebook
     // spends almost all 256 entries on the tail. The codebook is mapped back to
@@ -398,11 +409,11 @@ const writeSogst = async (options: WriteSogstOptions, fs: FileSystem) => {
     for (let i = 0; i < numRows; ++i) {
         logSigma[i] = Math.log(tSigmaColumn[i]);
     }
-    const trbfSigma = quantize1d(new DataTable([new Column('t_sigma', logSigma)]));
+    const trbfSigma = await runQuantize1dColumns([{ name: 't_sigma', data: logSigma }]);
 
     const trbfPlane = new Uint8Array(numRows * 4);
-    const centerLabels = trbfCenter.labels.getColumn(0).data;
-    const sigmaLabels = trbfSigma.labels.getColumn(0).data;
+    const centerLabels = trbfCenter.labels[0].data;
+    const sigmaLabels = trbfSigma.labels[0].data;
     for (let i = 0; i < numRows; ++i) {
         const idx = indices[i];
         trbfPlane[i * 4 + 0] = centerLabels[idx];
@@ -419,7 +430,16 @@ const writeSogst = async (options: WriteSogstOptions, fs: FileSystem) => {
     if (shBands > 0) {
         const shCoeffs = [0, 3, 8, 15][shBands];
         const shColumnNames = shNames.slice(0, shCoeffs * 3);
-        const shDataTable = new DataTable(shColumnNames.map(name => dataTable.getColumnByName(name)));
+        const restCount = shColumnNames.length;
+
+        // the clusterer takes one interleaved buffer, not columns
+        const shCols = shColumnNames.map(name => dataTable.getColumnByName(name).data);
+        const shRest = new Float32Array(numRows * restCount);
+        for (let i = 0; i < numRows; ++i) {
+            for (let j = 0; j < restCount; ++j) {
+                shRest[i * restCount + j] = shCols[j][i];
+            }
+        }
 
         const paletteSize = Math.min(64, 2 ** Math.floor(Math.log2(numRows / 1024))) * 1024;
 
@@ -427,22 +447,30 @@ const writeSogst = async (options: WriteSogstOptions, fs: FileSystem) => {
         const gpuDevice = createDevice ? await createDevice() : undefined;
 
         bar.tick();
-        const { centroids, labels } = await kmeans(shDataTable, paletteSize, iterations, gpuDevice);
+        const { centroids, labels } = await kmeansInterleaved(shRest, numRows, restCount, paletteSize, iterations, gpuDevice);
+        const numCentroids = centroids.length / restCount;
 
         bar.tick();
-        const codebook = quantize1d(centroids);
+        // de-interleave the (small) centroid palette into columns for the quantizer
+        const cbCols: { name: string, data: Float32Array }[] = [];
+        for (let j = 0; j < restCount; ++j) {
+            const col = new Float32Array(numCentroids);
+            for (let i = 0; i < numCentroids; ++i) {
+                col[i] = centroids[i * restCount + j];
+            }
+            cbCols.push({ name: shColumnNames[j], data: col });
+        }
+        const codebook = await runQuantize1dColumns(cbCols);
+        const cbLabels = codebook.labels.map(c => c.data);
 
         // centroid texture: 64 palette entries per row, each shCoeffs texels wide
-        shCentroidsDims = { width: 64 * shCoeffs, height: Math.ceil(centroids.numRows / 64) };
+        shCentroidsDims = { width: 64 * shCoeffs, height: Math.ceil(numCentroids / 64) };
         shCentroidsBuf = new Uint8Array(shCentroidsDims.width * shCentroidsDims.height * 4);
-        const centroidsRow: any = {};
-        for (let i = 0; i < centroids.numRows; ++i) {
-            codebook.labels.getRow(i, centroidsRow);
-
+        for (let i = 0; i < numCentroids; ++i) {
             for (let j = 0; j < shCoeffs; ++j) {
-                shCentroidsBuf[i * shCoeffs * 4 + j * 4 + 0] = centroidsRow[shColumnNames[shCoeffs * 0 + j]];
-                shCentroidsBuf[i * shCoeffs * 4 + j * 4 + 1] = centroidsRow[shColumnNames[shCoeffs * 1 + j]];
-                shCentroidsBuf[i * shCoeffs * 4 + j * 4 + 2] = centroidsRow[shColumnNames[shCoeffs * 2 + j]];
+                shCentroidsBuf[i * shCoeffs * 4 + j * 4 + 0] = cbLabels[shCoeffs * 0 + j][i];
+                shCentroidsBuf[i * shCoeffs * 4 + j * 4 + 1] = cbLabels[shCoeffs * 1 + j][i];
+                shCentroidsBuf[i * shCoeffs * 4 + j * 4 + 2] = cbLabels[shCoeffs * 2 + j][i];
                 shCentroidsBuf[i * shCoeffs * 4 + j * 4 + 3] = 0xff;
             }
         }
@@ -456,9 +484,9 @@ const writeSogst = async (options: WriteSogstOptions, fs: FileSystem) => {
         }
 
         shN = {
-            count: paletteSize,
+            count: numCentroids,
             bands: shBands,
-            codebook: Array.from(codebook.centroids.getColumn(0).data),
+            codebook: Array.from(codebook.centroids),
             files: ['shN_centroids.webp', 'shN_labels.webp']
         };
     }
@@ -602,14 +630,14 @@ const writeSogst = async (options: WriteSogstOptions, fs: FileSystem) => {
             files: ['means_l.webp', 'means_u.webp']
         },
         scales: {
-            codebook: Array.from(scales.centroids.getColumn(0).data),
+            codebook: Array.from(scales.centroids),
             files: ['scales.webp']
         },
         quats: {
             files: ['quats.webp']
         },
         sh0: {
-            codebook: Array.from(colors.centroids.getColumn(0).data),
+            codebook: Array.from(colors.centroids),
             files: ['sh0.webp']
         },
         ...(shN ? { shN } : {}),
@@ -627,8 +655,8 @@ const writeSogst = async (options: WriteSogstOptions, fs: FileSystem) => {
             }
         } : {}),
         trbf: {
-            center: { codebook: Array.from(trbfCenter.centroids.getColumn(0).data) },
-            sigma: { codebook: Array.from(trbfSigma.centroids.getColumn(0).data, v => Math.exp(v)) },
+            center: { codebook: Array.from(trbfCenter.centroids) },
+            sigma: { codebook: Array.from(trbfSigma.centroids, v => Math.exp(v)) },
             files: ['trbf.webp']
         },
         ...(cov2dScale ? { cov2d_scale: cov2dScale } : {}),
