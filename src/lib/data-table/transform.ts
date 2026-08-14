@@ -8,6 +8,13 @@ const shNames = new Array(45).fill('').map((_, i) => `f_rest_${i}`);
 const _v = new Vec3();
 const _q = new Quat();
 
+// Motion attributes are direction vectors, not points: they rotate and scale
+// with the geometry but never translate. Listed as (x, y, z) column triples.
+const motionTriples = [
+    ['vx', 'vy', 'vz'],
+    ['ax', 'ay', 'az']
+];
+
 // -- Helpers for on-demand column generation --
 
 /**
@@ -93,6 +100,36 @@ const transformColumns = (dataTable: DataTable, columnNames: string[], delta: Tr
         if (columnNames.includes('x')) result.set('x', dstX);
         if (columnNames.includes('y')) result.set('y', dstY);
         if (columnNames.includes('z')) result.set('z', dstZ);
+    }
+
+    // Motion columns. Velocity and acceleration are direction vectors: they
+    // take the rotation and the uniform scale, but never the translation.
+    // Left untransformed they would keep pointing the old way while the
+    // geometry moved, which only shows up once the clip is playing.
+    for (const names of motionTriples) {
+        if (!names.every(n => dataTable.hasColumn(n)) || !names.some(n => columnNames.includes(n))) {
+            continue;
+        }
+
+        const [nx, ny, nz] = names;
+        const srcX = dataTable.getColumnByName(nx)!.data;
+        const srcY = dataTable.getColumnByName(ny)!.data;
+        const srcZ = dataTable.getColumnByName(nz)!.data;
+        const dstX = inPlace ? srcX : new Float32Array(numRows);
+        const dstY = inPlace ? srcY : new Float32Array(numRows);
+        const dstZ = inPlace ? srcZ : new Float32Array(numRows);
+
+        for (let i = 0; i < numRows; ++i) {
+            _v.set(srcX[i], srcY[i], srcZ[i]);
+            r.transformVector(_v, _v);
+            dstX[i] = _v.x * s;
+            dstY[i] = _v.y * s;
+            dstZ[i] = _v.z * s;
+        }
+
+        if (columnNames.includes(nx)) result.set(nx, dstX);
+        if (columnNames.includes(ny)) result.set(ny, dstY);
+        if (columnNames.includes(nz)) result.set(nz, dstZ);
     }
 
     // Rotation columns

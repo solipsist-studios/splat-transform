@@ -19,7 +19,7 @@ import {
     computeWriteTransform
 } from '../src/lib/data-table/transform.js';
 
-import { createMinimalTestData } from './helpers/test-utils.mjs';
+import { createMinimalTestData, addSpacetimeColumns } from './helpers/test-utils.mjs';
 import { assertClose } from './helpers/summary-compare.mjs';
 
 import { Mat4, Quat, Vec3 } from 'playcanvas';
@@ -208,6 +208,69 @@ describe('Rotate Transform', () => {
         assertClose(newSummary.columns.x.mean, originalSummary.columns.x.mean, 1e-5, 'x mean');
         assertClose(newSummary.columns.y.mean, originalSummary.columns.y.mean, 1e-5, 'y mean');
         assertClose(newSummary.columns.z.mean, originalSummary.columns.z.mean, 1e-5, 'z mean');
+    });
+});
+
+describe('Motion Vector Transform', () => {
+    let testData;
+
+    before(() => {
+        testData = addSpacetimeColumns(createMinimalTestData(), { includeAccel: true });
+    });
+
+    it('should rotate velocity and acceleration with the geometry', async () => {
+        const clonedData = testData.clone();
+        const result = await processDataTable(clonedData, [{ kind: 'rotate', value: new Vec3(0, 90, 0) }]);
+
+        const rawVx = result.getColumnByName('vx').data;
+        const rawVz = result.getColumnByName('vz').data;
+        const rawAx = result.getColumnByName('ax').data;
+        const rawAz = result.getColumnByName('az').data;
+
+        const cols = transformColumns(result, ['vx', 'vy', 'vz', 'ax', 'ay', 'az'], result.transform);
+
+        // 90 degrees around Y maps x' = z, z' = -x
+        for (let i = 0; i < result.numRows; ++i) {
+            assertClose(cols.get('vx')[i], rawVz[i], 1e-5, `vx[${i}] after rotation`);
+            assertClose(cols.get('vz')[i], -rawVx[i], 1e-5, `vz[${i}] after rotation`);
+            assertClose(cols.get('ax')[i], rawAz[i], 1e-5, `ax[${i}] after rotation`);
+            assertClose(cols.get('az')[i], -rawAx[i], 1e-5, `az[${i}] after rotation`);
+        }
+    });
+
+    it('should scale velocity but never translate it', async () => {
+        const clonedData = testData.clone();
+        const result = await processDataTable(clonedData, [
+            { kind: 'scale', value: 3 },
+            { kind: 'translate', value: new Vec3(100, 200, 300) }
+        ]);
+
+        const rawVx = result.getColumnByName('vx').data;
+        const cols = transformColumns(result, ['vx', 'vy', 'vz'], result.transform);
+
+        // scaled by 3, and the translation must not appear
+        for (let i = 0; i < result.numRows; ++i) {
+            assertClose(cols.get('vx')[i], rawVx[i] * 3, 1e-5, `vx[${i}] after scale and translate`);
+        }
+    });
+
+    it('should leave the temporal window alone', async () => {
+        const clonedData = testData.clone();
+        const result = await processDataTable(clonedData, [
+            { kind: 'rotate', value: new Vec3(30, 45, 60) },
+            { kind: 'scale', value: 2 },
+            { kind: 'translate', value: new Vec3(1, 2, 3) }
+        ]);
+
+        const rawCenter = result.getColumnByName('t_center').data;
+        const rawSigma = result.getColumnByName('t_sigma').data;
+
+        // a spatial transform does not move a splat in time
+        const cols = transformColumns(result, ['t_center', 't_sigma'], result.transform);
+        for (let i = 0; i < result.numRows; ++i) {
+            assert.strictEqual(cols.get('t_center')[i], rawCenter[i]);
+            assert.strictEqual(cols.get('t_sigma')[i], rawSigma[i]);
+        }
     });
 });
 
