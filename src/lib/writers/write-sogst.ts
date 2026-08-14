@@ -681,19 +681,29 @@ const writeSogst = async (options: WriteSogstOptions, fs: FileSystem) => {
     // each marker must start exactly at the stored byte offset. This is the
     // only thing standing between an off-by-one and a player revealing a
     // half-loaded frame.
+    //
+    // When a marker falls on the last entry there is no following entry — the
+    // offset is the end of the data section, where the central directory
+    // begins. That is the ordinary case for an asset with no SH, so skipping
+    // the check there would leave every static asset unverified.
     if (streams) {
+        const last = archive[archive.length - 1];
+        const endOfData = headerOffsets[headerOffsets.length - 1] + entrySize(last.name, last.data);
+
         const checks: ['reveal_bytes' | 'geometry_bytes', number][] = [
             ['reveal_bytes', revealThrough],
             ['geometry_bytes', geometryThrough]
         ];
 
         for (const [key, index] of checks) {
-            if (index >= 0 && index + 1 < entries.length) {
-                // headerOffsets[0] is meta.json, so entries[n] is at n + 1
-                const actual = headerOffsets[index + 2];
-                if (actual !== streams[key]) {
-                    throw new Error(`writeSogst: ${key} ${streams[key]} does not match actual entry offset ${actual}`);
-                }
+            if (index < 0) {
+                continue;
+            }
+
+            // headerOffsets[0] is meta.json, so entries[n] is at n + 1
+            const actual = index + 1 < entries.length ? headerOffsets[index + 2] : endOfData;
+            if (actual !== streams[key]) {
+                throw new Error(`writeSogst: ${key} ${streams[key]} does not match actual entry offset ${actual}`);
             }
         }
     }

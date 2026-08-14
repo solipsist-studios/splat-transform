@@ -552,6 +552,33 @@ describe('SOGST Format', () => {
         assert.strictEqual(width, 64 * coeffs);
     });
 
+    it('should end geometry_bytes at the central directory when there is no SH', async () => {
+        // With deferred SH, geometry_bytes is the header offset of the first
+        // tail entry, and it is tempting to describe it as "the next entry's
+        // local header" in general. With no SH there is no next entry: the
+        // offset is the end of the last entry, which is where the central
+        // directory begins. A validator built on the first description passes
+        // every SH asset and fails every static one.
+        const source = makeFixture(64);
+        const { meta, entries } = decodeSogst(await writeToMemory(source));
+
+        const { streams } = meta;
+        assert.strictEqual(streams.sh_deferred, false, 'this fixture has no SH');
+        assert.strictEqual(meta.shN, undefined);
+
+        const last = entries[entries.length - 1];
+        const endOfData = last.headerOffset + 30 + last.name.length + last.data.length;
+
+        assert.strictEqual(streams.geometry_bytes, endOfData, 'geometry_bytes should end the data section');
+        assert(!entries.some(e => e.headerOffset >= streams.geometry_bytes), 'no entry may follow geometry_bytes');
+        assert(streams.reveal_bytes < streams.geometry_bytes, 'reveal must precede the end of geometry');
+
+        // reveal_bytes still points at a real entry header — only the geometry
+        // end degenerates when the tail is absent
+        const headerOffsets = new Set(entries.map(e => e.headerOffset));
+        assert(headerOffsets.has(streams.reveal_bytes), `reveal_bytes ${streams.reveal_bytes} is not an entry boundary`);
+    });
+
     it('should write a monolithic archive when segmentation is disabled', async () => {
         const source = makeFixture(32);
         const { meta, entries } = decodeSogst(await writeToMemory(source, { segmentDuration: 0 }));
