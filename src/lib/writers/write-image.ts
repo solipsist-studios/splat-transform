@@ -9,10 +9,6 @@ import { type Projection, type RenderCamera } from '../render/camera';
 import type { DeviceCreator } from '../types';
 import { logger, Transform, WebPCodec } from '../utils';
 
-// Cache the WebP codec across invocations; `WebPCodec.create()` instantiates
-// the WASM module which is expensive to repeat. Same pattern as write-sog.ts.
-let webPCodec: WebPCodec | undefined;
-
 /**
  * Options for writing a rendered splat image.
  */
@@ -169,7 +165,7 @@ const writeImage = async (options: WriteImageOptions, fs: FileSystem): Promise<v
     let { fov, width, height } = options;
     if (projection === 'equirect') {
         if (fov !== undefined) {
-            throw new Error('writeImage: --fov is not valid with --projection equirect (the projection covers a full 360°×180° sphere).');
+            throw new Error('writeImage: --camera-fov is not valid with --projection equirect (the projection covers a full 360°×180° sphere).');
         }
         if (fStop !== undefined) {
             throw new Error('writeImage: --f-stop is not valid with --projection equirect (defocus blur needs a focal length, which the equirect projection does not have).');
@@ -207,8 +203,8 @@ const writeImage = async (options: WriteImageOptions, fs: FileSystem): Promise<v
         }
     }
 
-    // Motion blur: enabled iff `--camera-end` is supplied. The end pose
-    // for missing `look-at-end` / `up-end` defaults to the start pose so
+    // Motion blur: enabled iff `--camera-pos-end` is supplied. The end pose
+    // for missing `camera-target-end` / `camera-up-end` defaults to the start pose so
     // pure translations don't need redundant flags.
     const motionBlur = cameraEndPosition !== undefined;
     const motionN = motionBlur ? (motionSamples ?? 16) : 1;
@@ -263,7 +259,7 @@ const writeImage = async (options: WriteImageOptions, fs: FileSystem): Promise<v
             } else {
                 const fwdLen = Math.hypot(tgt.x - pos.x, tgt.y - pos.y, tgt.z - pos.z);
                 if (fwdLen === 0) {
-                    throw new Error('writeImage: cannot derive default --focus-distance because --camera equals --look-at.');
+                    throw new Error('writeImage: cannot derive default --focus-distance because --camera-pos equals --camera-target.');
                 }
                 fDist = fwdLen;
             }
@@ -350,9 +346,7 @@ const writeImage = async (options: WriteImageOptions, fs: FileSystem): Promise<v
     }
 
     const encodingGroup = logger.group('Encoding');
-    if (!webPCodec) {
-        webPCodec = await WebPCodec.create();
-    }
+    const webPCodec = await WebPCodec.create(); // cheap: create() memoizes the wasm module
     const webp = webPCodec.encodeLosslessRGBA(rgba, width, height);
     encodingGroup.end();
 

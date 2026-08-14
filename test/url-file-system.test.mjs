@@ -25,10 +25,26 @@ import {
     writeSog
 } from '../src/lib/index.js';
 
+import { materializeToDataTable } from '../src/lib/compat/data-table.js';
+import { createChunkDataPool } from '../src/lib/chunk/index.js';
+
 import { createMinimalTestData } from './helpers/test-utils.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const fixturesDir = join(__dirname, 'fixtures', 'splat');
+
+// readFile now yields chunk sources; materialize them to DataTables for these
+// (DataTable-asserting) tests, releasing each source.
+const readTables = async (opts) => {
+    const sources = await readFile(opts);
+    const pool = createChunkDataPool();
+    const tables = [];
+    for (const src of sources) {
+        tables.push(await materializeToDataTable(src, pool));
+        await src.close();
+    }
+    return tables;
+};
 
 // Required so the SOG writer/reader can locate the WebP wasm during the
 // in-process .sog round-trip test below.
@@ -44,14 +60,17 @@ WebPCodec.wasmUrl = join(__dirname, '..', 'lib', 'webp.wasm');
  *
  * @param {Record<string, Uint8Array>} routes - map of pathname (e.g. `/minimal.splat`) to body
  * @param {boolean} supportRange - if true, respect Range headers (206); else always 200
- * @returns {Promise<{ url: string, requests: string[], close: () => Promise<void> }>}
+ * @param {boolean} exposeRangeSize - if false, omit Content-Range from 206 responses
+ * @returns {Promise<{ url: string, requests: string[], requestMethods: string[], close: () => Promise<void> }>}
  */
-const startServer = (routes, supportRange) => {
+const startServer = (routes, supportRange, exposeRangeSize = true) => {
     return new Promise((resolve) => {
         const requests = [];
+        const requestMethods = [];
         const server = http.createServer((req, res) => {
             // Track the full request line so tests can assert on querystrings too.
             requests.push(req.url);
+            requestMethods.push(req.method);
 
             // Match on pathname only; querystring/fragment are ignored for routing
             // (but the server records them via `requests` for assertions).
@@ -70,12 +89,15 @@ const startServer = (routes, supportRange) => {
                     const start = parseInt(match[1], 10);
                     const end = match[2] ? parseInt(match[2], 10) : body.length - 1;
                     const slice = body.subarray(start, end + 1);
-                    res.writeHead(206, {
+                    const headers = {
                         'Content-Type': 'application/octet-stream',
                         'Content-Length': String(slice.length),
-                        'Content-Range': `bytes ${start}-${end}/${body.length}`,
                         'Accept-Ranges': 'bytes'
-                    });
+                    };
+                    if (exposeRangeSize) {
+                        headers['Content-Range'] = `bytes ${start}-${end}/${body.length}`;
+                    }
+                    res.writeHead(206, headers);
                     res.end(slice);
                     return;
                 }
@@ -93,6 +115,7 @@ const startServer = (routes, supportRange) => {
             resolve({
                 url: `http://127.0.0.1:${port}`,
                 requests,
+                requestMethods,
                 close: () => new Promise(r => server.close(() => r()))
             });
         });
@@ -113,7 +136,7 @@ describe('UrlReadFileSystem (CLI integration)', () => {
         try {
             const url = `${server.url}/minimal.splat`;
             const fileSystem = new UrlReadFileSystem();
-            const tables = await readFile({
+            const tables = await readTables({
                 filename: url,
                 inputFormat: getInputFormat(url),
                 options: {},
@@ -132,7 +155,7 @@ describe('UrlReadFileSystem (CLI integration)', () => {
         try {
             const url = `${server.url}/minimal.ksplat`;
             const fileSystem = new UrlReadFileSystem();
-            const tables = await readFile({
+            const tables = await readTables({
                 filename: url,
                 inputFormat: getInputFormat(url),
                 options: {},
@@ -141,6 +164,23 @@ describe('UrlReadFileSystem (CLI integration)', () => {
             });
             assert.strictEqual(tables.length, 1);
             assert.strictEqual(tables[0].numRows, 4);
+        } finally {
+            await server.close();
+        }
+    });
+
+    it('falls back to memory when the range response size is unavailable', async () => {
+        const server = await startServer({ '/minimal.splat': splatBody }, true, false);
+        try {
+            const fileSystem = new UrlReadFileSystem();
+            const source = await fileSystem.createSource(`${server.url}/minimal.splat`);
+            try {
+                const bytes = await source.read().readAll();
+                assert.deepStrictEqual(Array.from(bytes), Array.from(splatBody));
+                assert.ok(!server.requestMethods.includes('HEAD'), 'must not use a potentially encoded HEAD Content-Length');
+            } finally {
+                source.close();
+            }
         } finally {
             await server.close();
         }
@@ -161,7 +201,7 @@ describe('UrlReadFileSystem (CLI integration)', () => {
             const fileSystem = new UrlReadFileSystem(baseUrl);
 
             // Primary leaf read goes through readFile().
-            const tables = await readFile({
+            const tables = await readTables({
                 filename: 'minimal.splat',
                 inputFormat: 'splat',
                 options: {},
@@ -202,7 +242,7 @@ describe('UrlReadFileSystem (CLI integration)', () => {
         try {
             const baseUrl = `${server.url}/`;
             const fileSystem = new UrlReadFileSystem(baseUrl);
-            const tables = await readFile({
+            const tables = await readTables({
                 filename: 'scene.splat?token=abc',
                 inputFormat: 'splat',
                 options: {},
@@ -252,7 +292,7 @@ describe('UrlReadFileSystem (CLI integration)', () => {
             const inputFormat = getInputFormat(`${baseUrl}${filename}`);
             assert.strictEqual(inputFormat, 'sog');
 
-            const tables = await readFile({
+            const tables = await readTables({
                 filename,
                 inputFormat,
                 options: {},
