@@ -444,6 +444,88 @@ describe('SOGST Format', () => {
         assert.strictEqual(cursor, meta.count);
     });
 
+    it('should give a populated segment its real extent, not its bucket bounds', async () => {
+        // A populated segment's [t0, t1] is the union of its members' active
+        // intervals, so a splat centred just inside a bucket has support
+        // reaching back before the bucket edge. Where a long empty run precedes
+        // such a segment, the empty segments carry nominal bucket bounds and the
+        // populated one carries a real extent that starts EARLIER -- so
+        // segments.list is not sorted by t0 on conforming files.
+        //
+        // Clamping the populated window to the bucket to restore monotonicity is
+        // the tempting fix and it is wrong: it culls splats that are still on
+        // screen, which pop. This locks in the asymmetry.
+        const count = 64;
+        const source = makeFixture(count, { timeMax: 2 });
+        const tCenter = source.getColumnByName('t_center').data;
+        const tSigma = source.getColumnByName('t_sigma').data;
+
+        // an empty run over buckets 7..12, then a segment-13 population whose
+        // sigma sits just under the persistent threshold (3.0 * 0.1 / 2 / 3.8)
+        // so it stays bucketed while reaching well back past 1.2
+        for (let i = 0; i < count; ++i) {
+            const preGap = i < count / 2;
+            tCenter[i] = preGap ? 0.05 + (i / count) * 1.2 : 1.301 + ((i - count / 2) / count) * 1.2;
+            tSigma[i] = preGap ? 0.008 : 0.039;
+        }
+
+        const { meta } = decodeSogst(await writeToMemory(source, { clip: { timeMin: 0, timeMax: 2, fps: 30 } }));
+        const { list, duration, k_sigma: kSigma } = meta.segments;
+
+        const populated = list[13];
+        assert(populated.range[1] > populated.range[0], 'segment 13 should be populated');
+        assert.strictEqual(list[12].range[0], list[12].range[1], 'segment 12 should be empty');
+
+        // the empty predecessor uses its nominal window
+        assert.strictEqual(list[12].t0, 12 * duration);
+
+        // and the populated segment reaches back before it
+        assert(
+            populated.t0 < list[12].t0,
+            `segment 13 t0 (${populated.t0}) should precede empty segment 12 t0 (${list[12].t0}) -- ` +
+            'a populated window must not be clamped to its bucket'
+        );
+
+        // the extent is exactly the union of the members' active intervals
+        let lo = Infinity;
+        let hi = -Infinity;
+        for (let i = 0; i < count; ++i) {
+            if (Math.floor(tCenter[i] / duration) !== 13) continue;
+            lo = Math.min(lo, tCenter[i] - kSigma * tSigma[i]);
+            hi = Math.max(hi, tCenter[i] + kSigma * tSigma[i]);
+        }
+        assert(Math.abs(populated.t0 - lo) < 1e-4, `segment 13 t0 ${populated.t0} should be the member minimum ${lo}`);
+        assert(Math.abs(populated.t1 - hi) < 1e-4, `segment 13 t1 ${populated.t1} should be the member maximum ${hi}`);
+
+        // list is indexed by segment number -- the range table is keyed to that
+        // index, so any reordering silently corrupts the file
+        let cursor = meta.segments.persistent[1];
+        for (const segment of list) {
+            assert.strictEqual(segment.range[0], cursor, 'segments.list must stay in segment-index order');
+            cursor = segment.range[1];
+        }
+    });
+
+    it('should handle a motion axis with zero variance', async () => {
+        // a static capture has constant-zero velocity on every axis, so the
+        // split-plane range is degenerate -- min === max on all three
+        const source = makeFixture(32);
+        for (const axis of ['vx', 'vy', 'vz']) {
+            source.getColumnByName(axis).data.fill(0);
+        }
+
+        const { meta, fields } = decodeSogst(await writeToMemory(source));
+
+        assert.deepStrictEqual(meta.motion.mins, [0, 0, 0]);
+        assert.deepStrictEqual(meta.motion.maxs, [0, 0, 0]);
+
+        for (const axis of ['vx', 'vy', 'vz']) {
+            for (let i = 0; i < meta.count; ++i) {
+                assert.strictEqual(fields[axis][i], 0, `${axis} should decode to exactly 0 at ${i}, not NaN`);
+            }
+        }
+    });
+
     it('should land reveal_bytes and geometry_bytes on entry boundaries', async () => {
         const source = makeFixture(64, { includeSH: true, shBands: 3 });
         const { meta, entries } = decodeSogst(await writeToMemory(source));
