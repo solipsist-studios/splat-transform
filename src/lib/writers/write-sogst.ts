@@ -701,9 +701,11 @@ const writeSogst = async (options: WriteSogstOptions, fs: FileSystem) => {
             }
 
             // headerOffsets[0] is meta.json, so entries[n] is at n + 1
-            const actual = index + 1 < entries.length ? headerOffsets[index + 2] : endOfData;
+            const follows = index + 1 < entries.length;
+            const actual = follows ? headerOffsets[index + 2] : endOfData;
             if (actual !== streams[key]) {
-                throw new Error(`writeSogst: ${key} ${streams[key]} does not match actual entry offset ${actual}`);
+                const what = follows ? `the local header of '${entries[index + 1].name}'` : 'the central directory';
+                throw new Error(`writeSogst: ${key} ${streams[key]} does not match ${actual}, ${what}`);
             }
         }
     }
