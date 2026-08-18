@@ -6,9 +6,9 @@ import { Column, DataTable, sortMortonOrder } from '../data-table';
 import { type FileSystem, writeStoredZip, type StoredZipEntry } from '../io/write';
 import { kmeansInterleaved } from '../spatial';
 import type { DeviceCreator } from '../types';
-import { logger, sigmoid, WebPCodec } from '../utils';
+import { logger, sigmoid } from '../utils';
 import { version } from '../version';
-import { runQuantize1dColumns } from '../workers';
+import { runEncodeWebp, runQuantize1dColumns } from '../workers';
 
 // Temporal segment length in seconds. Splats are bucketed by t_center into
 // segments of this length so a player can cull by time.
@@ -34,7 +34,6 @@ const motionNames = ['vx', 'vy', 'vz'];
 const accelNames = ['ax', 'ay', 'az'];
 const trbfNames = ['t_center', 't_sigma'];
 
-let webPCodec: WebPCodec;
 
 /**
  * A single temporal segment: the time range its members are actually active
@@ -603,19 +602,20 @@ const writeSogst = async (options: WriteSogstOptions, fs: FileSystem) => {
 
     bar.tick();
 
-    if (!webPCodec) {
-        webPCodec = await WebPCodec.create();
-    }
-
-    // encode a plane's [a, b) slice into its own near-square texture. Padding
+    // Encode a plane's [a, b) slice into its own near-square texture. Padding
     // texels beyond the slice stay zero — never read, and they compress best.
+    //
+    // Encoding runs on the worker pool: a segmented clip emits one texture set
+    // per group, which is 120-280 encodes for the capture fixtures, and they
+    // are independent of one another. `buf` is freshly allocated here, so
+    // handing its buffer to the worker as a transfer detaches nothing shared.
     const encodeSlice = (plane: Uint8Array, a: number, b: number) => {
         // same 4-aligned near-square dimensions as the SOG writer — the spec
         // requires only splat i at texel i, and permits the roundup
         const { width, height } = texDims(b - a);
         const buf = new Uint8Array(width * height * 4);
         buf.set(plane.subarray(a * 4, b * 4));
-        return webPCodec.encodeLosslessRGBA(buf, width, height);
+        return runEncodeWebp(buf, width, height);
     };
 
     // the geometry textures of one index range, in archive order
@@ -641,7 +641,7 @@ const writeSogst = async (options: WriteSogstOptions, fs: FileSystem) => {
         }));
     };
 
-    const entries: { name: string; data: Uint8Array }[] = [];
+    const pending: { name: string; data: Promise<Uint8Array> }[] = [];
     let revealThrough = -1;
     let geometryThrough = -1;
     let streams = null;
@@ -665,10 +665,10 @@ const writeSogst = async (options: WriteSogstOptions, fs: FileSystem) => {
             }
         });
 
-        const labelEntries: { name: string; data: Uint8Array }[] = [];
+        const labelEntries: { name: string; data: Promise<Uint8Array> }[] = [];
 
         for (const [prefix, a, b] of groups) {
-            entries.push(...groupTextures(prefix, a, b));
+            pending.push(...groupTextures(prefix, a, b));
 
             if (shLabelsPlane) {
                 labelEntries.push({
@@ -678,19 +678,19 @@ const writeSogst = async (options: WriteSogstOptions, fs: FileSystem) => {
             }
 
             if (prefix === 'persistent' || prefix === revealPrefix) {
-                revealThrough = entries.length - 1;
+                revealThrough = pending.length - 1;
             }
         }
 
-        geometryThrough = entries.length - 1;
+        geometryThrough = pending.length - 1;
 
         if (shCentroidsBuf) {
-            entries.push({
+            pending.push({
                 name: 'shN_centroids.webp',
-                data: webPCodec.encodeLosslessRGBA(shCentroidsBuf, shCentroidsDims.width, shCentroidsDims.height)
+                data: runEncodeWebp(shCentroidsBuf, shCentroidsDims.width, shCentroidsDims.height)
             });
         }
-        entries.push(...labelEntries);
+        pending.push(...labelEntries);
 
         streams = {
             persistent: persistentEnd > 0 ? 'persistent' : null,
@@ -701,18 +701,23 @@ const writeSogst = async (options: WriteSogstOptions, fs: FileSystem) => {
         };
     } else {
         // monolithic layout: one whole-clip texture set at the archive root
-        entries.push(...groupTextures('', 0, numRows));
+        pending.push(...groupTextures('', 0, numRows));
 
         if (shCentroidsBuf) {
-            entries.push({
+            pending.push({
                 name: 'shN_centroids.webp',
-                data: webPCodec.encodeLosslessRGBA(shCentroidsBuf, shCentroidsDims.width, shCentroidsDims.height)
+                data: runEncodeWebp(shCentroidsBuf, shCentroidsDims.width, shCentroidsDims.height)
             });
-            entries.push({ name: 'shN_labels.webp', data: encodeSlice(shLabelsPlane, 0, numRows) });
+            pending.push({ name: 'shN_labels.webp', data: encodeSlice(shLabelsPlane, 0, numRows) });
         }
     }
 
     bar.tick();
+
+    // Archive order is `pending` order; awaiting as a batch keeps it while
+    // letting the pool encode out of order.
+    const encoded = await Promise.all(pending.map(entry => entry.data));
+    const entries = pending.map((entry, i) => ({ name: entry.name, data: encoded[i] }));
 
     // -- meta.json ----------------------------------------------------------
 
