@@ -2,7 +2,7 @@ import { basename } from 'pathe';
 
 import { requireSogstClip, type SogstClip } from './sogst-clip';
 import { logWrittenFile } from './utils';
-import { Column, DataTable, sortMortonOrder } from '../data-table';
+import { Column, DataTable, sortMortonOrder, type TypedArray } from '../data-table';
 import { type FileSystem, writeStoredZip, type StoredZipEntry } from '../io/write';
 import { kmeansInterleaved } from '../spatial';
 import type { DeviceCreator } from '../types';
@@ -372,6 +372,579 @@ const packLabels = (labels: { name: string, data: Uint8Array }[], indices: Uint3
 };
 
 /**
+ * Checks that a table can be written as SOGST, and reports what it holds.
+ *
+ * @param dataTable - Table to check.
+ * @param motionDegree - Degree advertised by the input's `sogst.*` comments, if any.
+ * @returns Whether acceleration is present, the SH band count, and the t_sigma column.
+ * @throws Error describing the first problem found.
+ */
+const validateSogstInput = (dataTable: DataTable, motionDegree: number | undefined) => {
+    // temporal attributes are the whole point of the format — refuse without them
+    const missing = [...motionNames, ...trbfNames].filter(name => !dataTable.hasColumn(name));
+    if (missing.length > 0) {
+        throw new Error(`sogst output requires temporal columns, missing: ${missing.join(', ')}. Expected a PLY carrying ${[...motionNames, ...trbfNames].join(', ')}.`);
+    }
+
+    // accel is all-or-nothing, and its presence — not the advisory comment — is
+    // what sets motion.degree
+    const accelPresent = accelNames.filter(name => dataTable.hasColumn(name));
+    if (accelPresent.length > 0 && accelPresent.length < accelNames.length) {
+        throw new Error(`sogst output requires all of ${accelNames.join(', ')} or none, found only: ${accelPresent.join(', ')}.`);
+    }
+    const hasAccel = accelPresent.length === accelNames.length;
+
+    if (motionDegree !== undefined && motionDegree !== (hasAccel ? 2 : 1)) {
+        throw new Error(`sogst.motion_degree is ${motionDegree} but the data ${hasAccel ? 'has' : 'has no'} ax, ay, az columns.`);
+    }
+
+    const shBands = { '9': 1, '24': 2, '-1': 3 }[shNames.findIndex(v => !dataTable.hasColumn(v))] ?? 0;
+
+    // t_sigma is a standard deviation in seconds and divides the temporal
+    // exponent, so a zero or negative value is not representable
+    const tSigmaColumn = dataTable.getColumnByName('t_sigma').data;
+    for (let i = 0; i < dataTable.numRows; ++i) {
+        if (!(tSigmaColumn[i] > 0)) {
+            throw new Error(`sogst output requires t_sigma > 0 for every splat; row ${i} has ${tSigmaColumn[i]}.`);
+        }
+    }
+
+    return { hasAccel, shBands, tSigmaColumn };
+};
+
+/**
+ * Packs rotations using SOG's largest-three quaternion encoding: normalize,
+ * drop the largest-magnitude component (recoverable from the other three), and
+ * record which one was dropped in the alpha byte.
+ *
+ * @param dataTable - Table holding the rot_0..3 columns.
+ * @param indices - Row order to emit.
+ * @returns The packed RGBA plane.
+ */
+const packQuats = (dataTable: DataTable, indices: Uint32Array): Uint8Array => {
+    const numRows = indices.length;
+    const plane = new Uint8Array(numRows * 4);
+    const quatColumns = ['rot_0', 'rot_1', 'rot_2', 'rot_3'].map(name => dataTable.getColumnByName(name).data);
+    const q = [0, 0, 0, 0];
+    const sqrt2 = Math.sqrt(2);
+
+    for (let i = 0; i < numRows; ++i) {
+        const idx = indices[i];
+
+        for (let j = 0; j < 4; ++j) {
+            q[j] = quatColumns[j][idx];
+        }
+
+        const l = Math.sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+        q.forEach((v, j) => {
+            q[j] = v / l;
+        });
+
+        // find max component
+        const maxComp = q.reduce((v, _, j) => (Math.abs(q[j]) > Math.abs(q[v]) ? j : v), 0);
+
+        // invert if max component is negative, then scale to fit [-1, 1]
+        const sign = q[maxComp] < 0 ? -1 : 1;
+        q.forEach((v, j) => {
+            q[j] = v * sign * sqrt2;
+        });
+
+        const keep = [
+            [1, 2, 3],
+            [0, 2, 3],
+            [0, 1, 3],
+            [0, 1, 2]
+        ][maxComp];
+
+        // q has already been scaled by sqrt(2), so this is
+        // round((s / sqrt(2) + 0.5) * 255) with s the raw component
+        plane[i * 4 + 0] = Math.round(255 * (q[keep[0]] * 0.5 + 0.5));
+        plane[i * 4 + 1] = Math.round(255 * (q[keep[1]] * 0.5 + 0.5));
+        plane[i * 4 + 2] = Math.round(255 * (q[keep[2]] * 0.5 + 0.5));
+
+        // mode byte: 252 + the index of the dropped component in (w,x,y,z)
+        plane[i * 4 + 3] = 252 + maxComp;
+    }
+
+    return plane;
+};
+
+/**
+ * Packs the temporal radial basis function: t_center and t_sigma, each
+ * quantized to its own 256-entry codebook and packed into the R and G channels.
+ *
+ * @param dataTable - Table holding the t_center and t_sigma columns.
+ * @param indices - Row order to emit.
+ * @param tSigmaColumn - The t_sigma column data, already validated as positive.
+ * @returns The packed plane and both codebooks, in linear (not log) space.
+ */
+const packTrbf = async (dataTable: DataTable, indices: Uint32Array, tSigmaColumn: TypedArray) => {
+    const numRows = indices.length;
+    const center = await quantizeColumns(dataTable, ['t_center']);
+
+    // sigma is heavy-tailed, so cluster in the log domain: a linear codebook
+    // spends almost all 256 entries on the tail. The codebook is mapped back to
+    // linear space, so decoders are unaffected.
+    const logSigma = new Float32Array(numRows);
+    for (let i = 0; i < numRows; ++i) {
+        logSigma[i] = Math.log(tSigmaColumn[i]);
+    }
+    const sigma = await runQuantize1dColumns([{ name: 't_sigma', data: logSigma }]);
+
+    const plane = new Uint8Array(numRows * 4);
+    const centerLabels = center.labels[0].data;
+    const sigmaLabels = sigma.labels[0].data;
+    for (let i = 0; i < numRows; ++i) {
+        const idx = indices[i];
+        plane[i * 4 + 0] = centerLabels[idx];
+        plane[i * 4 + 1] = sigmaLabels[idx];
+        plane[i * 4 + 3] = 255;
+    }
+
+    return {
+        plane,
+        centerCodebook: Array.from(center.centroids),
+        sigmaCodebook: Array.from(sigma.centroids, v => Math.exp(v))
+    };
+};
+
+/**
+ * Vector-quantizes the higher-order spherical harmonics into a palette shared
+ * by every group: k-means over the per-splat coefficient vectors, then the
+ * centroid palette itself quantized to a uint8 codebook.
+ *
+ * @param dataTable - Table holding the f_rest_* columns.
+ * @param indices - Row order to emit.
+ * @param shBands - Number of SH bands present (1-3).
+ * @param iterations - k-means iteration count.
+ * @param createDevice - Optional GPU device factory; k-means is the only GPU user.
+ * @param bar - Progress bar, ticked twice.
+ * @returns The centroid texture, its dimensions, the per-splat label plane, and
+ * the shN metadata block.
+ */
+const packSh = async (
+    dataTable: DataTable,
+    indices: Uint32Array,
+    shBands: number,
+    iterations: number,
+    createDevice: DeviceCreator | undefined,
+    bar: ReturnType<typeof logger.bar>
+) => {
+    const numRows = indices.length;
+    const shCoeffs = [0, 3, 8, 15][shBands];
+    const shColumnNames = shNames.slice(0, shCoeffs * 3);
+    const restCount = shColumnNames.length;
+
+    // the clusterer takes one interleaved buffer, not columns
+    const shCols = shColumnNames.map(name => dataTable.getColumnByName(name).data);
+    const shRest = new Float32Array(numRows * restCount);
+    for (let i = 0; i < numRows; ++i) {
+        for (let j = 0; j < restCount; ++j) {
+            shRest[i * restCount + j] = shCols[j][i];
+        }
+    }
+
+    const paletteSize = Math.min(64, 2 ** Math.floor(Math.log2(numRows / 1024))) * 1024;
+
+    // create the GPU device lazily — only SH clustering needs it
+    const gpuDevice = createDevice ? await createDevice() : undefined;
+
+    bar.tick();
+    const { centroids, labels } = await kmeansInterleaved(shRest, numRows, restCount, paletteSize, iterations, gpuDevice);
+    const numCentroids = centroids.length / restCount;
+
+    bar.tick();
+    // de-interleave the (small) centroid palette into columns for the quantizer
+    const cbCols: { name: string, data: Float32Array }[] = [];
+    for (let j = 0; j < restCount; ++j) {
+        const col = new Float32Array(numCentroids);
+        for (let i = 0; i < numCentroids; ++i) {
+            col[i] = centroids[i * restCount + j];
+        }
+        cbCols.push({ name: shColumnNames[j], data: col });
+    }
+    const codebook = await runQuantize1dColumns(cbCols);
+    const cbLabels = codebook.labels.map(c => c.data);
+
+    // centroid texture: 64 palette entries per row, each shCoeffs texels wide
+    const centroidsDims = { width: 64 * shCoeffs, height: Math.ceil(numCentroids / 64) };
+    const centroidsBuf = new Uint8Array(centroidsDims.width * centroidsDims.height * 4);
+    for (let i = 0; i < numCentroids; ++i) {
+        for (let j = 0; j < shCoeffs; ++j) {
+            centroidsBuf[i * shCoeffs * 4 + j * 4 + 0] = cbLabels[shCoeffs * 0 + j][i];
+            centroidsBuf[i * shCoeffs * 4 + j * 4 + 1] = cbLabels[shCoeffs * 1 + j][i];
+            centroidsBuf[i * shCoeffs * 4 + j * 4 + 2] = cbLabels[shCoeffs * 2 + j][i];
+            centroidsBuf[i * shCoeffs * 4 + j * 4 + 3] = 0xff;
+        }
+    }
+
+    const labelsPlane = new Uint8Array(numRows * 4);
+    for (let i = 0; i < numRows; ++i) {
+        const label = labels[indices[i]];
+        labelsPlane[i * 4 + 0] = 0xff & label;
+        labelsPlane[i * 4 + 1] = 0xff & (label >> 8);
+        labelsPlane[i * 4 + 3] = 0xff;
+    }
+
+    return {
+        centroidsBuf,
+        centroidsDims,
+        labelsPlane,
+        shN: {
+            count: numCentroids,
+            bands: shBands,
+            codebook: Array.from(codebook.centroids),
+            files: ['shN_centroids.webp', 'shN_labels.webp']
+        }
+    };
+};
+
+type Split16Planes = ReturnType<typeof computeSplit16Planes>;
+type QuantizedColumns = Awaited<ReturnType<typeof quantizeColumns>>;
+type ShPack = Awaited<ReturnType<typeof packSh>>;
+type TrbfPack = Awaited<ReturnType<typeof packTrbf>>;
+type PendingEntry = { name: string, data: Promise<Uint8Array> };
+type WrittenEntry = { name: string, data: Uint8Array };
+
+/**
+ * The `streams` block: which groups exist and where the two streaming markers
+ * fall. The byte offsets start at 0 and are filled in by resolveStreamOffsets.
+ */
+type Streams = {
+    persistent: string | null;
+    segments: (string | null)[];
+    sh_deferred: boolean;
+    reveal_bytes: number;
+    geometry_bytes: number;
+};
+
+/**
+ * The stored size of one archive entry: its local header, its name, its data.
+ *
+ * @param name - Entry name.
+ * @param data - Entry contents.
+ * @returns The number of bytes the entry occupies in the archive.
+ */
+const entrySize = (name: string, data: Uint8Array) => {
+    return ZIP_LOCAL_HEADER_SIZE + name.length + data.length;
+};
+
+/**
+ * Lays out the archive: slices every plane per group, starts the WebP encodes,
+ * and records which entry each streaming marker falls on.
+ *
+ * With segments this is the streamed layout, SH deferred behind geometry:
+ * `[meta | persistent/* | seg_NNN/* | shN_centroids | *\/shN_labels]`. A player
+ * starts DC-only playback once the first segment has landed and layers the
+ * view-dependent SH in as the trailing entries arrive. Without segments it is
+ * one whole-clip texture set at the archive root and there are no markers.
+ *
+ * @param planes - The geometry planes, as [entry name, whole-clip plane] pairs.
+ * @param sh - Packed spherical harmonics, or null when the asset has none.
+ * @param segments - The segment table, or null for a monolithic archive.
+ * @param numRows - Total splat count.
+ * @returns The pending entries in archive order, the index of the last entry
+ * covered by each marker, and the `streams` block (null when unsegmented).
+ */
+const buildArchive = (
+    planes: [string, Uint8Array][],
+    sh: ShPack | null,
+    segments: Segments | null,
+    numRows: number
+) => {
+    // encode a plane's [a, b) slice into its own near-square texture. Padding
+    // texels beyond the slice stay zero — never read, and they compress best.
+    //
+    // Encoding runs on the worker pool: a segmented clip emits one texture set
+    // per group, which is 120-280 encodes for the capture fixtures, and they
+    // are independent of one another. `buf` is freshly allocated here, so
+    // handing its buffer to the worker as a transfer detaches nothing shared.
+    const encodeSlice = (plane: Uint8Array, a: number, b: number) => {
+        // same 4-aligned near-square dimensions as the SOG writer — the spec
+        // requires only splat i at texel i, and permits the roundup
+        const { width, height } = texDims(b - a);
+        const buf = new Uint8Array(width * height * 4);
+        buf.set(plane.subarray(a * 4, b * 4));
+        return runEncodeWebp(buf, width, height);
+    };
+
+    // the geometry textures of one index range, in archive order
+    const groupTextures = (prefix: string, a: number, b: number) => {
+        return planes.map(([name, plane]) => ({
+            name: prefix ? `${prefix}/${name}` : name,
+            data: encodeSlice(plane, a, b)
+        }));
+    };
+
+    const pending: PendingEntry[] = [];
+    let revealThrough = -1;
+    let geometryThrough = -1;
+    let streams: Streams | null = null;
+
+    if (segments) {
+        const persistentEnd = segments.persistent[1];
+        const prefixes = segments.list.map((segment, i) => (segment.range[1] > segment.range[0] ? `seg_${String(i).padStart(3, '0')}` : null));
+        const revealPrefix = prefixes.find(prefix => prefix !== null) ?? null;
+
+        const groups: [string, number, number][] = [];
+        if (persistentEnd > 0) {
+            groups.push(['persistent', 0, persistentEnd]);
+        }
+        segments.list.forEach((segment, i) => {
+            if (prefixes[i]) {
+                groups.push([prefixes[i], segment.range[0], segment.range[1]]);
+            }
+        });
+
+        const labelEntries: PendingEntry[] = [];
+
+        for (const [prefix, a, b] of groups) {
+            pending.push(...groupTextures(prefix, a, b));
+
+            if (sh) {
+                labelEntries.push({
+                    name: `${prefix}/shN_labels.webp`,
+                    data: encodeSlice(sh.labelsPlane, a, b)
+                });
+            }
+
+            if (prefix === 'persistent' || prefix === revealPrefix) {
+                revealThrough = pending.length - 1;
+            }
+        }
+
+        geometryThrough = pending.length - 1;
+
+        if (sh) {
+            pending.push({
+                name: 'shN_centroids.webp',
+                data: runEncodeWebp(sh.centroidsBuf, sh.centroidsDims.width, sh.centroidsDims.height)
+            });
+        }
+        pending.push(...labelEntries);
+
+        streams = {
+            persistent: persistentEnd > 0 ? 'persistent' : null,
+            segments: prefixes,
+            sh_deferred: labelEntries.length > 0,
+            reveal_bytes: 0,
+            geometry_bytes: 0
+        };
+    } else {
+        pending.push(...groupTextures('', 0, numRows));
+
+        if (sh) {
+            pending.push({
+                name: 'shN_centroids.webp',
+                data: runEncodeWebp(sh.centroidsBuf, sh.centroidsDims.width, sh.centroidsDims.height)
+            });
+            pending.push({ name: 'shN_labels.webp', data: encodeSlice(sh.labelsPlane, 0, numRows) });
+        }
+    }
+
+    return { pending, revealThrough, geometryThrough, streams };
+};
+
+/**
+ * Assembles meta.json.
+ *
+ * @param parts - Everything the manifest reports on.
+ * @param parts.numRows - Total splat count.
+ * @param parts.timeMin - Clip start, in seconds.
+ * @param parts.timeMax - Clip end, in seconds.
+ * @param parts.fps - Playback rate.
+ * @param parts.cov2dScale - Optional 2D covariance scale pair.
+ * @param parts.means - Packed positions.
+ * @param parts.scales - Quantized log scales.
+ * @param parts.colors - Quantized SH DC coefficients.
+ * @param parts.motion - Packed velocities.
+ * @param parts.accel - Packed accelerations, or null at degree 1.
+ * @param parts.trbf - Packed temporal centre and sigma.
+ * @param parts.sh - Packed higher-order harmonics, or null when absent.
+ * @param parts.segments - The segment table, or null for a monolithic archive.
+ * @param parts.streams - The stream block, or null for a monolithic archive.
+ * @returns The manifest object, ready to serialize.
+ */
+const buildSogstMeta = (parts: {
+    numRows: number,
+    timeMin: number,
+    timeMax: number,
+    fps: number,
+    cov2dScale?: SogstClip['cov2dScale'],
+    means: Split16Planes,
+    scales: QuantizedColumns,
+    colors: QuantizedColumns,
+    motion: Split16Planes,
+    accel: Split16Planes | null,
+    trbf: TrbfPack,
+    sh: ShPack | null,
+    segments: Segments | null,
+    streams: Streams | null
+}): any => {
+    const { numRows, timeMin, timeMax, fps, cov2dScale, means, scales, colors, motion, accel, trbf, sh, segments, streams } = parts;
+
+    return {
+        // container version 1. The development-era formats this grew out of were
+        // never released, so they were deleted rather than deprecated: there is
+        // no version 2 or 3 to be compatible with. `format` is required — a
+        // reader rejects an archive without it rather than guessing.
+        version: 1,
+        format: 'sogst',
+        asset: {
+            generator: `splat-transform v${version}`
+        },
+        count: numRows,
+        time: {
+            min: timeMin,
+            max: timeMax,
+            fps: fps
+        },
+        means: {
+            mins: means.mins,
+            maxs: means.maxs,
+            files: ['means_l.webp', 'means_u.webp']
+        },
+        scales: {
+            codebook: Array.from(scales.centroids),
+            files: ['scales.webp']
+        },
+        quats: {
+            files: ['quats.webp']
+        },
+        sh0: {
+            codebook: Array.from(colors.centroids),
+            files: ['sh0.webp']
+        },
+        ...(sh ? { shN: sh.shN } : {}),
+        motion: {
+            degree: accel ? 2 : 1,
+            mins: motion.mins,
+            maxs: motion.maxs,
+            files: ['motion_l.webp', 'motion_u.webp']
+        },
+        ...(accel ? {
+            accel: {
+                mins: accel.mins,
+                maxs: accel.maxs,
+                files: ['accel_l.webp', 'accel_u.webp']
+            }
+        } : {}),
+        trbf: {
+            center: { codebook: trbf.centerCodebook },
+            sigma: { codebook: trbf.sigmaCodebook },
+            files: ['trbf.webp']
+        },
+        ...(cov2dScale ? { cov2d_scale: cov2dScale } : {}),
+        ...(segments ? { segments } : {}),
+        ...(streams ? { streams } : {})
+    };
+};
+
+/**
+ * Fills in `streams.reveal_bytes` / `geometry_bytes` and serializes the
+ * manifest.
+ *
+ * The offsets are byte positions inside the very JSON whose length they change,
+ * so this iterates to a fixed point. `streams` is the same object the manifest
+ * holds, so mutating it updates the manifest in place. reveal_bytes ends the
+ * last entry needed for first paint; geometry_bytes ends the last geometry
+ * entry, which a player uses with measured bandwidth to decide when gap-free
+ * playback becomes possible.
+ *
+ * @param meta - The manifest, holding `streams` by reference.
+ * @param streams - The stream block to fill in, or null when unsegmented.
+ * @param entries - The archive entries following meta.json, in order.
+ * @param revealThrough - Index of the last entry covered by reveal_bytes.
+ * @param geometryThrough - Index of the last entry covered by geometry_bytes.
+ * @returns The serialized manifest.
+ */
+const resolveStreamOffsets = (
+    meta: any,
+    streams: Streams | null,
+    entries: WrittenEntry[],
+    revealThrough: number,
+    geometryThrough: number
+): Uint8Array => {
+    const textEncoder = new TextEncoder();
+    let metaJson = textEncoder.encode(JSON.stringify(meta));
+
+    if (streams) {
+        for (let pass = 0; pass < 6; ++pass) {
+            const previous = [streams.reveal_bytes, streams.geometry_bytes];
+
+            let pos = entrySize('meta.json', metaJson);
+            for (let i = 0; i < entries.length; ++i) {
+                pos += entrySize(entries[i].name, entries[i].data);
+                if (i === revealThrough) streams.reveal_bytes = pos;
+                if (i === geometryThrough) streams.geometry_bytes = pos;
+            }
+
+            metaJson = textEncoder.encode(JSON.stringify(meta));
+
+            if (previous[0] === streams.reveal_bytes && previous[1] === streams.geometry_bytes) {
+                break;
+            }
+        }
+    }
+
+    return metaJson;
+};
+
+/**
+ * Verifies the analytic offsets against the real layout: the entry following
+ * each marker must start exactly at the stored byte offset. This is the only
+ * thing standing between an off-by-one and a player revealing a half-loaded
+ * frame.
+ *
+ * When a marker falls on the last entry there is no following entry — the
+ * offset is the end of the data section, where the central directory begins.
+ * That is the ordinary case for an asset with no SH, so skipping the check
+ * there would leave every static asset unverified.
+ *
+ * @param streams - The stream block that was written, or null when unsegmented.
+ * @param entries - The archive entries following meta.json, in order.
+ * @param archive - Every entry written, meta.json first.
+ * @param headerOffsets - Local header offset of each archive entry, as written.
+ * @param revealThrough - Index of the last entry covered by reveal_bytes.
+ * @param geometryThrough - Index of the last entry covered by geometry_bytes.
+ * @throws Error naming the offset that disagrees and what it landed on.
+ */
+const verifyStreamOffsets = (
+    streams: Streams | null,
+    entries: WrittenEntry[],
+    archive: StoredZipEntry[],
+    headerOffsets: number[],
+    revealThrough: number,
+    geometryThrough: number
+) => {
+    if (!streams) {
+        return;
+    }
+
+    const last = archive[archive.length - 1];
+    const endOfData = headerOffsets[headerOffsets.length - 1] + entrySize(last.name, last.data);
+
+    const checks: ['reveal_bytes' | 'geometry_bytes', number][] = [
+        ['reveal_bytes', revealThrough],
+        ['geometry_bytes', geometryThrough]
+    ];
+
+    for (const [key, index] of checks) {
+        if (index < 0) {
+            continue;
+        }
+
+        // headerOffsets[0] is meta.json, so entries[n] is at n + 1
+        const follows = index + 1 < entries.length;
+        const actual = follows ? headerOffsets[index + 2] : endOfData;
+        if (actual !== streams[key]) {
+            const what = follows ? `the local header of '${entries[index + 1].name}'` : 'the central directory';
+            throw new Error(`writeSogst: ${key} ${streams[key]} does not match ${actual}, ${what}`);
+        }
+    }
+};
+
+/**
  * Writes Gaussian splat data to the SOGST (SOG spacetime) format.
  *
  * SOGST is a SOG container extended to spacetime: the same WebP texture groups
@@ -406,34 +979,7 @@ const writeSogst = async (options: WriteSogstOptions, fs: FileSystem) => {
     // and plays at the wrong speed
     const { timeMin, timeMax, fps, motionDegree, cov2dScale } = requireSogstClip(options.clip ?? {});
 
-    // temporal attributes are the whole point of the format — refuse without them
-    const missing = [...motionNames, ...trbfNames].filter(name => !dataTable.hasColumn(name));
-    if (missing.length > 0) {
-        throw new Error(`sogst output requires temporal columns, missing: ${missing.join(', ')}. Expected a PLY carrying ${[...motionNames, ...trbfNames].join(', ')}.`);
-    }
-
-    // accel is all-or-nothing, and its presence — not the advisory comment — is
-    // what sets motion.degree
-    const accelPresent = accelNames.filter(name => dataTable.hasColumn(name));
-    if (accelPresent.length > 0 && accelPresent.length < accelNames.length) {
-        throw new Error(`sogst output requires all of ${accelNames.join(', ')} or none, found only: ${accelPresent.join(', ')}.`);
-    }
-    const hasAccel = accelPresent.length === accelNames.length;
-
-    if (motionDegree !== undefined && motionDegree !== (hasAccel ? 2 : 1)) {
-        throw new Error(`sogst.motion_degree is ${motionDegree} but the data ${hasAccel ? 'has' : 'has no'} ax, ay, az columns.`);
-    }
-
-    const shBands = { '9': 1, '24': 2, '-1': 3 }[shNames.findIndex(v => !dataTable.hasColumn(v))] ?? 0;
-
-    // t_sigma is a standard deviation in seconds and divides the temporal
-    // exponent, so a zero or negative value is not representable
-    const tSigmaColumn = dataTable.getColumnByName('t_sigma').data;
-    for (let i = 0; i < numRows; ++i) {
-        if (!(tSigmaColumn[i] > 0)) {
-            throw new Error(`sogst output requires t_sigma > 0 for every splat; row ${i} has ${tSigmaColumn[i]}.`);
-        }
-    }
+    const { hasAccel, shBands, tSigmaColumn } = validateSogstInput(dataTable, motionDegree);
 
     const totalSteps = 8 + (hasAccel ? 1 : 0) + (shBands > 0 ? 2 : 0);
     const bar = logger.bar('encoding', totalSteps);
@@ -448,52 +994,7 @@ const writeSogst = async (options: WriteSogstOptions, fs: FileSystem) => {
     const means = computeSplit16Planes(dataTable, ['x', 'y', 'z'], indices);
 
     bar.tick();
-    const quatsPlane = (() => {
-        const plane = new Uint8Array(numRows * 4);
-        const quatColumns = ['rot_0', 'rot_1', 'rot_2', 'rot_3'].map(name => dataTable.getColumnByName(name).data);
-        const q = [0, 0, 0, 0];
-        const sqrt2 = Math.sqrt(2);
-
-        for (let i = 0; i < numRows; ++i) {
-            const idx = indices[i];
-
-            for (let j = 0; j < 4; ++j) {
-                q[j] = quatColumns[j][idx];
-            }
-
-            const l = Math.sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
-            q.forEach((v, j) => {
-                q[j] = v / l;
-            });
-
-            // find max component
-            const maxComp = q.reduce((v, _, j) => (Math.abs(q[j]) > Math.abs(q[v]) ? j : v), 0);
-
-            // invert if max component is negative, then scale to fit [-1, 1]
-            const sign = q[maxComp] < 0 ? -1 : 1;
-            q.forEach((v, j) => {
-                q[j] = v * sign * sqrt2;
-            });
-
-            const keep = [
-                [1, 2, 3],
-                [0, 2, 3],
-                [0, 1, 3],
-                [0, 1, 2]
-            ][maxComp];
-
-            // q has already been scaled by sqrt(2), so this is
-            // round((s / sqrt(2) + 0.5) * 255) with s the raw component
-            plane[i * 4 + 0] = Math.round(255 * (q[keep[0]] * 0.5 + 0.5));
-            plane[i * 4 + 1] = Math.round(255 * (q[keep[1]] * 0.5 + 0.5));
-            plane[i * 4 + 2] = Math.round(255 * (q[keep[2]] * 0.5 + 0.5));
-
-            // mode byte: 252 + the index of the dropped component in (w,x,y,z)
-            plane[i * 4 + 3] = 252 + maxComp;
-        }
-
-        return plane;
-    })();
+    const quatsPlane = packQuats(dataTable, indices);
 
     bar.tick();
     const scales = await quantizeColumns(dataTable, ['scale_0', 'scale_1', 'scale_2']);
@@ -517,210 +1018,31 @@ const writeSogst = async (options: WriteSogstOptions, fs: FileSystem) => {
     }
 
     bar.tick();
-    const trbfCenter = await quantizeColumns(dataTable, ['t_center']);
-
-    // sigma is heavy-tailed, so cluster in the log domain: a linear codebook
-    // spends almost all 256 entries on the tail. The codebook is mapped back to
-    // linear space, so decoders are unaffected.
-    const logSigma = new Float32Array(numRows);
-    for (let i = 0; i < numRows; ++i) {
-        logSigma[i] = Math.log(tSigmaColumn[i]);
-    }
-    const trbfSigma = await runQuantize1dColumns([{ name: 't_sigma', data: logSigma }]);
-
-    const trbfPlane = new Uint8Array(numRows * 4);
-    const centerLabels = trbfCenter.labels[0].data;
-    const sigmaLabels = trbfSigma.labels[0].data;
-    for (let i = 0; i < numRows; ++i) {
-        const idx = indices[i];
-        trbfPlane[i * 4 + 0] = centerLabels[idx];
-        trbfPlane[i * 4 + 1] = sigmaLabels[idx];
-        trbfPlane[i * 4 + 3] = 255;
-    }
+    const trbf = await packTrbf(dataTable, indices, tSigmaColumn);
 
     // higher-order spherical harmonics: vector-quantized, shared across groups
-    let shN = null;
-    let shCentroidsBuf: Uint8Array = null;
-    let shCentroidsDims: { width: number; height: number } = null;
-    let shLabelsPlane: Uint8Array = null;
-
-    if (shBands > 0) {
-        const shCoeffs = [0, 3, 8, 15][shBands];
-        const shColumnNames = shNames.slice(0, shCoeffs * 3);
-        const restCount = shColumnNames.length;
-
-        // the clusterer takes one interleaved buffer, not columns
-        const shCols = shColumnNames.map(name => dataTable.getColumnByName(name).data);
-        const shRest = new Float32Array(numRows * restCount);
-        for (let i = 0; i < numRows; ++i) {
-            for (let j = 0; j < restCount; ++j) {
-                shRest[i * restCount + j] = shCols[j][i];
-            }
-        }
-
-        const paletteSize = Math.min(64, 2 ** Math.floor(Math.log2(numRows / 1024))) * 1024;
-
-        // create the GPU device lazily — only SH clustering needs it
-        const gpuDevice = createDevice ? await createDevice() : undefined;
-
-        bar.tick();
-        const { centroids, labels } = await kmeansInterleaved(shRest, numRows, restCount, paletteSize, iterations, gpuDevice);
-        const numCentroids = centroids.length / restCount;
-
-        bar.tick();
-        // de-interleave the (small) centroid palette into columns for the quantizer
-        const cbCols: { name: string, data: Float32Array }[] = [];
-        for (let j = 0; j < restCount; ++j) {
-            const col = new Float32Array(numCentroids);
-            for (let i = 0; i < numCentroids; ++i) {
-                col[i] = centroids[i * restCount + j];
-            }
-            cbCols.push({ name: shColumnNames[j], data: col });
-        }
-        const codebook = await runQuantize1dColumns(cbCols);
-        const cbLabels = codebook.labels.map(c => c.data);
-
-        // centroid texture: 64 palette entries per row, each shCoeffs texels wide
-        shCentroidsDims = { width: 64 * shCoeffs, height: Math.ceil(numCentroids / 64) };
-        shCentroidsBuf = new Uint8Array(shCentroidsDims.width * shCentroidsDims.height * 4);
-        for (let i = 0; i < numCentroids; ++i) {
-            for (let j = 0; j < shCoeffs; ++j) {
-                shCentroidsBuf[i * shCoeffs * 4 + j * 4 + 0] = cbLabels[shCoeffs * 0 + j][i];
-                shCentroidsBuf[i * shCoeffs * 4 + j * 4 + 1] = cbLabels[shCoeffs * 1 + j][i];
-                shCentroidsBuf[i * shCoeffs * 4 + j * 4 + 2] = cbLabels[shCoeffs * 2 + j][i];
-                shCentroidsBuf[i * shCoeffs * 4 + j * 4 + 3] = 0xff;
-            }
-        }
-
-        shLabelsPlane = new Uint8Array(numRows * 4);
-        for (let i = 0; i < numRows; ++i) {
-            const label = labels[indices[i]];
-            shLabelsPlane[i * 4 + 0] = 0xff & label;
-            shLabelsPlane[i * 4 + 1] = 0xff & (label >> 8);
-            shLabelsPlane[i * 4 + 3] = 0xff;
-        }
-
-        shN = {
-            count: numCentroids,
-            bands: shBands,
-            codebook: Array.from(codebook.centroids),
-            files: ['shN_centroids.webp', 'shN_labels.webp']
-        };
-    }
+    const sh = shBands > 0 ? await packSh(dataTable, indices, shBands, iterations, createDevice, bar) : null;
 
     // -- texture encoding ---------------------------------------------------
 
     bar.tick();
 
-    // Encode a plane's [a, b) slice into its own near-square texture. Padding
-    // texels beyond the slice stay zero — never read, and they compress best.
-    //
-    // Encoding runs on the worker pool: a segmented clip emits one texture set
-    // per group, which is 120-280 encodes for the capture fixtures, and they
-    // are independent of one another. `buf` is freshly allocated here, so
-    // handing its buffer to the worker as a transfer detaches nothing shared.
-    const encodeSlice = (plane: Uint8Array, a: number, b: number) => {
-        // same 4-aligned near-square dimensions as the SOG writer — the spec
-        // requires only splat i at texel i, and permits the roundup
-        const { width, height } = texDims(b - a);
-        const buf = new Uint8Array(width * height * 4);
-        buf.set(plane.subarray(a * 4, b * 4));
-        return runEncodeWebp(buf, width, height);
-    };
+    const planes: [string, Uint8Array][] = [
+        ['means_l.webp', means.lo],
+        ['means_u.webp', means.hi],
+        ['quats.webp', quatsPlane],
+        ['scales.webp', scalesPlane],
+        ['sh0.webp', sh0Plane],
+        ['motion_l.webp', motion.lo],
+        ['motion_u.webp', motion.hi],
+        ['trbf.webp', trbf.plane]
+    ];
 
-    // the geometry textures of one index range, in archive order
-    const groupTextures = (prefix: string, a: number, b: number) => {
-        const planes: [string, Uint8Array][] = [
-            ['means_l.webp', means.lo],
-            ['means_u.webp', means.hi],
-            ['quats.webp', quatsPlane],
-            ['scales.webp', scalesPlane],
-            ['sh0.webp', sh0Plane],
-            ['motion_l.webp', motion.lo],
-            ['motion_u.webp', motion.hi],
-            ['trbf.webp', trbfPlane]
-        ];
-
-        if (accel) {
-            planes.push(['accel_l.webp', accel.lo], ['accel_u.webp', accel.hi]);
-        }
-
-        return planes.map(([name, plane]) => ({
-            name: prefix ? `${prefix}/${name}` : name,
-            data: encodeSlice(plane, a, b)
-        }));
-    };
-
-    const pending: { name: string; data: Promise<Uint8Array> }[] = [];
-    let revealThrough = -1;
-    let geometryThrough = -1;
-    let streams = null;
-
-    if (segments) {
-        // Streamed layout, SH deferred behind geometry:
-        //   [meta | persistent/* | seg_NNN/* | shN_centroids | */shN_labels]
-        // A player starts DC-only playback once the first segment has landed
-        // and layers the view-dependent SH in as the trailing entries arrive.
-        const persistentEnd = segments.persistent[1];
-        const prefixes = segments.list.map((segment, i) => (segment.range[1] > segment.range[0] ? `seg_${String(i).padStart(3, '0')}` : null));
-        const revealPrefix = prefixes.find(prefix => prefix !== null) ?? null;
-
-        const groups: [string, number, number][] = [];
-        if (persistentEnd > 0) {
-            groups.push(['persistent', 0, persistentEnd]);
-        }
-        segments.list.forEach((segment, i) => {
-            if (prefixes[i]) {
-                groups.push([prefixes[i], segment.range[0], segment.range[1]]);
-            }
-        });
-
-        const labelEntries: { name: string; data: Promise<Uint8Array> }[] = [];
-
-        for (const [prefix, a, b] of groups) {
-            pending.push(...groupTextures(prefix, a, b));
-
-            if (shLabelsPlane) {
-                labelEntries.push({
-                    name: `${prefix}/shN_labels.webp`,
-                    data: encodeSlice(shLabelsPlane, a, b)
-                });
-            }
-
-            if (prefix === 'persistent' || prefix === revealPrefix) {
-                revealThrough = pending.length - 1;
-            }
-        }
-
-        geometryThrough = pending.length - 1;
-
-        if (shCentroidsBuf) {
-            pending.push({
-                name: 'shN_centroids.webp',
-                data: runEncodeWebp(shCentroidsBuf, shCentroidsDims.width, shCentroidsDims.height)
-            });
-        }
-        pending.push(...labelEntries);
-
-        streams = {
-            persistent: persistentEnd > 0 ? 'persistent' : null,
-            segments: prefixes,
-            sh_deferred: labelEntries.length > 0,
-            reveal_bytes: 0,
-            geometry_bytes: 0
-        };
-    } else {
-        // monolithic layout: one whole-clip texture set at the archive root
-        pending.push(...groupTextures('', 0, numRows));
-
-        if (shCentroidsBuf) {
-            pending.push({
-                name: 'shN_centroids.webp',
-                data: runEncodeWebp(shCentroidsBuf, shCentroidsDims.width, shCentroidsDims.height)
-            });
-            pending.push({ name: 'shN_labels.webp', data: encodeSlice(shLabelsPlane, 0, numRows) });
-        }
+    if (accel) {
+        planes.push(['accel_l.webp', accel.lo], ['accel_u.webp', accel.hi]);
     }
+
+    const { pending, revealThrough, geometryThrough, streams } = buildArchive(planes, sh, segments, numRows);
 
     bar.tick();
 
@@ -731,91 +1053,24 @@ const writeSogst = async (options: WriteSogstOptions, fs: FileSystem) => {
 
     // -- meta.json ----------------------------------------------------------
 
-    const meta: any = {
-        // container version 1. The development-era formats this grew out of were
-        // never released, so they were deleted rather than deprecated: there is
-        // no version 2 or 3 to be compatible with. `format` is required — a
-        // reader rejects an archive without it rather than guessing.
-        version: 1,
-        format: 'sogst',
-        asset: {
-            generator: `splat-transform v${version}`
-        },
-        count: numRows,
-        time: {
-            min: timeMin,
-            max: timeMax,
-            fps: fps
-        },
-        means: {
-            mins: means.mins,
-            maxs: means.maxs,
-            files: ['means_l.webp', 'means_u.webp']
-        },
-        scales: {
-            codebook: Array.from(scales.centroids),
-            files: ['scales.webp']
-        },
-        quats: {
-            files: ['quats.webp']
-        },
-        sh0: {
-            codebook: Array.from(colors.centroids),
-            files: ['sh0.webp']
-        },
-        ...(shN ? { shN } : {}),
-        motion: {
-            degree: accel ? 2 : 1,
-            mins: motion.mins,
-            maxs: motion.maxs,
-            files: ['motion_l.webp', 'motion_u.webp']
-        },
-        ...(accel ? {
-            accel: {
-                mins: accel.mins,
-                maxs: accel.maxs,
-                files: ['accel_l.webp', 'accel_u.webp']
-            }
-        } : {}),
-        trbf: {
-            center: { codebook: Array.from(trbfCenter.centroids) },
-            sigma: { codebook: Array.from(trbfSigma.centroids, v => Math.exp(v)) },
-            files: ['trbf.webp']
-        },
-        ...(cov2dScale ? { cov2d_scale: cov2dScale } : {}),
-        ...(segments ? { segments } : {}),
-        ...(streams ? { streams } : {})
-    };
+    const meta = buildSogstMeta({
+        numRows,
+        timeMin,
+        timeMax,
+        fps,
+        cov2dScale,
+        means,
+        scales,
+        colors,
+        motion,
+        accel,
+        trbf,
+        sh,
+        segments,
+        streams
+    });
 
-    const textEncoder = new TextEncoder();
-    const entrySize = (name: string, data: Uint8Array) => {
-        return ZIP_LOCAL_HEADER_SIZE + name.length + data.length;
-    };
-
-    // reveal_bytes / geometry_bytes are byte offsets inside the very JSON whose
-    // length they change, so iterate to a fixed point. reveal_bytes ends the
-    // last entry needed for first paint; geometry_bytes ends the last geometry
-    // entry, which a player uses with measured bandwidth to decide when
-    // gap-free playback becomes possible.
-    let metaJson = textEncoder.encode(JSON.stringify(meta));
-    if (streams) {
-        for (let pass = 0; pass < 6; ++pass) {
-            const previous = [streams.reveal_bytes, streams.geometry_bytes];
-
-            let pos = entrySize('meta.json', metaJson);
-            for (let i = 0; i < entries.length; ++i) {
-                pos += entrySize(entries[i].name, entries[i].data);
-                if (i === revealThrough) streams.reveal_bytes = pos;
-                if (i === geometryThrough) streams.geometry_bytes = pos;
-            }
-
-            metaJson = textEncoder.encode(JSON.stringify(meta));
-
-            if (previous[0] === streams.reveal_bytes && previous[1] === streams.geometry_bytes) {
-                break;
-            }
-        }
-    }
+    const metaJson = resolveStreamOffsets(meta, streams, entries, revealThrough, geometryThrough);
 
     // -- write the archive --------------------------------------------------
 
@@ -828,38 +1083,7 @@ const writeSogst = async (options: WriteSogstOptions, fs: FileSystem) => {
     bar.end();
     logWrittenFile(basename(filename), outputWriter.bytesWritten);
 
-    // Verify the analytic offsets against the real layout: the entry following
-    // each marker must start exactly at the stored byte offset. This is the
-    // only thing standing between an off-by-one and a player revealing a
-    // half-loaded frame.
-    //
-    // When a marker falls on the last entry there is no following entry — the
-    // offset is the end of the data section, where the central directory
-    // begins. That is the ordinary case for an asset with no SH, so skipping
-    // the check there would leave every static asset unverified.
-    if (streams) {
-        const last = archive[archive.length - 1];
-        const endOfData = headerOffsets[headerOffsets.length - 1] + entrySize(last.name, last.data);
-
-        const checks: ['reveal_bytes' | 'geometry_bytes', number][] = [
-            ['reveal_bytes', revealThrough],
-            ['geometry_bytes', geometryThrough]
-        ];
-
-        for (const [key, index] of checks) {
-            if (index < 0) {
-                continue;
-            }
-
-            // headerOffsets[0] is meta.json, so entries[n] is at n + 1
-            const follows = index + 1 < entries.length;
-            const actual = follows ? headerOffsets[index + 2] : endOfData;
-            if (actual !== streams[key]) {
-                const what = follows ? `the local header of '${entries[index + 1].name}'` : 'the central directory';
-                throw new Error(`writeSogst: ${key} ${streams[key]} does not match ${actual}, ${what}`);
-            }
-        }
-    }
+    verifyStreamOffsets(streams, entries, archive, headerOffsets, revealThrough, geometryThrough);
 };
 
 export { writeSogst, computeOrder, type WriteSogstOptions, type Segment, type Segments };
