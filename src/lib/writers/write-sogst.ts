@@ -81,14 +81,56 @@ type WriteSogstOptions = {
      * no defaults — see requireSogstClip for why.
      */
     clip: Partial<SogstClip>;
-    /** Temporal segment length in seconds. 0 disables segmentation. Default 0.1. */
+    /**
+     * Temporal segment length in seconds. 0 disables segmentation. Default 0.1.
+     * Mutually exclusive with `segmentFrames`.
+     */
     segmentDuration?: number;
+    /**
+     * Temporal segment length in frames, converted to seconds with the clip's
+     * `fps`. 0 disables segmentation. Mutually exclusive with
+     * `segmentDuration`.
+     */
+    segmentFrames?: number;
     /** Active-interval half-width in temporal standard deviations. Default 3.8. */
     kSigma?: number;
     /** Persistent-splat threshold, in segment durations. Default 3.0. */
     persistentSpanMult?: number;
     /** Optional function to create a GPU device for SH clustering. */
     createDevice?: DeviceCreator;
+};
+
+/**
+ * Resolves the segment length in seconds, whichever unit the caller expressed
+ * it in.
+ *
+ * The file format stores seconds, so seconds is what the writer works in.
+ * Frames exist because segment boundaries that fall mid-frame make a player's
+ * per-frame cull straddle two segments unpredictably: 0.1s is exactly 3 frames
+ * at 30fps but 2.4 at 24fps. Expressing the length in frames pins each frame to
+ * a whole number of segments at any rate.
+ *
+ * @param segmentDuration - Length in seconds, if given.
+ * @param segmentFrames - Length in frames, if given.
+ * @param fps - The clip's frame rate, already validated as positive.
+ * @returns The segment length in seconds; <= 0 disables segmentation.
+ * @throws Error if both units are given, or if the frame count is not a finite
+ * number >= 0.
+ */
+const resolveSegmentDuration = (segmentDuration: number | undefined, segmentFrames: number | undefined, fps: number) => {
+    if (segmentFrames === undefined) {
+        return segmentDuration ?? DEFAULT_SEGMENT_DURATION;
+    }
+
+    if (segmentDuration !== undefined) {
+        throw new Error(`sogst output takes a segment length in seconds or in frames, not both (got ${segmentDuration}s and ${segmentFrames} frames).`);
+    }
+
+    if (!Number.isFinite(segmentFrames) || segmentFrames < 0) {
+        throw new Error(`sogst segmentFrames must be a finite number >= 0, got ${segmentFrames}.`);
+    }
+
+    return segmentFrames / fps;
 };
 
 /**
@@ -969,7 +1011,6 @@ const verifyStreamOffsets = (
  */
 const writeSogst = async (options: WriteSogstOptions, fs: FileSystem) => {
     const { filename, dataTable, iterations, createDevice } = options;
-    const segmentDuration = options.segmentDuration ?? DEFAULT_SEGMENT_DURATION;
     const kSigma = options.kSigma ?? DEFAULT_K_SIGMA;
     const persistentSpanMult = options.persistentSpanMult ?? DEFAULT_PERSISTENT_SPAN_MULT;
 
@@ -978,6 +1019,9 @@ const writeSogst = async (options: WriteSogstOptions, fs: FileSystem) => {
     // clip scalars have no defaults — an assumed frame rate renders perfectly
     // and plays at the wrong speed
     const { timeMin, timeMax, fps, motionDegree, cov2dScale } = requireSogstClip(options.clip ?? {});
+
+    // resolved after the clip, because the frames form needs a validated fps
+    const segmentDuration = resolveSegmentDuration(options.segmentDuration, options.segmentFrames, fps);
 
     const { hasAccel, shBands, tSigmaColumn } = validateSogstInput(dataTable, motionDegree);
 

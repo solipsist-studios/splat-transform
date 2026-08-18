@@ -690,3 +690,47 @@ describe('SOGST clip comments', () => {
         assert.deepStrictEqual(parseSogstComments(), {});
     });
 });
+
+describe('SOGST segment length units', () => {
+    it('should resolve a frame count against the clip fps', async () => {
+        const source = makeFixture(64);
+        const { meta } = decodeSogst(await writeToMemory(source, { segmentFrames: 3 }));
+
+        // CLIP.fps is 24, so three frames is 0.125s exactly
+        assert.strictEqual(meta.segments.duration, 0.125);
+    });
+
+    it('should produce the same archive as the equivalent duration in seconds', async () => {
+        const source = makeFixture(64);
+        const byFrames = decodeSogst(await writeToMemory(source, { segmentFrames: 3 }));
+        const bySeconds = decodeSogst(await writeToMemory(source, { segmentDuration: 3 / 24 }));
+
+        assert.deepStrictEqual(byFrames.meta, bySeconds.meta);
+        assert.deepStrictEqual(
+            byFrames.entries.map(e => e.name),
+            bySeconds.entries.map(e => e.name)
+        );
+    });
+
+    it('should disable segmentation at zero frames, as zero seconds does', async () => {
+        const source = makeFixture(64);
+        const { meta } = decodeSogst(await writeToMemory(source, { segmentFrames: 0 }));
+
+        assert.strictEqual(meta.segments, undefined, 'no segment table');
+        assert.strictEqual(meta.streams, undefined, 'no stream table');
+    });
+
+    it('should refuse both units at once', async () => {
+        const source = makeFixture(64);
+        await assert.rejects(
+            () => writeToMemory(source, { segmentDuration: 0.1, segmentFrames: 3 }),
+            /not both/
+        );
+    });
+
+    it('should reject a negative or non-finite frame count', async () => {
+        const source = makeFixture(64);
+        await assert.rejects(() => writeToMemory(source, { segmentFrames: -1 }), />= 0/);
+        await assert.rejects(() => writeToMemory(source, { segmentFrames: NaN }), /finite/);
+    });
+});

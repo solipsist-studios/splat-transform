@@ -145,6 +145,7 @@ const writeFile = async (writeOptions: WriteOptions, fs: FileSystem) => {
                 iterations: options.iterations,
                 clip: options.sogstClip,
                 segmentDuration: options.segmentDuration,
+                segmentFrames: options.segmentFrames,
                 createDevice
             }, fs);
             break;

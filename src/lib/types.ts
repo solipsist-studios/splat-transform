@@ -33,8 +33,18 @@ type Options = {
     /** SPZ format version to write. Default: 4. */
     spzVersion?: 3 | 4;
 
-    /** Temporal segment length in seconds for .sogst output. 0 disables segmentation. Default: 0.1 */
+    /**
+     * Temporal segment length in seconds for .sogst output. 0 disables
+     * segmentation. Mutually exclusive with segmentFrames. Default: 0.1
+     */
     segmentDuration?: number;
+
+    /**
+     * Temporal segment length in frames for .sogst output, converted to
+     * seconds using the clip's fps. 0 disables segmentation. Mutually
+     * exclusive with segmentDuration.
+     */
+    segmentFrames?: number;
 
     /**
      * Clip-level scalars for .sogst output. Normally read from the input PLY's

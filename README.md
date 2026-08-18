@@ -187,6 +187,9 @@ Apply when writing `.sogst` outputs. See [Spacetime output](#spacetime-output-so
 
 ```none
 -T, --segment-duration <n>              Temporal segment length in seconds. 0 disables. Default: 0.1
+    --segment-frames   <n>              Temporal segment length in frames instead, resolved against fps.
+                                          Frame-aligned segments keep a player's per-frame cull from
+                                          straddling a boundary. Mutually exclusive with -T
 -f, --fps              <n>              Override the playback rate recorded in the file
 ```
 
@@ -434,6 +437,10 @@ splat-transform dancer-4d.ply dancer.sogst
 
 # Coarser temporal segments, and override the advisory frame rate
 splat-transform -T 0.25 -f 24 dancer-4d.ply dancer.sogst
+
+# Give the segment length in frames instead: at 24fps this is the same 0.25s,
+# but it stays frame-aligned at any rate
+splat-transform --segment-frames 6 -f 24 dancer-4d.ply dancer.sogst
 
 # Disable temporal segmentation (one whole-clip texture set)
 splat-transform -T 0 dancer-4d.ply dancer.sogst

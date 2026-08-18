@@ -164,7 +164,8 @@ const cliOptionsConfig = {
     'lod-chunk-count': { type: 'string', default: '512' },
     'lod-chunk-extent': { type: 'string', default: '16' },
     'spz-version': { type: 'string', default: '4' },
-    'segment-duration': { type: 'string', short: 'T', default: '0.1' },
+    'segment-duration': { type: 'string', short: 'T', default: '' },
+    'segment-frames': { type: 'string', default: '' },
     fps: { type: 'string', short: 'f', default: '' },
     unbundled: { type: 'boolean', default: false },
     'voxel-size': { type: 'string' },
@@ -431,9 +432,24 @@ const parseArguments = async () => {
     }
 
     const collisionMesh = parseCollisionMesh(v['collision-mesh']);
-    const segmentDuration = parseNumber(v['segment-duration']);
-    if (!Number.isFinite(segmentDuration) || segmentDuration < 0) {
-        throw new Error(`Invalid segment-duration value: ${v['segment-duration']}. Must be a finite number >= 0 (0 disables segmentation).`);
+    // the segment length is given in seconds or in frames, never both; the
+    // frames form is resolved against fps once the clip is known
+    if (v['segment-duration'] && v['segment-frames']) {
+        throw new Error('Use --segment-duration (seconds) or --segment-frames, not both.');
+    }
+
+    if (v['segment-duration']) {
+        const segmentDuration = parseNumber(v['segment-duration']);
+        if (!Number.isFinite(segmentDuration) || segmentDuration < 0) {
+            throw new Error(`Invalid segment-duration value: ${v['segment-duration']}. Must be a finite number >= 0 (0 disables segmentation).`);
+        }
+    }
+
+    if (v['segment-frames']) {
+        const segmentFrames = parseNumber(v['segment-frames']);
+        if (!Number.isFinite(segmentFrames) || segmentFrames < 0) {
+            throw new Error(`Invalid segment-frames value: ${v['segment-frames']}. Must be a finite number >= 0 (0 disables segmentation).`);
+        }
     }
 
     if (v.fps) {
@@ -555,7 +571,8 @@ const parseArguments = async () => {
         lodChunkCount: parseInteger(v['lod-chunk-count']),
         lodChunkExtent: parseInteger(v['lod-chunk-extent']),
         spzVersion: spzVersion as 3 | 4,
-        segmentDuration: parseNumber(v['segment-duration']),
+        segmentDuration: v['segment-duration'] ? parseNumber(v['segment-duration']) : undefined,
+        segmentFrames: v['segment-frames'] ? parseNumber(v['segment-frames']) : undefined,
         // clip scalars normally come from the input PLY's sogst.* comments;
         // -f overrides only the frame rate
         sogstClip: v.fps ? { fps: parseNumber(v.fps) } : {},
@@ -865,6 +882,9 @@ SOGST OUTPUT (.sogst)
     plus vx, vy, vz, t_center, t_sigma (and optionally ax, ay, az).
 
     -T, --segment-duration <n>              Temporal segment length in seconds. 0 disables. Default: 0.1
+        --segment-frames   <n>              Temporal segment length in frames instead, resolved against fps.
+                                              Frame-aligned segments keep a player's per-frame cull from
+                                              straddling a boundary. Mutually exclusive with -T
     -f, --fps              <n>              Override the playback rate recorded in the file
 
 SPZ OUTPUT (.spz)
