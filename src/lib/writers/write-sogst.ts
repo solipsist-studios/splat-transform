@@ -24,8 +24,18 @@ const DEFAULT_PERSISTENT_SPAN_MULT = 3.0;
 // Guard against a mistyped segment duration; see computeOrder.
 const MAX_SEGMENTS = 65536;
 
-// Entries carry no extra fields and no data descriptor, so a local header is
-// exactly this plus the filename. The streaming offsets depend on it.
+// A ZIP local file header is fixed at 30 bytes by the format itself (PKWARE
+// APPNOTE 4.3.7): signature 4, version 2, flags 2, method 2, modtime 2,
+// moddate 2, crc32 4, compressed size 4, uncompressed size 4, name length 2,
+// extra length 2. It is not a budget with headroom — an entry's header is
+// exactly this plus its filename, and only because writeStoredZip emits no
+// extra field and no data descriptor (spec §2). Adding either would grow every
+// header and silently invalidate reveal_bytes / geometry_bytes.
+//
+// Nothing rests on this constant being right by inspection: writeSogst
+// re-derives both offsets from the header offsets writeStoredZip actually
+// wrote and throws on a mismatch (see the end of this file), and the tests
+// assert method 0, extra length 0 and no data descriptor on every entry.
 const ZIP_LOCAL_HEADER_SIZE = 30;
 
 const shNames = new Array(45).fill('').map((_, i) => `f_rest_${i}`);
