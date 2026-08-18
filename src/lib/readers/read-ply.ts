@@ -312,6 +312,9 @@ const decodePlyToDataTable = async (source: ReadSource): Promise<DataTable> => {
 
     result.transform = Transform.PLY.clone();
 
+    // surface the header comments — some formats carry file-level scalars there
+    result.comments = comments;
+
     // Close the bar only on success: leaving it open on an earlier error path
     // lets `logger.error() -> unwindAll(true)` mark it as failed.
     bar.end();
@@ -917,4 +920,20 @@ const readPly = async (source: ReadSource, pool: ChunkDataPool): Promise<ChunkSo
     return fileChunkSource(source, meta, read);
 };
 
-export { PlyData, decodePlyToDataTable, readPly, splatModelFromComments };
+/**
+ * Reads only a PLY file's header comments, without decoding any gaussian data.
+ *
+ * Formats that carry clip-level scalars in the header (see `.sogst`, whose
+ * `comment sogst.*` lines hold the clip time range and frame rate) need them
+ * before the writer runs. The streaming reader produces a `ChunkSource`, whose
+ * metadata deliberately carries no comments, so a caller that needs them reads
+ * the header separately. That costs one extra header-sized read.
+ *
+ * @param source - The read source for the PLY file.
+ * @returns The header comments, without their leading `comment `.
+ */
+const readPlyComments = async (source: ReadSource): Promise<string[]> => {
+    return (await readHeader(source)).comments;
+};
+
+export { PlyData, decodePlyToDataTable, readPly, readPlyComments, splatModelFromComments };

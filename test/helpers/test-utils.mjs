@@ -107,6 +107,74 @@ function createMinimalTestData(options = {}) {
 }
 
 /**
+ * Adds the spacetime columns a .sogst file needs to a splat DataTable.
+ *
+ * t_center is spread across the clip so the splats bucket into several temporal
+ * segments, and every `persistentEvery`-th splat is given a wide t_sigma so it
+ * lands in the persistent group. Velocities vary per axis so a swapped axis in
+ * the writer shows up as a field mismatch rather than a wash.
+ *
+ * @param {DataTable} dataTable - Table to extend, modified in place
+ * @param {object} [options] - Options
+ * @param {number} [options.timeMax=1.0] - Clip length in seconds
+ * @param {boolean} [options.includeAccel=false] - Also add ax, ay, az
+ * @param {number} [options.persistentEvery=5] - Every nth splat is long-lived
+ * @param {number[]} [options.gap] - [start, end] seconds left with no splats, so
+ * the encoder has to emit empty segments. No real capture produces one.
+ * @returns {DataTable} The same DataTable, for chaining
+ */
+function addSpacetimeColumns(dataTable, options = {}) {
+    const { timeMax = 1.0, includeAccel = false, persistentEvery = 5, gap } = options;
+    const count = dataTable.numRows;
+
+    const make = name => new Column(name, new Float32Array(count));
+    const vx = make('vx'), vy = make('vy'), vz = make('vz');
+    const tCenter = make('t_center'), tSigma = make('t_sigma');
+
+    for (let i = 0; i < count; i++) {
+        // distinct per-axis velocities, both signs
+        vx.data[i] = (i % 7) * 0.1 - 0.3;
+        vy.data[i] = (i % 5) * -0.2 + 0.4;
+        vz.data[i] = (i % 3) * 0.05;
+
+        const t = count > 1 ? (i / (count - 1)) * timeMax : 0;
+
+        // squeeze every t_center into the intervals either side of the gap, so
+        // the segments covering the gap come out empty
+        if (gap) {
+            const [gapStart, gapEnd] = gap;
+            const kept = timeMax - (gapEnd - gapStart);
+            const scaled = (t / timeMax) * kept;
+            tCenter.data[i] = scaled < gapStart ? scaled : scaled + (gapEnd - gapStart);
+        } else {
+            tCenter.data[i] = t;
+        }
+
+        // short-lived by default; every nth splat spans enough of the clip to
+        // be classified persistent
+        tSigma.data[i] = (i % persistentEvery === 0) ? 0.25 : 0.005 + (i % 3) * 0.002;
+    }
+
+    for (const column of [vx, vy, vz, tCenter, tSigma]) {
+        dataTable.addColumn(column);
+    }
+
+    if (includeAccel) {
+        const ax = make('ax'), ay = make('ay'), az = make('az');
+        for (let i = 0; i < count; i++) {
+            ax.data[i] = (i % 4) * 0.02 - 0.03;
+            ay.data[i] = (i % 6) * -0.01;
+            az.data[i] = (i % 5) * 0.015 + 0.01;
+        }
+        for (const column of [ax, ay, az]) {
+            dataTable.addColumn(column);
+        }
+    }
+
+    return dataTable;
+}
+
+/**
  * Encodes a DataTable to PLY binary format.
  * @param {DataTable} dataTable - The data to encode
  * @param {string[]} comments - Header comments (without the leading `comment `)
@@ -168,4 +236,4 @@ function encodePlyBinary(dataTable, comments = []) {
     return result;
 }
 
-export { createTestDataTable, createMinimalTestData, encodePlyBinary };
+export { createTestDataTable, createMinimalTestData, addSpacetimeColumns, encodePlyBinary };

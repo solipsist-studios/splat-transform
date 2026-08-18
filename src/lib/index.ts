@@ -76,11 +76,13 @@ export { processDataTable } from './process';
 
 // Individual readers (advanced use; ply/splat/spz return a `ChunkSource`,
 // ksplat/mjs/sog return a `DataTable`)
-export { readKsplat, readMjs, readPly, readSog, readSplat, readSpz } from './readers';
+export { readKsplat, readMjs, readPly, readPlyComments, readSog, readSplat, readSpz } from './readers';
 
 // Individual writers (advanced use; DataTable-input compat set)
-export { writeSog, writeSpz, writePly, writeCompressedPly, writeCsv, writeHtml, writeImage, writeGlb, writeVoxel } from './writers';
+export { writeSog, writeSogst, writeSpz, writePly, writeCompressedPly, writeCsv, writeHtml, writeImage, writeGlb, writeVoxel } from './writers';
+export { parseSogstComments, requireSogstClip } from './writers';
 export type { WriteImageOptions, WriteVoxelOptions, VoxelMetadata } from './writers';
+export type { WriteSogstOptions, Segment, Segments, SogstClip } from './writers';
 
 // ---------------------------------------------------------------------------
 // Infrastructure

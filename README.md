@@ -76,6 +76,7 @@ splat-transform [GLOBAL] input [ACTIONS]  ...  output [ACTIONS]
 | `.ply` | ✅ | ✅ | Standard PLY format |
 | `.sog` | ✅ | ✅ | Bundled super-compressed format (recommended) |
 | `meta.json` | ✅ | ✅ | Unbundled super-compressed format (accompanied by `.webp` textures) |
+| `.sogst` | ❌ | ✅ | SOG extended to spacetime — animated splats (see [Spacetime output](#spacetime-output-sogst)) |
 | `lod-meta.json` | ✅ | ✅ | Streamed LOD data stored in SOG chunks |
 | `.compressed.ply` | ✅ | ✅ | Compressed PLY format (auto-detected and decompressed on read) |
 | `.spz` | ✅ | ✅ | Compressed splat format (Niantic format, v2–4) |
@@ -178,6 +179,18 @@ Apply when writing `.sog`, `meta.json`, `lod-meta.json`, or `.html` outputs.
 ```none
 -i, --sh-iterations    <n>              Iterations for SH compression (more=better). Default: 10
     --max-workers      <n>              Worker threads for SOG encoding (0 = inline/serial). Default: 4
+```
+
+### SOGST Output Options
+
+Apply when writing `.sogst` outputs. See [Spacetime output](#spacetime-output-sogst).
+
+```none
+-T, --segment-duration <n>              Temporal segment length in seconds. 0 disables. Default: 0.1
+    --segment-frames   <n>              Temporal segment length in frames instead, resolved against fps.
+                                          Frame-aligned segments keep a player's per-frame cull from
+                                          straddling a boundary. Mutually exclusive with -T
+-f, --fps              <n>              Override the playback rate recorded in the file
 ```
 
 ### SPZ Output Options
@@ -390,6 +403,58 @@ Generator scripts can be used to synthesize gaussian splat data. See [gen-grid.m
 splat-transform gen-grid.mjs -p width=10,height=10,scale=10,color=0.1 scenes/grid.ply -w
 ```
 
+### Spacetime output (`.sogst`)
+
+`.sogst` is the SOG container extended to spacetime: the same WebP texture groups
+and codebooks, plus a per-splat linear velocity, temporal centre and temporal
+standard deviation, so each Gaussian moves and fades over the clip.
+
+```
+mean(t)  = xyz + v·(t − t_center)   [+ a·(t − t_center)²  when acceleration is present]
+alpha(t) = sigmoid(opacity) · exp(−0.5·((t − t_center)/t_sigma)²)
+```
+
+The input is a **single** binary PLY carrying the standard 3DGS columns plus
+`vx, vy, vz, t_center, t_sigma` — and optionally `ax, ay, az` (which switches the
+file to degree-2 motion) and the usual `f_rest_*`. A sequence of per-frame PLYs is
+not a valid input.
+
+Clip-level values have no per-splat column, so they ride in the PLY header:
+
+```
+comment sogst.time_min 0.0
+comment sogst.time_max 10.0
+comment sogst.fps 30.0
+```
+
+`time_min`, `time_max` and `fps` are required — the writer errors rather than
+guessing, because an assumed frame rate renders perfectly while playing at the
+wrong speed. `-f` overrides the frame rate when the input lacks it.
+
+```bash
+# Compress an animated PLY
+splat-transform dancer-4d.ply dancer.sogst
+
+# Coarser temporal segments, and override the advisory frame rate
+splat-transform -T 0.25 -f 24 dancer-4d.ply dancer.sogst
+
+# Give the segment length in frames instead: at 24fps this is the same 0.25s,
+# but it stays frame-aligned at any rate
+splat-transform --segment-frames 6 -f 24 dancer-4d.ply dancer.sogst
+
+# Disable temporal segmentation (one whole-clip texture set)
+splat-transform -T 0 dancer-4d.ply dancer.sogst
+```
+
+By default splats are bucketed into 0.1s temporal segments and the archive is
+written in play order, so a sequential download becomes renderable progressively.
+`meta.streams.reveal_bytes` marks the point at which a player can put the first
+frame on screen.
+
+> [!NOTE]
+> `--rotate` and `--scale` transform velocity and acceleration along with the
+> geometry. `--translate` deliberately does not — they are direction vectors.
+
 ### Voxel Format
 
 The voxel format stores sparse voxel octree data for collision detection. It consists of two files: `.voxel.json` (metadata) and `.voxel.bin` (binary octree data). Pass `--collision-mesh` to also emit a `.collision.glb` mesh derived from the voxel grid.
@@ -475,82 +540,6 @@ splat-transform input.ply view.webp \
     --camera-pos 2,1,-2 --camera-pos-end 3,1,-2 \
     --motion-samples 16 --shutter 1
 ```
-
-### OMG4 Animated Format
-
-The `.omg4` format stores animated 4D Gaussian Splat scenes produced by the [OMG4](https://github.com/MinShirley/OMG4) training pipeline. It contains pre-baked per-frame Gaussian attributes (position, rotation, scale, opacity, colour) so the browser can play back a 4DGS animation at runtime without GPU-side MLP inference.
-
-#### Converting an OMG4 checkpoint to `.omg4`
-
-Run the provided converter on the machine where you trained the model (requires Python with PyTorch):
-
-```bash
-python scripts/xz_to_omg4.py \
-    --input  output/my_scene/comp.xz \
-    --output public/scene.omg4 \
-    --frames 30 \
-    --fps    24 \
-    --time_min -0.5 \
-    --time_max  0.5
-```
-
-The converter requires the OMG4 Python environment:
-
-```
-torch  numpy  dahuffman  lzma  pickle
-```
-
-#### File-size guidance
-
-| Gaussians (N) | Frames (F) | Approx. file size |
-|---------------|------------|-------------------|
-| 50 000        | 30         | ~42 MB            |
-| 100 000       | 30         | ~84 MB            |
-| 100 000       | 50         | ~140 MB           |
-
-Standard gzip compression (e.g. `gzip -k scene.omg4`) and serving with `Content-Encoding: gzip` typically halves the transfer size.
-
-### QUEEN Animated Format
-
-The `.queen` format stores animated 4D Gaussian Splat scenes produced by the [QUEEN](https://research.nvidia.com/labs/toronto-ai/queen/) training pipeline (NeurIPS 2024). Like `.omg4`, it contains pre-baked per-frame Gaussian attributes for browser playback without any GPU-side inference.
-
-QUEEN stores its compressed output as per-frame `.pkl` files in a directory structure such as:
-
-```
-<frames_dir>/
-  Frame0001/
-    compressed/
-      0001.pkl          ← entropy-coded latents (torchac)
-  Frame0002/
-    compressed/
-      0002.pkl          ← residuals relative to previous frame
-  ...
-```
-
-#### Converting a QUEEN checkpoint to `.queen`
-
-```bash
-python scripts/queen_pkl_to_queen.py \
-    --input  path/to/queen_frames_directory \
-    --output public/scene.queen \
-    --fps    30.0
-```
-
-Required Python packages:
-
-```
-torch  numpy  torchac  plyfile
-```
-
-(`torchac` and `plyfile` are soft dependencies – clear error messages are shown if either is absent and are only needed when processing entropy-coded PKL or PLY frames.)
-
-#### Shared conversion library
-
-Both `xz_to_omg4.py` and `queen_pkl_to_queen.py` import from `scripts/splat4d_io.py`, which provides:
-
-- `write_4dgs_header()` – writes the 28-byte binary file header
-- `pack_frame_aos()` – packs per-frame Gaussian attributes into the common AoS float32 layout
-- `read_ply_gaussians()` – loads Gaussian attributes from a standard 3DGS PLY file
 
 ### Device Selection for SOG Compression
 

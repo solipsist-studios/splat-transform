@@ -23,9 +23,11 @@ import {
     getInputFormat,
     getOutputFormat,
     materializeToDataTable,
+    parseSogstComments,
     processSourceBridged,
     readFile,
     readPly,
+    readPlyComments,
     resolveSplatModel,
     revision,
     selectLod,
@@ -162,6 +164,9 @@ const cliOptionsConfig = {
     'lod-chunk-count': { type: 'string', default: '512' },
     'lod-chunk-extent': { type: 'string', default: '16' },
     'spz-version': { type: 'string', default: '4' },
+    'segment-duration': { type: 'string', short: 'T', default: '' },
+    'segment-frames': { type: 'string', default: '' },
+    fps: { type: 'string', short: 'f', default: '' },
     unbundled: { type: 'boolean', default: false },
     'voxel-size': { type: 'string' },
     'voxel-opacity': { type: 'string' },
@@ -427,6 +432,33 @@ const parseArguments = async () => {
     }
 
     const collisionMesh = parseCollisionMesh(v['collision-mesh']);
+    // the segment length is given in seconds or in frames, never both; the
+    // frames form is resolved against fps once the clip is known
+    if (v['segment-duration'] && v['segment-frames']) {
+        throw new Error('Use --segment-duration (seconds) or --segment-frames, not both.');
+    }
+
+    if (v['segment-duration']) {
+        const segmentDuration = parseNumber(v['segment-duration']);
+        if (!Number.isFinite(segmentDuration) || segmentDuration < 0) {
+            throw new Error(`Invalid segment-duration value: ${v['segment-duration']}. Must be a finite number >= 0 (0 disables segmentation).`);
+        }
+    }
+
+    if (v['segment-frames']) {
+        const segmentFrames = parseNumber(v['segment-frames']);
+        if (!Number.isFinite(segmentFrames) || segmentFrames < 0) {
+            throw new Error(`Invalid segment-frames value: ${v['segment-frames']}. Must be a finite number >= 0 (0 disables segmentation).`);
+        }
+    }
+
+    if (v.fps) {
+        const fps = parseNumber(v.fps);
+        if (!Number.isFinite(fps) || fps <= 0) {
+            throw new Error(`Invalid fps value: ${v.fps}. Must be a finite number > 0.`);
+        }
+    }
+
     const spzVersion = parseInteger(v['spz-version']);
     if (spzVersion !== 3 && spzVersion !== 4) {
         throw new Error(`Invalid spz-version value: ${v['spz-version']}. Must be 3 or 4.`);
@@ -539,6 +571,11 @@ const parseArguments = async () => {
         lodChunkCount: parseInteger(v['lod-chunk-count']),
         lodChunkExtent: parseInteger(v['lod-chunk-extent']),
         spzVersion: spzVersion as 3 | 4,
+        segmentDuration: v['segment-duration'] ? parseNumber(v['segment-duration']) : undefined,
+        segmentFrames: v['segment-frames'] ? parseNumber(v['segment-frames']) : undefined,
+        // clip scalars normally come from the input PLY's sogst.* comments;
+        // -f overrides only the frame rate
+        sogstClip: v.fps ? { fps: parseNumber(v.fps) } : {},
         voxelResolution,
         opacityCutoff,
         navExteriorRadius,
@@ -794,7 +831,7 @@ SUPPORTED INPUTS
     .mjs generators are local-only).
 
 SUPPORTED OUTPUTS
-    .ply   .compressed.ply   .sog   .spz   meta.json   lod-meta.json   .glb   .csv   .html   .voxel.json   .webp   null
+    .ply   .compressed.ply   .sog   .sogst   .spz   meta.json   lod-meta.json   .glb   .csv   .html   .voxel.json   .webp   null
 
 ACTIONS (executed in order; can be repeated)
     -t, --translate        <x,y,z>          Translate Gaussians by (x, y, z)
@@ -839,6 +876,16 @@ GPU (used by SOG compression and GPU voxelization: --filter-cluster, --filter-fl
 SOG COMPRESSION (.sog, meta.json, lod-meta.json, .html outputs)
     -i, --sh-iterations    <n>              SH compression iterations (more=better). Default: 10
         --max-workers      <n>              Worker threads for SOG encoding (0 = inline/serial). Default: 4
+
+SOGST OUTPUT (.sogst)
+    SOG extended to spacetime. Needs an input PLY carrying the standard 3DGS columns
+    plus vx, vy, vz, t_center, t_sigma (and optionally ax, ay, az).
+
+    -T, --segment-duration <n>              Temporal segment length in seconds. 0 disables. Default: 0.1
+        --segment-frames   <n>              Temporal segment length in frames instead, resolved against fps.
+                                              Frame-aligned segments keep a player's per-frame cull from
+                                              straddling a boundary. Mutually exclusive with -T
+    -f, --fps              <n>              Override the playback rate recorded in the file
 
 SPZ OUTPUT (.spz)
         --spz-version      <3|4>            The SPZ format version to write. Default: 4
@@ -1296,6 +1343,21 @@ const main = async () => {
 
             logger.info(`${fmtCount(combined.meta.numGaussians)} gaussians · ${combined.meta.shBands} SH bands`);
             if (outputFormat !== null) { // null output: process for side-effects (e.g. --stats), skip the write
+                // .sogst clip scalars (time range, frame rate) ride in the
+                // input PLY's header comments. A ChunkSource deliberately
+                // carries no comments, so read the headers directly here.
+                // Explicit flags win over whatever the inputs declared.
+                if (outputFormat === 'sogst') {
+                    const fromInputs: Partial<LibOptions['sogstClip']> = {};
+                    for (const inputArg of inputArgs) {
+                        const resolved = resolveInput(inputArg.filename);
+                        if (getInputFormat(resolved.classifyName) !== 'ply') continue;
+                        const src = await resolved.fileSystem.createSource(resolved.filename);
+                        Object.assign(fromInputs, parseSogstComments(await readPlyComments(src)));
+                    }
+                    options.sogstClip = { ...fromInputs, ...options.sogstClip };
+                }
+
                 await writeSource({
                     filename: outputFilename,
                     outputFormat,
