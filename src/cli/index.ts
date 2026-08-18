@@ -816,9 +816,6 @@ SUPPORTED INPUTS
 SUPPORTED OUTPUTS
     .ply   .compressed.ply   .sog   .sogst   .spz   meta.json   lod-meta.json   .glb   .csv   .html   .voxel.json   .webp   null
 
-    .sogst is SOG extended to spacetime: it needs an input PLY carrying the standard
-    3DGS columns plus vx, vy, vz, t_center, t_sigma (and optionally ax, ay, az).
-
 ACTIONS (executed in order; can be repeated)
     -t, --translate        <x,y,z>          Translate Gaussians by (x, y, z)
     -r, --rotate           <x,y,z>          Rotate Gaussians by Euler angles, in degrees
@@ -864,6 +861,9 @@ SOG COMPRESSION (.sog, meta.json, lod-meta.json, .html outputs)
         --max-workers      <n>              Worker threads for SOG encoding (0 = inline/serial). Default: 4
 
 SOGST OUTPUT (.sogst)
+    SOG extended to spacetime. Needs an input PLY carrying the standard 3DGS columns
+    plus vx, vy, vz, t_center, t_sigma (and optionally ax, ay, az).
+
     -T, --segment-duration <n>              Temporal segment length in seconds. 0 disables. Default: 0.1
     -f, --fps              <n>              Override the playback rate recorded in the file
 
