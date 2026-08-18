@@ -1,6 +1,5 @@
 import { basename } from 'pathe';
 
-import { computeSplit16Planes, texDims } from './sog-common';
 import { requireSogstClip, type SogstClip } from './sogst-clip';
 import { logWrittenFile } from './utils';
 import { Column, DataTable, sortMortonOrder } from '../data-table';
@@ -217,13 +216,114 @@ const computeOrder = (
 };
 
 /**
- * Packs up to three uint8 label columns into an RGBA plane in `indices` order.
+ * Per-column [min, max] over the rows referenced by `indices`.
  *
- * @param labels - Table of Uint8Array label columns.
- * @param indices - Row order to emit.
- * @param alpha - Value for the alpha channel.
- * @returns The packed plane.
+ * @param dataTable - Table to scan.
+ * @param columnNames - Columns to measure.
+ * @param indices - Row indices to include.
+ * @returns One [min, max] pair per column name, in order.
  */
+const calcMinMax = (dataTable: DataTable, columnNames: string[], indices: Uint32Array) => {
+    const columns = columnNames.map(name => dataTable.getColumnByName(name));
+    const minMax = columnNames.map(() => [Infinity, -Infinity]);
+    const row = {};
+
+    for (let i = 0; i < indices.length; ++i) {
+        const r = dataTable.getRow(indices[i], row, columns);
+
+        for (let j = 0; j < columnNames.length; ++j) {
+            const value = r[columnNames[j]];
+            if (value < minMax[j][0]) minMax[j][0] = value;
+            if (value > minMax[j][1]) minMax[j][1] = value;
+        }
+    }
+
+    return minMax;
+};
+
+/**
+ * The means transform: sign(x) * ln(1 + |x|). Monotonic, so it can be applied
+ * to the endpoints of a range to get the range in log space.
+ *
+ * @param value - The value to transform.
+ * @returns The log-space value.
+ */
+const logTransform = (value: number) => {
+    return Math.sign(value) * Math.log(Math.abs(value) + 1);
+};
+
+/**
+ * Near-square texture dimensions holding `n` row-major texels, with both axes
+ * rounded up to a multiple of 4 to match the SOG writer. The spec pins the
+ * dimensions to `ceil(sqrt(n))` by `ceil(n / width)` but permits the roundup.
+ *
+ * @param n - Number of texels required. Must be > 0.
+ * @returns The texture width and height.
+ */
+const texDims = (n: number) => {
+    const width = Math.ceil(Math.sqrt(n) / 4) * 4;
+    const height = Math.ceil(n / width / 4) * 4;
+    return { width, height };
+};
+
+/**
+ * The means/motion quantizer: log-transform each axis, then normalize over the
+ * per-axis range to 16 bits and split into low and high byte planes.
+ *
+ * Both planes are RGBA in `indices` order, so texel i of the output holds row
+ * `indices[i]` — every plane built this way stays in sync with the others.
+ *
+ * Values are rounded, which the spec requires and which is load-bearing rather
+ * than cosmetic: a source PLY that has already been through a 16-bit encode
+ * lands exactly on the quantization grid, and float round-off puts about half
+ * of those values a hair below their integer. Rounding reproduces them
+ * exactly; truncating drops every one of them a full LSB. Measured on the
+ * capture fixtures that is a ~1300x difference in RMS error, against 2x for
+ * continuous source data. `write-sog.ts` truncates instead, to stay
+ * byte-identical with its own pre-3.2 output — which is why this cannot be
+ * shared with it.
+ *
+ * @param dataTable - Table holding the source columns.
+ * @param columnNames - The three axis columns, in x, y, z order.
+ * @param indices - Row order to emit.
+ * @returns The two byte planes and the log-space mins/maxs for meta.json.
+ */
+const computeSplit16Planes = (dataTable: DataTable, columnNames: string[], indices: Uint32Array) => {
+    const minMax = calcMinMax(dataTable, columnNames, indices).map(v => v.map(logTransform));
+    const columns = columnNames.map(name => dataTable.getColumnByName(name).data);
+    const numRows = indices.length;
+
+    const lo = new Uint8Array(numRows * 4);
+    const hi = new Uint8Array(numRows * 4);
+
+    for (let i = 0; i < numRows; ++i) {
+        const idx = indices[i];
+
+        for (let c = 0; c < 3; ++c) {
+            const [min, max] = minMax[c];
+            const t = logTransform(columns[c][idx]);
+
+            // a zero-width range uses a span of 1.0, so it quantizes to 0
+            // rather than dividing by zero; the decode is constant at min
+            const span = max > min ? max - min : 1.0;
+            const v = Math.max(0, Math.min(65535, Math.round(65535 * (t - min) / span)));
+
+            lo[i * 4 + c] = v & 0xff;
+            hi[i * 4 + c] = (v >> 8) & 0xff;
+        }
+
+        lo[i * 4 + 3] = 0xff;
+        hi[i * 4 + 3] = 0xff;
+    }
+
+    return {
+        lo,
+        hi,
+        mins: minMax.map(v => v[0]),
+        maxs: minMax.map(v => v[1])
+    };
+};
+
 /**
  * Quantizes a set of DataTable columns to a shared 256-entry codebook.
  *
@@ -238,6 +338,14 @@ const quantizeColumns = (dataTable: DataTable, columnNames: string[]) => {
     })));
 };
 
+/**
+ * Packs up to three uint8 label columns into an RGBA plane in `indices` order.
+ *
+ * @param labels - Label columns, one per output channel.
+ * @param indices - Row order to emit.
+ * @param alpha - Value for the alpha channel.
+ * @returns The packed plane.
+ */
 const packLabels = (labels: { name: string, data: Uint8Array }[], indices: Uint32Array, alpha: number): Uint8Array => {
     const numRows = indices.length;
     const columns = labels.map(c => c.data);
