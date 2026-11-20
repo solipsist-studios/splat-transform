@@ -4,7 +4,7 @@ import type { FileSystem } from './io/write';
 import { reduceBandsSource } from './ops';
 import type { DeviceCreator, Options } from './types';
 import { logger } from './utils';
-import { writeCsv, writeGlb, writeHtml, writeImage, writeSogSource, writeSpz, writeVoxel } from './writers';
+import { writeCsv, writeGlb, writeHtml, writeImage, writeSogSource, writeSogst, writeSpz, writeVoxel } from './writers';
 import { writeCompressedPlySource } from './writers/write-compressed-ply';
 import { writePlyStreaming } from './writers/write-ply-streaming';
 import { writeSplatStreaming } from './writers/write-splat-streaming';
@@ -20,6 +20,7 @@ import { writeSplatStreaming } from './writers/write-splat-streaming';
  * - `csv` - CSV text format (for debugging/analysis)
  * - `sog` - PlayCanvas SOG format (separate files)
  * - `sog-bundle` - PlayCanvas SOG format (bundled into single .sog file)
+ * - `sogst` - SOG spacetime format (animated splats, bundled into a single .sogst file)
  * - `lod` - Multi-LOD format with chunked data
  * - `html` - Self-contained HTML viewer (separate assets)
  * - `html-bundle` - Self-contained HTML viewer (all assets embedded)
@@ -30,6 +31,7 @@ type OutputFormat =
     | 'csv'
     | 'sog'
     | 'sog-bundle'
+    | 'sogst'
     | 'lod'
     | 'compressed-ply'
     | 'ply'
@@ -64,6 +66,8 @@ const getOutputFormat = (filename: string, options: Options): OutputFormat => {
         return 'voxel';
     } else if (lowerFilename.endsWith('lod-meta.json')) {
         return 'lod';
+    } else if (lowerFilename.endsWith('.sogst')) {
+        return 'sogst';
     } else if (lowerFilename.endsWith('.sog')) {
         return 'sog-bundle';
     } else if (lowerFilename.endsWith('meta.json')) {
@@ -254,6 +258,20 @@ const writeSource = async (writeSourceOptions: WriteSourceOptions, fs: FileSyste
             );
             break;
         }
+        case 'sogst':
+            await writeSogst(
+                {
+                    filename,
+                    dataTable: await materializeToDataTable(source, pool),
+                    iterations: options.iterations ?? 10,
+                    clip: options.sogstClip ?? {},
+                    segmentDuration: options.segmentDuration,
+                    segmentFrames: options.segmentFrames,
+                    createDevice
+                },
+                fs
+            );
+            break;
         case 'csv':
             await writeCsv({ filename, dataTable: await materializeToDataTable(source, pool) }, fs);
             break;

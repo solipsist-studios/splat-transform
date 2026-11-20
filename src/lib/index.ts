@@ -85,11 +85,12 @@ export { processDataTable } from './process';
 
 // Individual readers (advanced use; ply/splat/spz/glb return a `ChunkSource`,
 // ksplat/mjs/sog return a `DataTable`)
-export { readGlb, readKsplat, readMjs, readPly, readSog, readSplat, readSpz } from './readers';
+export { readGlb, readKsplat, readMjs, readPly, readPlyComments, readSog, readSplat, readSpz } from './readers';
 
 // Individual writers (advanced use; DataTable-input compat set)
 export {
     writeSog,
+    writeSogst,
     writeSpz,
     writePly,
     writeCompressedPly,
@@ -99,7 +100,9 @@ export {
     writeGlb,
     writeVoxel
 } from './writers';
+export { parseSogstComments, requireSogstClip } from './writers';
 export type { WriteImageOptions, WriteVoxelOptions, VoxelMetadata } from './writers';
+export type { WriteSogstOptions, Segment, Segments, SogstClip } from './writers';
 
 // Camera animation tracks for multi-frame image output (editor project,
 // viewer settings, or a plain frame list)
