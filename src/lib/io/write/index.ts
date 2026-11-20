@@ -9,3 +9,7 @@ export { MemoryFileSystem } from './memory-file-system';
 
 // Zip filesystem implementation
 export { ZipFileSystem } from './zip-file-system';
+
+// Whole-archive zip writer for formats that publish analytic byte offsets
+export { writeStoredZip } from './stored-zip';
+export type { StoredZipEntry } from './stored-zip';
