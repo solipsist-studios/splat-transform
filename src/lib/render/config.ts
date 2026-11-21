@@ -1,3 +1,5 @@
+import type { GraphicsDevice } from 'playcanvas';
+
 /**
  * Centralised render-time tunables. Constants that today live as magic
  * numbers in the project/rasterize WGSL shaders, in `gaussian-aabb.ts`'s
@@ -25,6 +27,14 @@
 export const AA_DILATION_COV = 0.3;
 
 /**
+ * Screen-space filter, in pixels², that scenes trained with anti-aliasing (model `antialiased`)
+ * were trained with. It replaces {@link AA_DILATION_COV} for them, and their opacity is scaled by
+ * `sqrt(det Σ / det(Σ + filter))` so each splat draws its undilated mass. 0.1 is Mip-Splatting's
+ * value, which Brush, LichtFeld Studio and Spirula train with; the engine defaults to it too.
+ */
+export const AA_FILTER_COV = 0.1;
+
+/**
  * Maximum tan(half-FOV) factor that the EWA Jacobian's `(cx/cz, cy/cz)`
  * is clamped to before forming the projection. Splats outside this cone
  * use a distorted Jacobian. Matches the INRIA reference (`1.3 × half-FOV`).
@@ -41,7 +51,8 @@ export const OPACITY_CAP = 0.99;
 /**
  * Per-splat alpha cutoff. Contributions below this are dropped — saves
  * work for splats whose evaluated 2D Gaussian falls below quantization
- * threshold. INRIA reference.
+ * threshold. INRIA reference. Disabled for defocus, where many faint
+ * contributions must accumulate before quantization.
  */
 export const MIN_ALPHA = 1.0 / 255.0;
 
@@ -111,7 +122,6 @@ export const TILE_SIZE = 16;
  */
 export const POLE_EPS = 0.005;
 
-
 /**
  * Total GPU memory budget for ALL pair-sized buffers combined: the
  * tile-key and splat-value buffers the rasterizer owns (2× pairsCap × 4 B)
@@ -119,7 +129,7 @@ export const POLE_EPS = 0.005;
  * (`_keys0`, `_keys1`, `_values0`, `_values1` — another 4× pairsCap × 4 B).
  * That's 6 × pairsCap × 4 B = `PAIR_BUFFER_TOTAL_BYTES_PER_ELEMENT × pairsCap`.
  *
- * `chunkCap` is sized to keep this total under budget. The radix-sort
+ * The pairs cap is sized to keep this total under budget. The radix-sort
  * scratch is the dominant share; budgeting only the local buffers (as
  * earlier revisions did) under-counts actual GPU memory by ~3×.
  */
@@ -127,34 +137,36 @@ export const PAIR_BUFFER_BUDGET_BYTES = 768 * 1024 * 1024;
 
 /**
  * Total bytes per pair *element* across all six pair-sized buffers
- * (4 B × 6 buffers). Used by the orchestrator's chunkCap calculation
+ * (4 B × 6 buffers). Used by the rasterizer's pairs-cap calculation
  * so the math reflects actual GPU memory consumed by the sort
  * pipeline.
  */
 export const PAIR_BUFFER_TOTAL_BYTES_PER_ELEMENT = 4 * 6;
 
 /**
- * Screen-radius fade thresholds, expressed as fractions of image
- * height. Defends against outlier splats with large world-space scale
- * or near-camera placement that would otherwise project to a screen-
- * spanning footprint.
+ * Largest storage buffer one binding may reference, from the device's WebGPU
+ * limits, or the spec's 128 MiB baseline when the device does not expose them.
  *
- * A hard clamp produces a visible "pop" as the camera approaches a
- * splat that grows past the cap (the splat suddenly stops getting any
- * bigger). Instead we *linearly fade out* the splat's alpha between
- * `RADIUS_FADE_START_FRAC × imageHeight` (alpha × 1) and
- * `RADIUS_FADE_END_FRAC × imageHeight` (alpha × 0). Beyond the END
- * threshold the splat is discarded entirely.
- *
- * Image-height-relative so the SAME world-space splats fade at every
- * render resolution — a splat that doesn't fade at 1080p won't get
- * dropped at 8K just because its pixel radius is 4× bigger. The values
- * are calibrated so that the original 1080p thresholds (1024 px /
- * 2048 px) reproduce, while 8K renders fade only the splats that
- * would also fade at 1080p.
- *
- * Inspired by PlayCanvas engine's `min(1024.0, viewport)` axis cap
- * (see `gsplatCorner.js`), but with the cap softened into a fade.
+ * @param device - The graphics device.
+ * @returns The limit in bytes.
  */
-export const RADIUS_FADE_START_FRAC = 1024 / 1080;
-export const RADIUS_FADE_END_FRAC = 2048 / 1080;
+export const storageBindingLimit = (device: GraphicsDevice): number => {
+    const limits = (device as { limits?: { maxStorageBufferBindingSize?: number } }).limits;
+    return limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+};
+
+/**
+ * Screen-size clamp, as a fraction of the shorter image edge. A splat
+ * whose projected 3σ radius exceeds `SIZE_CLAMP_FRAC × min(width, height)`
+ * has its 2D covariance scaled down uniformly until it fits: the ellipse
+ * keeps its aspect and orientation, and alpha is untouched. This is the
+ * supersplat editor's behaviour (`min(1024, min(viewport))` on the
+ * projected axis), made resolution-independent by scaling with the image
+ * rather than a fixed pixel count.
+ *
+ * Defends against outlier splats with large world-space scale or
+ * near-camera placement that would otherwise tint the whole frame.
+ * Disabled for measurement renders (`NO_SIZE_CLAMP`), where a splat that
+ * legitimately fills the frame must render as it is.
+ */
+export const SIZE_CLAMP_FRAC = 1.0;

@@ -1,5 +1,5 @@
 import { Crc } from './crc';
-import { type Writer } from './file-system';
+import type { Writer } from './file-system';
 
 /**
  * A complete archive entry. Unlike ZipFileSystem, the payload is known up
@@ -43,7 +43,7 @@ const writeStoredZip = async (writer: Writer, entries: StoredZipEntry[]): Promis
     const dosTime = (date.getHours() << 11) | (date.getMinutes() << 5) | Math.floor(date.getSeconds() / 2);
     const dosDate = ((date.getFullYear() - 1980) << 9) | ((date.getMonth() + 1) << 5) | date.getDate();
 
-    const names = entries.map(entry => textEncoder.encode(entry.name));
+    const names = entries.map((entry) => textEncoder.encode(entry.name));
     const crcs = entries.map((entry) => {
         const crc = new Crc();
         crc.update(entry.data);
@@ -61,16 +61,16 @@ const writeStoredZip = async (writer: Writer, entries: StoredZipEntry[]): Promis
         const view = new DataView(header.buffer);
 
         view.setUint32(0, 0x04034b50, true);
-        view.setUint16(4, 20, true);            // version needed to extract = 2.0
-        view.setUint16(6, 0x800, true);         // utf-8 filename; sizes are in this header
-        view.setUint16(8, 0, true);             // method = 0 (store)
+        view.setUint16(4, 20, true); // version needed to extract = 2.0
+        view.setUint16(6, 0x800, true); // utf-8 filename; sizes are in this header
+        view.setUint16(8, 0, true); // method = 0 (store)
         view.setUint16(10, dosTime, true);
         view.setUint16(12, dosDate, true);
         view.setUint32(14, crcs[i], true);
-        view.setUint32(18, data.length, true);  // compressed size
-        view.setUint32(22, data.length, true);  // uncompressed size
+        view.setUint32(18, data.length, true); // compressed size
+        view.setUint32(22, data.length, true); // uncompressed size
         view.setUint16(26, name.length, true);
-        view.setUint16(28, 0, true);            // extra field length = 0
+        view.setUint16(28, 0, true); // extra field length = 0
         header.set(name, LOCAL_HEADER_SIZE);
 
         headerOffsets.push(offset);
@@ -92,10 +92,10 @@ const writeStoredZip = async (writer: Writer, entries: StoredZipEntry[]): Promis
         const view = new DataView(record.buffer);
 
         view.setUint32(0, 0x02014b50, true);
-        view.setUint16(4, 20, true);            // version made by
-        view.setUint16(6, 20, true);            // version needed to extract
+        view.setUint16(4, 20, true); // version made by
+        view.setUint16(6, 20, true); // version needed to extract
         view.setUint16(8, 0x800, true);
-        view.setUint16(10, 0, true);            // method = 0 (store)
+        view.setUint16(10, 0, true); // method = 0 (store)
         view.setUint16(12, dosTime, true);
         view.setUint16(14, dosDate, true);
         view.setUint32(16, crcs[i], true);

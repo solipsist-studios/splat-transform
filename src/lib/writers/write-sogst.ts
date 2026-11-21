@@ -1,14 +1,18 @@
 import { basename } from 'pathe';
 
-import { requireSogstClip, type SogstClip } from './sogst-clip';
-import { logWrittenFile } from './utils';
-import { Column, DataTable, sortMortonOrder, type TypedArray } from '../data-table';
-import { type FileSystem, writeStoredZip, type StoredZipEntry } from '../io/write';
+import { Column, sortMortonOrder } from '../data-table';
+import type { DataTable, TypedArray } from '../data-table';
+import { writeStoredZip } from '../io/write';
+import type { FileSystem, StoredZipEntry } from '../io/write';
 import { kmeansInterleaved } from '../spatial';
 import type { DeviceCreator } from '../types';
 import { logger, sigmoid } from '../utils';
 import { version } from '../version';
 import { runEncodeWebp, runQuantize1dColumns } from '../workers';
+
+import { requireSogstClip } from './sogst-clip';
+import type { SogstClip } from './sogst-clip';
+import { logWrittenFile } from './utils';
 
 // Temporal segment length in seconds. Splats are bucketed by t_center into
 // segments of this length so a player can cull by time.
@@ -43,7 +47,6 @@ const shNames = new Array(45).fill('').map((_, i) => `f_rest_${i}`);
 const motionNames = ['vx', 'vy', 'vz'];
 const accelNames = ['ax', 'ay', 'az'];
 const trbfNames = ['t_center', 't_sigma'];
-
 
 /**
  * A single temporal segment: the time range its members are actually active
@@ -117,13 +120,19 @@ type WriteSogstOptions = {
  * @throws Error if both units are given, or if the frame count is not a finite
  * number >= 0.
  */
-const resolveSegmentDuration = (segmentDuration: number | undefined, segmentFrames: number | undefined, fps: number) => {
+const resolveSegmentDuration = (
+    segmentDuration: number | undefined,
+    segmentFrames: number | undefined,
+    fps: number
+) => {
     if (segmentFrames === undefined) {
         return segmentDuration ?? DEFAULT_SEGMENT_DURATION;
     }
 
     if (segmentDuration !== undefined) {
-        throw new Error(`sogst output takes a segment length in seconds or in frames, not both (got ${segmentDuration}s and ${segmentFrames} frames).`);
+        throw new Error(
+            `sogst output takes a segment length in seconds or in frames, not both (got ${segmentDuration}s and ${segmentFrames} frames).`
+        );
     }
 
     if (!Number.isFinite(segmentFrames) || segmentFrames < 0) {
@@ -186,7 +195,9 @@ const computeOrder = (
     // any splats, so a mistyped duration would otherwise produce a valid file
     // with a megabytes-long segment table
     if (numSegments > MAX_SEGMENTS) {
-        throw new Error(`sogst segmentation would need ${numSegments} segments for a ${timeMax - timeMin}s clip at ${segmentDuration}s each (limit ${MAX_SEGMENTS}). Use a longer segment duration.`);
+        throw new Error(
+            `sogst segmentation would need ${numSegments} segments for a ${timeMax - timeMin}s clip at ${segmentDuration}s each (limit ${MAX_SEGMENTS}). Use a longer segment duration.`
+        );
     }
 
     // classify every splat as persistent or bucketed, and record its active interval
@@ -275,7 +286,7 @@ const computeOrder = (
  * @returns One [min, max] pair per column name, in order.
  */
 const calcMinMax = (dataTable: DataTable, columnNames: string[], indices: Uint32Array) => {
-    const columns = columnNames.map(name => dataTable.getColumnByName(name));
+    const columns = columnNames.map((name) => dataTable.getColumnByName(name));
     const minMax = columnNames.map(() => [Infinity, -Infinity]);
     const row = {};
 
@@ -340,8 +351,8 @@ const texDims = (n: number) => {
  * @returns The two byte planes and the log-space mins/maxs for meta.json.
  */
 const computeSplit16Planes = (dataTable: DataTable, columnNames: string[], indices: Uint32Array) => {
-    const minMax = calcMinMax(dataTable, columnNames, indices).map(v => v.map(logTransform));
-    const columns = columnNames.map(name => dataTable.getColumnByName(name).data);
+    const minMax = calcMinMax(dataTable, columnNames, indices).map((v) => v.map(logTransform));
+    const columns = columnNames.map((name) => dataTable.getColumnByName(name).data);
     const numRows = indices.length;
 
     const lo = new Uint8Array(numRows * 4);
@@ -357,7 +368,7 @@ const computeSplit16Planes = (dataTable: DataTable, columnNames: string[], indic
             // a zero-width range uses a span of 1.0, so it quantizes to 0
             // rather than dividing by zero; the decode is constant at min
             const span = max > min ? max - min : 1.0;
-            const v = Math.max(0, Math.min(65535, Math.round(65535 * (t - min) / span)));
+            const v = Math.max(0, Math.min(65535, Math.round((65535 * (t - min)) / span)));
 
             lo[i * 4 + c] = v & 0xff;
             hi[i * 4 + c] = (v >> 8) & 0xff;
@@ -370,8 +381,8 @@ const computeSplit16Planes = (dataTable: DataTable, columnNames: string[], indic
     return {
         lo,
         hi,
-        mins: minMax.map(v => v[0]),
-        maxs: minMax.map(v => v[1])
+        mins: minMax.map((v) => v[0]),
+        maxs: minMax.map((v) => v[1])
     };
 };
 
@@ -383,10 +394,12 @@ const computeSplit16Planes = (dataTable: DataTable, columnNames: string[], indic
  * @returns The codebook centroids and one uint8 label column per input.
  */
 const quantizeColumns = (dataTable: DataTable, columnNames: string[]) => {
-    return runQuantize1dColumns(columnNames.map(name => ({
-        name,
-        data: dataTable.getColumnByName(name).data
-    })));
+    return runQuantize1dColumns(
+        columnNames.map((name) => ({
+            name,
+            data: dataTable.getColumnByName(name).data
+        }))
+    );
 };
 
 /**
@@ -397,9 +410,9 @@ const quantizeColumns = (dataTable: DataTable, columnNames: string[]) => {
  * @param alpha - Value for the alpha channel.
  * @returns The packed plane.
  */
-const packLabels = (labels: { name: string, data: Uint8Array }[], indices: Uint32Array, alpha: number): Uint8Array => {
+const packLabels = (labels: { name: string; data: Uint8Array }[], indices: Uint32Array, alpha: number): Uint8Array => {
     const numRows = indices.length;
-    const columns = labels.map(c => c.data);
+    const columns = labels.map((c) => c.data);
     const plane = new Uint8Array(numRows * 4);
 
     for (let i = 0; i < numRows; ++i) {
@@ -423,24 +436,30 @@ const packLabels = (labels: { name: string, data: Uint8Array }[], indices: Uint3
  */
 const validateSogstInput = (dataTable: DataTable, motionDegree: number | undefined) => {
     // temporal attributes are the whole point of the format — refuse without them
-    const missing = [...motionNames, ...trbfNames].filter(name => !dataTable.hasColumn(name));
+    const missing = [...motionNames, ...trbfNames].filter((name) => !dataTable.hasColumn(name));
     if (missing.length > 0) {
-        throw new Error(`sogst output requires temporal columns, missing: ${missing.join(', ')}. Expected a PLY carrying ${[...motionNames, ...trbfNames].join(', ')}.`);
+        throw new Error(
+            `sogst output requires temporal columns, missing: ${missing.join(', ')}. Expected a PLY carrying ${[...motionNames, ...trbfNames].join(', ')}.`
+        );
     }
 
     // accel is all-or-nothing, and its presence — not the advisory comment — is
     // what sets motion.degree
-    const accelPresent = accelNames.filter(name => dataTable.hasColumn(name));
+    const accelPresent = accelNames.filter((name) => dataTable.hasColumn(name));
     if (accelPresent.length > 0 && accelPresent.length < accelNames.length) {
-        throw new Error(`sogst output requires all of ${accelNames.join(', ')} or none, found only: ${accelPresent.join(', ')}.`);
+        throw new Error(
+            `sogst output requires all of ${accelNames.join(', ')} or none, found only: ${accelPresent.join(', ')}.`
+        );
     }
     const hasAccel = accelPresent.length === accelNames.length;
 
     if (motionDegree !== undefined && motionDegree !== (hasAccel ? 2 : 1)) {
-        throw new Error(`sogst.motion_degree is ${motionDegree} but the data ${hasAccel ? 'has' : 'has no'} ax, ay, az columns.`);
+        throw new Error(
+            `sogst.motion_degree is ${motionDegree} but the data ${hasAccel ? 'has' : 'has no'} ax, ay, az columns.`
+        );
     }
 
-    const shBands = { '9': 1, '24': 2, '-1': 3 }[shNames.findIndex(v => !dataTable.hasColumn(v))] ?? 0;
+    const shBands = { '9': 1, '24': 2, '-1': 3 }[shNames.findIndex((v) => !dataTable.hasColumn(v))] ?? 0;
 
     // t_sigma is a standard deviation in seconds and divides the temporal
     // exponent, so a zero or negative value is not representable
@@ -466,7 +485,7 @@ const validateSogstInput = (dataTable: DataTable, motionDegree: number | undefin
 const packQuats = (dataTable: DataTable, indices: Uint32Array): Uint8Array => {
     const numRows = indices.length;
     const plane = new Uint8Array(numRows * 4);
-    const quatColumns = ['rot_0', 'rot_1', 'rot_2', 'rot_3'].map(name => dataTable.getColumnByName(name).data);
+    const quatColumns = ['rot_0', 'rot_1', 'rot_2', 'rot_3'].map((name) => dataTable.getColumnByName(name).data);
     const q = [0, 0, 0, 0];
     const sqrt2 = Math.sqrt(2);
 
@@ -546,7 +565,7 @@ const packTrbf = async (dataTable: DataTable, indices: Uint32Array, tSigmaColumn
     return {
         plane,
         centerCodebook: Array.from(center.centroids),
-        sigmaCodebook: Array.from(sigma.centroids, v => Math.exp(v))
+        sigmaCodebook: Array.from(sigma.centroids, (v) => Math.exp(v))
     };
 };
 
@@ -578,7 +597,7 @@ const packSh = async (
     const restCount = shColumnNames.length;
 
     // the clusterer takes one interleaved buffer, not columns
-    const shCols = shColumnNames.map(name => dataTable.getColumnByName(name).data);
+    const shCols = shColumnNames.map((name) => dataTable.getColumnByName(name).data);
     const shRest = new Float32Array(numRows * restCount);
     for (let i = 0; i < numRows; ++i) {
         for (let j = 0; j < restCount; ++j) {
@@ -592,12 +611,19 @@ const packSh = async (
     const gpuDevice = createDevice ? await createDevice() : undefined;
 
     bar.tick();
-    const { centroids, labels } = await kmeansInterleaved(shRest, numRows, restCount, paletteSize, iterations, gpuDevice);
+    const { centroids, labels } = await kmeansInterleaved(
+        shRest,
+        numRows,
+        restCount,
+        paletteSize,
+        iterations,
+        gpuDevice
+    );
     const numCentroids = centroids.length / restCount;
 
     bar.tick();
     // de-interleave the (small) centroid palette into columns for the quantizer
-    const cbCols: { name: string, data: Float32Array }[] = [];
+    const cbCols: { name: string; data: Float32Array }[] = [];
     for (let j = 0; j < restCount; ++j) {
         const col = new Float32Array(numCentroids);
         for (let i = 0; i < numCentroids; ++i) {
@@ -606,7 +632,7 @@ const packSh = async (
         cbCols.push({ name: shColumnNames[j], data: col });
     }
     const codebook = await runQuantize1dColumns(cbCols);
-    const cbLabels = codebook.labels.map(c => c.data);
+    const cbLabels = codebook.labels.map((c) => c.data);
 
     // centroid texture: 64 palette entries per row, each shCoeffs texels wide
     const centroidsDims = { width: 64 * shCoeffs, height: Math.ceil(numCentroids / 64) };
@@ -645,8 +671,8 @@ type Split16Planes = ReturnType<typeof computeSplit16Planes>;
 type QuantizedColumns = Awaited<ReturnType<typeof quantizeColumns>>;
 type ShPack = Awaited<ReturnType<typeof packSh>>;
 type TrbfPack = Awaited<ReturnType<typeof packTrbf>>;
-type PendingEntry = { name: string, data: Promise<Uint8Array> };
-type WrittenEntry = { name: string, data: Uint8Array };
+type PendingEntry = { name: string; data: Promise<Uint8Array> };
+type WrittenEntry = { name: string; data: Uint8Array };
 
 /**
  * The `streams` block: which groups exist and where the two streaming markers
@@ -725,8 +751,10 @@ const buildArchive = (
 
     if (segments) {
         const persistentEnd = segments.persistent[1];
-        const prefixes = segments.list.map((segment, i) => (segment.range[1] > segment.range[0] ? `seg_${String(i).padStart(3, '0')}` : null));
-        const revealPrefix = prefixes.find(prefix => prefix !== null) ?? null;
+        const prefixes = segments.list.map((segment, i) =>
+            segment.range[1] > segment.range[0] ? `seg_${String(i).padStart(3, '0')}` : null
+        );
+        const revealPrefix = prefixes.find((prefix) => prefix !== null) ?? null;
 
         const groups: [string, number, number][] = [];
         if (persistentEnd > 0) {
@@ -808,22 +836,37 @@ const buildArchive = (
  * @returns The manifest object, ready to serialize.
  */
 const buildSogstMeta = (parts: {
-    numRows: number,
-    timeMin: number,
-    timeMax: number,
-    fps: number,
-    cov2dScale?: SogstClip['cov2dScale'],
-    means: Split16Planes,
-    scales: QuantizedColumns,
-    colors: QuantizedColumns,
-    motion: Split16Planes,
-    accel: Split16Planes | null,
-    trbf: TrbfPack,
-    sh: ShPack | null,
-    segments: Segments | null,
-    streams: Streams | null
-}): any => {
-    const { numRows, timeMin, timeMax, fps, cov2dScale, means, scales, colors, motion, accel, trbf, sh, segments, streams } = parts;
+    numRows: number;
+    timeMin: number;
+    timeMax: number;
+    fps: number;
+    cov2dScale?: SogstClip['cov2dScale'];
+    means: Split16Planes;
+    scales: QuantizedColumns;
+    colors: QuantizedColumns;
+    motion: Split16Planes;
+    accel: Split16Planes | null;
+    trbf: TrbfPack;
+    sh: ShPack | null;
+    segments: Segments | null;
+    streams: Streams | null;
+}): Record<string, unknown> => {
+    const {
+        numRows,
+        timeMin,
+        timeMax,
+        fps,
+        cov2dScale,
+        means,
+        scales,
+        colors,
+        motion,
+        accel,
+        trbf,
+        sh,
+        segments,
+        streams
+    } = parts;
 
     return {
         // container version 1. The development-era formats this grew out of were
@@ -864,13 +907,15 @@ const buildSogstMeta = (parts: {
             maxs: motion.maxs,
             files: ['motion_l.webp', 'motion_u.webp']
         },
-        ...(accel ? {
-            accel: {
-                mins: accel.mins,
-                maxs: accel.maxs,
-                files: ['accel_l.webp', 'accel_u.webp']
-            }
-        } : {}),
+        ...(accel
+            ? {
+                  accel: {
+                      mins: accel.mins,
+                      maxs: accel.maxs,
+                      files: ['accel_l.webp', 'accel_u.webp']
+                  }
+              }
+            : {}),
         trbf: {
             center: { codebook: trbf.centerCodebook },
             sigma: { codebook: trbf.sigmaCodebook },
@@ -901,7 +946,7 @@ const buildSogstMeta = (parts: {
  * @returns The serialized manifest.
  */
 const resolveStreamOffsets = (
-    meta: any,
+    meta: Record<string, unknown>,
     streams: Streams | null,
     entries: WrittenEntry[],
     revealThrough: number,
@@ -1028,7 +1073,14 @@ const writeSogst = async (options: WriteSogstOptions, fs: FileSystem) => {
     const totalSteps = 8 + (hasAccel ? 1 : 0) + (shBands > 0 ? 2 : 0);
     const bar = logger.bar('encoding', totalSteps);
 
-    const { indices, segments } = computeOrder(dataTable, timeMin, timeMax, segmentDuration, kSigma, persistentSpanMult);
+    const { indices, segments } = computeOrder(
+        dataTable,
+        timeMin,
+        timeMax,
+        segmentDuration,
+        kSigma,
+        persistentSpanMult
+    );
 
     // Every plane below is RGBA in `indices` order, so texel i holds row
     // indices[i]. A group is then just a slice — and every plane stays in sync
@@ -1092,7 +1144,7 @@ const writeSogst = async (options: WriteSogstOptions, fs: FileSystem) => {
 
     // Archive order is `pending` order; awaiting as a batch keeps it while
     // letting the pool encode out of order.
-    const encoded = await Promise.all(pending.map(entry => entry.data));
+    const encoded = await Promise.all(pending.map((entry) => entry.data));
     const entries = pending.map((entry, i) => ({ name: entry.name, data: encoded[i] }));
 
     // -- meta.json ----------------------------------------------------------

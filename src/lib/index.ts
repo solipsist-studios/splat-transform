@@ -6,13 +6,22 @@
 // Core contract + pool
 export { createChunkDataPool } from './chunk';
 export type {
-    ChunkSource, ChunkSourceMetadata, ReadRequest, ReadTarget,
-    ChunkData, ChunkDataPool,
-    ChunkLayer, SHBands, ChunkField, ChunkFieldMap, LayerLayout, ExtraColumn
+    ChunkSource,
+    ChunkSourceMetadata,
+    ReadRequest,
+    ReadTarget,
+    ChunkData,
+    ChunkDataPool,
+    ChunkLayer,
+    SHBands,
+    ChunkField,
+    ChunkFieldMap,
+    LayerLayout,
+    ExtraColumn
 } from './chunk';
 
 // Structural combinators (lazy views over sources)
-export { bakeTransform, concatSource, selectLod, stackLods } from './ops';
+export { bakeTransform, concatSource, selectLod, stackLods, sortMortonColumns, sortMortonInterleaved } from './ops';
 
 // How a scene was trained (carried on `ChunkSourceMetadata.model`). The per-format
 // spellings of the tag live with their reader/writer.
@@ -59,8 +68,8 @@ export type { LodStats, LodStatsData, SourceStats } from './stats';
 // High-level read/write
 export { readFile, readFileInfo, getInputFormat } from './read';
 export type { InputFormat, ReadFileOptions, FileInfo } from './read';
-export { writeFile, writeSource, getOutputFormat } from './write';
-export type { OutputFormat, WriteOptions, WriteSourceOptions } from './write';
+export { writeSource, getOutputFormat } from './write';
+export type { OutputFormat, WriteSourceOptions } from './write';
 export { writeLodSource } from './writers';
 export type { WriteLodSourceOptions } from './writers';
 
@@ -74,26 +83,40 @@ export type { TypedArray, ColumnType, Row } from './data-table';
 export { dataTableToChunkSource, materializeToDataTable } from './compat/data-table';
 export { processDataTable } from './process';
 
-// Individual readers (advanced use; ply/splat/spz return a `ChunkSource`,
+// Individual readers (advanced use; ply/splat/spz/glb return a `ChunkSource`,
 // ksplat/mjs/sog return a `DataTable`)
-export { readKsplat, readMjs, readPly, readPlyComments, readSog, readSplat, readSpz } from './readers';
+export { readGlb, readKsplat, readMjs, readPly, readPlyComments, readSog, readSplat, readSpz } from './readers';
 
 // Individual writers (advanced use; DataTable-input compat set)
-export { writeSog, writeSogst, writeSpz, writePly, writeCompressedPly, writeCsv, writeHtml, writeImage, writeGlb, writeVoxel } from './writers';
+export {
+    writeSog,
+    writeSogst,
+    writeSpz,
+    writePly,
+    writeCompressedPly,
+    writeCsv,
+    writeHtml,
+    writeImage,
+    writeGlb,
+    writeVoxel
+} from './writers';
 export { parseSogstComments, requireSogstClip } from './writers';
 export type { WriteImageOptions, WriteVoxelOptions, VoxelMetadata } from './writers';
 export type { WriteSogstOptions, Segment, Segments, SogstClip } from './writers';
+
+// Camera animation tracks for multi-frame image output (editor project,
+// viewer settings, or a plain frame list)
+export { loadCameraTrack } from './render/camera-track';
+export type { CameraTrack, TrackPose } from './render/camera-track';
 
 // ---------------------------------------------------------------------------
 // Infrastructure
 // ---------------------------------------------------------------------------
 
 // Utils
-export {
-    fmtBytes, fmtCount, fmtTime,
-    logger, TextRenderer, Transform, WebPCodec
-} from './utils';
+export { fmtBytes, fmtCount, fmtTime, logger, TextRenderer, Transform, WebPCodec } from './utils';
 export type { Bar, Group, LogEvent, Logger, MessageKind, Renderer, TextRendererOptions, Verbosity } from './utils';
+export type { SogBlindEncoding, SogBlindField, SogBlindTexture } from './utils/sog-blind';
 
 // Worker pool for CPU-heavy tasks
 export { WorkerQueue } from './workers';

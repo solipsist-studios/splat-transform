@@ -12,7 +12,7 @@ abstract class ReadStream {
     /**
      * Total bytes read from this stream so far.
      */
-    bytesRead: number = 0;
+    bytesRead = 0;
 
     /**
      * @param expectedSize - Optional size hint for buffer pre-allocation

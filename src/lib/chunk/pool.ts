@@ -1,5 +1,7 @@
-import { type ChunkData, ChunkDataImpl } from './data';
-import { type ChunkLayer, type LayerLayout, DEFAULT_CHUNK_SIZE } from './layout';
+import { ChunkDataImpl } from './data';
+import type { ChunkData } from './data';
+import { DEFAULT_CHUNK_SIZE } from './layout';
+import type { ChunkLayer, LayerLayout } from './layout';
 
 /**
  * A pool-backed allocator for {@link ChunkData} buffers.
@@ -53,9 +55,7 @@ interface ChunkDataPool {
  * @param options.maxPooledBytes - Cap on bytes held in the free list (default 2 GB).
  * @returns A new {@link ChunkDataPool}.
  */
-const createChunkDataPool = (
-    options?: { chunkSize?: number; maxPooledBytes?: number }
-): ChunkDataPool => {
+const createChunkDataPool = (options?: { chunkSize?: number; maxPooledBytes?: number }): ChunkDataPool => {
     const chunkSize = options?.chunkSize ?? DEFAULT_CHUNK_SIZE;
     const maxPooledBytes = options?.maxPooledBytes ?? 2 * 1024 * 1024 * 1024;
 

@@ -1,15 +1,10 @@
 import { Vec3 } from 'playcanvas';
 
-import {
-    type ChunkData,
-    type ChunkDataPool,
-    type ChunkLayer,
-    type ChunkSource,
-    type ChunkSourceMetadata,
-    SH_REST_COUNTS
-} from '../chunk';
+import { SH_REST_COUNTS } from '../chunk';
+import type { ChunkData, ChunkDataPool, ChunkLayer, ChunkSource, ChunkSourceMetadata } from '../chunk';
 import { Transform } from '../utils';
-import { inverseTransforms, isTransformColumn, rawColumnMap } from '../value-transforms';
+import { inverseTransforms, isTransformColumn, opacityRaw, rawColumnMap } from '../value-transforms';
+
 import { bakeTransform } from './bake-transform';
 
 /**
@@ -24,7 +19,7 @@ const LAYERS: ChunkLayer[] = ['position', 'geometric', 'color', 'other'];
 
 // Mutable form of a chunk read request, built layer-by-layer before passing to
 // a source's `read` (whose `ReadRequest` fields are readonly).
-type MutableReadRequest = { chunkIndex: number; lod: number } & { [L in ChunkLayer]?: ChunkData };
+type MutableReadRequest = { chunkIndex: number; lod: number } & Partial<Record<ChunkLayer, ChunkData>>;
 
 type Comparator = 'lt' | 'lte' | 'gt' | 'gte' | 'eq' | 'neq';
 
@@ -93,8 +88,8 @@ const selectRows = async (
 
 /**
  * Remove gaussians containing NaN or Infinity. Mirrors `processDataTable`'s
- * `filterNaN`: any non-finite value drops the row, except `opacity` may be
- * `+Infinity` and `scale_*` may be `-Infinity`. Rows whose rotation quaternion
+ * `filterNaN`: any non-finite value drops the row, except `scale_*` may be
+ * `-Infinity` (true opacity is always finite; a `+Infinity` PLY logit reads as 1). Rows whose rotation quaternion
  * is all-zero are also dropped: a zero-norm quaternion cannot be normalized,
  * so the gaussian is unrenderable (seen in zero-padded exporter output, where
  * whole rows of zeros otherwise survive as visible alpha-0.5 splats at the
@@ -105,7 +100,7 @@ const selectRows = async (
  */
 const filterNaNRows = (src: ChunkSource, pool: ChunkDataPool): Promise<Uint32Array> => {
     const { meta } = src;
-    const layers = LAYERS.filter(l => meta.availableLayers.has(l));
+    const layers = LAYERS.filter((l) => meta.availableLayers.has(l));
     const colStride32 = 3 + SH_REST_COUNTS[meta.shBands];
     const extras = meta.extraColumns;
 
@@ -133,8 +128,7 @@ const filterNaNRows = (src: ChunkSource, pool: ChunkDataPool): Promise<Uint32Arr
                     const v = geoF[o + e];
                     if (!isFinite(v) && v !== -Infinity) return false; // scale: -Inf ok
                 }
-                const op = geoF[o + 7];
-                if (!isFinite(op) && op !== Infinity) return false; // opacity: +Inf ok
+                if (!isFinite(geoF[o + 7])) return false; // true opacity
             }
             if (colF) {
                 const o = r * colStride32;
@@ -158,7 +152,14 @@ type ColumnLoc = { layer: ChunkLayer; elem: number; type: 'float32' | 'uint32' }
 
 const POSITION_ELEMS: Record<string, number> = { x: 0, y: 1, z: 2 };
 const GEOMETRIC_ELEMS: Record<string, number> = {
-    rot_0: 0, rot_1: 1, rot_2: 2, rot_3: 3, scale_0: 4, scale_1: 5, scale_2: 6, opacity: 7
+    rot_0: 0,
+    rot_1: 1,
+    rot_2: 2,
+    rot_3: 3,
+    scale_0: 4,
+    scale_1: 5,
+    scale_2: 6,
+    opacity: 7
 };
 const DC_ELEMS: Record<string, number> = { f_dc_0: 0, f_dc_1: 1, f_dc_2: 2 };
 
@@ -173,7 +174,7 @@ const columnLocation = (name: string, meta: ChunkSourceMetadata): ColumnLoc | nu
         const k = parseInt(rest[1], 10);
         return k < SH_REST_COUNTS[meta.shBands] ? { layer: 'color', elem: 3 + k, type: 'float32' } : null;
     }
-    const ei = meta.extraColumns.findIndex(e => e.name === name);
+    const ei = meta.extraColumns.findIndex((e) => e.name === name);
     if (ei >= 0) return { layer: 'other', elem: ei, type: meta.extraColumns[ei].type };
     return null;
 };
@@ -182,9 +183,10 @@ type ByValueParams = { columnName: string; comparator: string; value: number };
 
 /**
  * Keep gaussians matching a column comparison. Mirrors `processDataTable`'s
- * `filterByValue`: `*_raw` compares the stored value directly; otherwise an
- * `opacity`/`scale_*`/`f_dc_*` value is converted from user-friendly to raw
- * space first. If the source has a pending transform and the column is affected
+ * `filterByValue`: `*_raw` compares the stored value directly; otherwise a
+ * `scale_*`/`f_dc_*` value is converted from user-friendly to raw space first.
+ * `opacity` compares true opacity, which the source stores as is (it may exceed
+ * 1), and `opacity_raw` the logit a standard PLY would store. If the source has a pending transform and the column is affected
  * by it, the column is baked (via {@link bakeTransform}) before comparison.
  * @param src - The source to filter (LOD 0).
  * @param pool - Pool for the temporary read buffers.
@@ -195,13 +197,16 @@ const filterByValueRows = (src: ChunkSource, pool: ChunkDataPool, params: ByValu
     const { meta } = src;
     let columnName = params.columnName;
     let value = params.value;
+    // opacity_raw compares each gaussian's stored logit, from its true opacity
+    let toRaw: ((a: number) => number) | null = null;
 
-    if (rawColumnMap[columnName]) {
+    if (columnName === 'opacity_raw') {
+        columnName = 'opacity';
+        const threshold = value;
+        toRaw = (a) => opacityRaw(a, threshold);
+    } else if (rawColumnMap[columnName]) {
         columnName = rawColumnMap[columnName];
-    } else if (inverseTransforms[columnName]) {
-        if (columnName === 'opacity' && (value <= 0 || value >= 1)) {
-            throw new Error(`filterByValue: opacity value must be between 0 and 1 (exclusive), got ${value}`);
-        }
+    } else if (columnName !== 'opacity' && inverseTransforms[columnName]) {
         value = inverseTransforms[columnName](value);
     }
 
@@ -212,7 +217,9 @@ const filterByValueRows = (src: ChunkSource, pool: ChunkDataPool, params: ByValu
 
     const compare = comparators[params.comparator as Comparator];
     if (!compare) {
-        throw new Error(`filterByValue: unknown comparator '${params.comparator}', expected one of: ${Object.keys(comparators).join(', ')}`);
+        throw new Error(
+            `filterByValue: unknown comparator '${params.comparator}', expected one of: ${Object.keys(comparators).join(', ')}`
+        );
     }
 
     // Transform-affected columns must be compared in baked (world) space, exactly
@@ -226,6 +233,10 @@ const filterByValueRows = (src: ChunkSource, pool: ChunkDataPool, params: ByValu
         const buf = buffers[loc.layer]!;
         if (loc.type === 'float32') {
             const f = new Float32Array(buf);
+            if (toRaw) {
+                const raw = toRaw;
+                return (r: number) => compare(raw(f[r * stride32 + loc.elem]), value);
+            }
             return (r: number) => compare(f[r * stride32 + loc.elem], value);
         }
         const u = new Uint32Array(buf);
@@ -253,10 +264,10 @@ const filterBoxRows = (src: ChunkSource, pool: ChunkDataPool, params: BoxParams)
             const p = new Float32Array(buffers.position!);
             return (r: number) => {
                 const o = r * 3;
-                const x = p[o], y = p[o + 1], z = p[o + 2];
-                return x >= min.x && x <= max.x &&
-                       y >= min.y && y <= max.y &&
-                       z >= min.z && z <= max.z;
+                const x = p[o],
+                    y = p[o + 1],
+                    z = p[o + 2];
+                return x >= min.x && x <= max.x && y >= min.y && y <= max.y && z >= min.z && z <= max.z;
             };
         });
     }
@@ -287,7 +298,9 @@ const filterBoxRows = (src: ChunkSource, pool: ChunkDataPool, params: BoxParams)
         const p = new Float32Array(buffers.position!);
         return (r: number) => {
             const o = r * 3;
-            const x = p[o], y = p[o + 1], z = p[o + 2];
+            const x = p[o],
+                y = p[o + 1],
+                z = p[o + 2];
             for (let j = 0; j < 3; j++) {
                 const proj = rawAxes[j].x * x + rawAxes[j].y * y + rawAxes[j].z * z;
                 if (proj < rawMin[j] || proj > rawMax[j]) return false;
@@ -317,13 +330,17 @@ const filterSphereRows = (src: ChunkSource, pool: ChunkDataPool, params: SphereP
         rawRadius /= transform.scale;
     }
     const radiusSq = rawRadius * rawRadius;
-    const cx = rawCenter.x, cy = rawCenter.y, cz = rawCenter.z;
+    const cx = rawCenter.x,
+        cy = rawCenter.y,
+        cz = rawCenter.z;
 
     return selectRows(src, pool, ['position'], (buffers) => {
         const p = new Float32Array(buffers.position!);
         return (r: number) => {
             const o = r * 3;
-            const dx = p[o] - cx, dy = p[o + 1] - cy, dz = p[o + 2] - cz;
+            const dx = p[o] - cx,
+                dy = p[o + 1] - cy,
+                dz = p[o + 2] - cz;
             return dx * dx + dy * dy + dz * dz < radiusSq;
         };
     });

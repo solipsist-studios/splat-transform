@@ -1,13 +1,17 @@
-import { Column, DataTable, TypedArray } from './data-table';
-import { convertToSpace } from './transform';
+import { OPACITY_LINEAR_COLUMN } from '../chunk';
 import { logger, Transform } from '../utils';
+
+import type { TypedArray } from './data-table';
+import { Column, DataTable } from './data-table';
+import { convertToSpace } from './transform';
 
 /**
  * Combines multiple DataTables into a single DataTable.
  *
  * Merges rows from all input tables. Columns are matched by name and type;
  * columns that don't exist in all tables will have undefined values for
- * rows from tables lacking that column.
+ * rows from tables lacking that column, except `opacity_linear`, which is
+ * filled from those rows' `opacity` (`sigmoid(opacity)`, what its absence means).
  *
  * If tables have differing source transforms, all data is first converted
  * to engine coordinate space (identity transform) before combining.
@@ -21,28 +25,27 @@ import { logger, Transform } from '../utils';
  * console.log(combined.numRows); // tableA.numRows + tableB.numRows + tableC.numRows
  * ```
  */
-const combine = (dataTables: DataTable[]) : DataTable => {
+const combine = (dataTables: DataTable[]): DataTable => {
     if (dataTables.length === 1) {
         return dataTables[0];
     }
 
     // Check if all transforms match the first table's transform
     const refTransform = dataTables[0].transform;
-    const allMatch = dataTables.every(dt => dt.transform.equals(refTransform));
+    const allMatch = dataTables.every((dt) => dt.transform.equals(refTransform));
 
     let tables = dataTables;
     let resultTransform = refTransform;
 
     if (!allMatch) {
         logger.warn('Combining DataTables with different source transforms; converting to engine space.');
-        tables = dataTables.map(dt => convertToSpace(dt, Transform.IDENTITY));
+        tables = dataTables.map((dt) => convertToSpace(dt, Transform.IDENTITY));
         resultTransform = Transform.IDENTITY;
     }
 
     const findMatchingColumn = (columns: Column[], column: Column) => {
         for (let i = 0; i < columns.length; ++i) {
-            if (columns[i].name === column.name &&
-                columns[i].dataType === column.dataType) {
+            if (columns[i].name === column.name && columns[i].dataType === column.dataType) {
                 return columns[i];
             }
         }
@@ -82,6 +85,19 @@ const combine = (dataTables: DataTable[]) : DataTable => {
         }
 
         rowOffset += dataTable.numRows;
+    }
+
+    // opacity_linear's absence means sigmoid(opacity), not the zero a missing column is left at
+    const linear = result.getColumnByName(OPACITY_LINEAR_COLUMN)?.data;
+    if (linear) {
+        let start = 0;
+        for (const dataTable of tables) {
+            const opacity = dataTable.getColumnByName('opacity')?.data;
+            if (!dataTable.hasColumn(OPACITY_LINEAR_COLUMN) && opacity) {
+                for (let r = 0; r < dataTable.numRows; r++) linear[start + r] = 1 / (1 + Math.exp(-opacity[r]));
+            }
+            start += dataTable.numRows;
+        }
     }
 
     return result;

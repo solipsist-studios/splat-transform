@@ -1,21 +1,19 @@
-import {
-    type ChunkData,
-    type ChunkDataPool,
-    type ChunkLayer,
-    type ReadRequest,
-    type ChunkSource,
-    type ChunkSourceMetadata
-} from '../chunk';
+import type { ChunkData, ChunkDataPool, ChunkLayer, ReadRequest, ChunkSource, ChunkSourceMetadata } from '../chunk';
+import { resolveComments } from '../comments';
+import { resolveExtras } from '../extras';
 import { resolveSplatModel } from '../splat-model';
 import { logger } from '../utils';
+import { combineBlindOrigins } from '../utils/sog-blind';
 
 const LAYERS: ChunkLayer[] = ['position', 'geometric', 'color', 'other'];
 
 // Mutable forms of a read request, built layer-by-layer before passing to a
 // source's `read` (whose `ReadRequest` fields are readonly): one for a
 // contiguous chunk read, one for a scatter-gather read.
-type MutableReadRequest = { chunkIndex: number; lod: number } & { [L in ChunkLayer]?: ChunkData };
-type MutableRowReadRequest = { indices: Uint32Array; indexOffset: number; count: number } & { [L in ChunkLayer]?: ChunkData };
+type MutableReadRequest = { chunkIndex: number; lod: number } & Partial<Record<ChunkLayer, ChunkData>>;
+type MutableRowReadRequest = { indices: Uint32Array; indexOffset: number; count: number } & Partial<
+    Record<ChunkLayer, ChunkData>
+>;
 
 /**
  * Concatenate several sources end-to-end into one, as a lazy view.
@@ -25,6 +23,7 @@ type MutableRowReadRequest = { indices: Uint32Array; indexOffset: number; count:
  * SH bands, available layers, extra columns) and on the pending coordinate-space
  * **transform** — concatenating data in mismatched spaces is silently wrong, so
  * a transform mismatch throws (the caller must bake to a common space first).
+ * The result carries `opacityAboveOne` when any input does.
  *
  * Single-LOD only. Reads stitch contiguous row ranges: an output chunk is filled
  * by block-copying the overlapping span out of each contributing source chunk
@@ -42,8 +41,8 @@ const concatSource = (allSources: ChunkSource[], pool: ChunkDataPool): ChunkSour
     }
 
     const ref = allSources[0].meta;
-    const layerKey = (m: ChunkSourceMetadata) => LAYERS.filter(l => m.availableLayers.has(l)).join(',');
-    const extraKey = (m: ChunkSourceMetadata) => m.extraColumns.map(e => `${e.name}:${e.type}`).join(',');
+    const layerKey = (m: ChunkSourceMetadata) => LAYERS.filter((l) => m.availableLayers.has(l)).join(',');
+    const extraKey = (m: ChunkSourceMetadata) => m.extraColumns.map((e) => `${e.name}:${e.type}`).join(',');
     const refLayers = layerKey(ref);
     const refExtras = extraKey(ref);
 
@@ -73,7 +72,7 @@ const concatSource = (allSources: ChunkSource[], pool: ChunkDataPool): ChunkSour
     // the chunk stitcher's one-step source advance and the pool rejects
     // zero-count acquires); close() still closes ALL inputs, dropped or not.
     // Keep one source when everything is empty so the metadata stays derivable.
-    let sources = allSources.filter(s => s.meta.numGaussians > 0);
+    let sources = allSources.filter((s) => s.meta.numGaussians > 0);
     if (sources.length === 0) {
         sources = [allSources[0]];
     }
@@ -81,15 +80,15 @@ const concatSource = (allSources: ChunkSource[], pool: ChunkDataPool): ChunkSour
     // Unlike the structural mismatches above, disagreeing models don't block the
     // concat: no output format can hold two, so fall back to plain gaussians
     // (which every variant renders acceptably as) rather than mistagging.
-    const model = resolveSplatModel(sources.map(s => s.meta.model));
-    if (sources.some(s => s.meta.model !== model)) {
-        const seen = [...new Set(sources.map(s => s.meta.model))].join(', ');
+    const model = resolveSplatModel(sources.map((s) => s.meta.model));
+    if (sources.some((s) => s.meta.model !== model)) {
+        const seen = [...new Set(sources.map((s) => s.meta.model))].join(', ');
         logger.warn(`mixed splat models (${seen}); writing the result as '${model}'`);
     }
 
     const S = ref.chunkSize;
     // Per-source gaussian counts and the output-row offset each source begins at.
-    const counts = sources.map(s => s.meta.numGaussians);
+    const counts = sources.map((s) => s.meta.numGaussians);
     const starts: number[] = [];
     let total = 0;
     for (const c of counts) {
@@ -97,8 +96,15 @@ const concatSource = (allSources: ChunkSource[], pool: ChunkDataPool): ChunkSour
         total += c;
     }
 
+    const extras = resolveExtras(sources);
+    const comments = resolveComments(sources);
+    const { extras: _refExtras, comments: _refComments, opacityAboveOne: _refAboveOne, ...refMeta } = ref;
     const meta: ChunkSourceMetadata = {
-        ...ref,
+        ...refMeta,
+        ...(extras !== undefined ? { extras } : {}),
+        ...(comments?.length ? { comments } : {}),
+        ...(sources.some((s) => s.meta.opacityAboveOne) ? { opacityAboveOne: true } : {}),
+        extraColumns: combineBlindOrigins(sources.map((s) => s.meta.extraColumns)),
         model,
         numGaussians: total,
         numLods: 1,
@@ -115,7 +121,7 @@ const concatSource = (allSources: ChunkSource[], pool: ChunkDataPool): ChunkSour
             // rows from disk.
             const { indices, indexOffset, count } = request;
             if (count <= 0) return;
-            const wanted: ChunkLayer[] = LAYERS.filter(l => request[l]);
+            const wanted: ChunkLayer[] = LAYERS.filter((l) => request[l]);
             if (wanted.length === 0) return;
 
             // Bucket rows by source: binary-search `starts` per row (sources
@@ -134,7 +140,8 @@ const concatSource = (allSources: ChunkSource[], pool: ChunkDataPool): ChunkSour
                 let hi = nSrc - 1;
                 while (lo < hi) {
                     const mid = (lo + hi + 1) >> 1;
-                    if (starts[mid] <= g) lo = mid; else hi = mid - 1;
+                    if (starts[mid] <= g) lo = mid;
+                    else hi = mid - 1;
                 }
                 srcOf[j] = lo;
                 bucketCount[lo]++;
@@ -156,8 +163,12 @@ const concatSource = (allSources: ChunkSource[], pool: ChunkDataPool): ChunkSour
                 const m = bucketCount[s];
                 if (m === 0) continue;
                 const base = offsets[s];
-                const temps = wanted.map(layer => ({ layer, tmp: pool.acquire(layer, ref.layouts[layer]!, m) }));
-                const req: MutableRowReadRequest = { indices: localIdx.subarray(base, base + m), indexOffset: 0, count: m };
+                const temps = wanted.map((layer) => ({ layer, tmp: pool.acquire(layer, ref.layouts[layer]!, m) }));
+                const req: MutableRowReadRequest = {
+                    indices: localIdx.subarray(base, base + m),
+                    indexOffset: 0,
+                    count: m
+                };
                 for (const { layer, tmp } of temps) req[layer] = tmp;
                 await sources[s].read(req);
 
@@ -230,7 +241,7 @@ const concatSource = (allSources: ChunkSource[], pool: ChunkDataPool): ChunkSour
     };
 
     const close = async (): Promise<void> => {
-        await Promise.all(allSources.map(s => s.close()));
+        await Promise.all(allSources.map((s) => s.close()));
     };
 
     return { meta, read, close };

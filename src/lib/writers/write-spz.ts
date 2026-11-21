@@ -1,14 +1,18 @@
 import { basename } from 'pathe';
 
-import { logWrittenFile } from './utils';
-import { type FileSystem, writeFile } from '../io/write';
-import { type SplatModel } from '../splat-model';
+import { withOpacityLogit } from '../data-table';
+import type { DataTable } from '../data-table';
+import { writeFile } from '../io/write';
+import type { FileSystem } from '../io/write';
+import type { SplatModel } from '../splat-model';
 import { dataTableToGaussianCloud, getSpzModule, makeSpzPackOptions } from '../spz-module';
 import { logger } from '../utils';
 
+import { logWrittenFile } from './utils';
+
 type WriteSpzOptions = {
     filename: string;
-    dataTable: import('../data-table').DataTable;
+    dataTable: DataTable;
     model?: SplatModel;
     version?: 3 | 4;
 };
@@ -34,7 +38,7 @@ const writeSpz = async (options: WriteSpzOptions, fs: FileSystem) => {
 
     const spz = await getSpzModule();
     const packOptions = await makeSpzPackOptions({ version });
-    const cloud = dataTableToGaussianCloud(dataTable, model);
+    const cloud = dataTableToGaussianCloud(withOpacityLogit(dataTable), model);
     const bytes = spz.saveSpzToBuffer(cloud, packOptions);
 
     if (version === 4) {

@@ -7,9 +7,8 @@ import {
     MIN_TRANSMITTANCE,
     OPACITY_CAP,
     POLE_EPS,
-    RADIUS_FADE_END_FRAC,
-    RADIUS_FADE_START_FRAC,
     SIGMA_CUTOFF,
+    SIZE_CLAMP_FRAC,
     TILE_SIZE
 } from '../../../render/config';
 
@@ -37,10 +36,10 @@ const wgslF32 = (n: number): string => {
  * additionally be used inside `@workgroup_size(...)` and other const-
  * expression contexts.
  *
- * Included via `#include "constants"` (see `sharedCincludes` in
- * `gpu-splat-rasterizer.ts`).
+ * Included via `#include "constants"` (see `cincludes` in
+ * `gpu-scene-rasterizer.ts`).
  */
-const constantsChunk = /* wgsl */`
+const constantsChunk = /* wgsl */ `
 const TILE_SIZE: u32 = ${TILE_SIZE}u;
 const SIGMA_CUTOFF: f32 = ${wgslF32(SIGMA_CUTOFF)};
 const GAUSSIAN_FLOOR: f32 = ${wgslF32(GAUSSIAN_FLOOR)};
@@ -50,8 +49,7 @@ const JACOBIAN_LIMIT_FACTOR: f32 = ${wgslF32(JACOBIAN_LIMIT_FACTOR)};
 const MIN_ALPHA: f32 = ${wgslF32(MIN_ALPHA)};
 const MIN_TRANSMITTANCE: f32 = ${wgslF32(MIN_TRANSMITTANCE)};
 const OPACITY_CAP: f32 = ${wgslF32(OPACITY_CAP)};
-const RADIUS_FADE_START_FRAC: f32 = ${wgslF32(RADIUS_FADE_START_FRAC)};
-const RADIUS_FADE_END_FRAC: f32 = ${wgslF32(RADIUS_FADE_END_FRAC)};
+const SIZE_CLAMP_FRAC: f32 = ${wgslF32(SIZE_CLAMP_FRAC)};
 const POLE_EPS: f32 = ${wgslF32(POLE_EPS)};
 `;
 

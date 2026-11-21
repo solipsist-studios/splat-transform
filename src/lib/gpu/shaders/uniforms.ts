@@ -1,8 +1,4 @@
-import {
-    UNIFORMTYPE_FLOAT,
-    UNIFORMTYPE_UINT,
-    UniformFormat
-} from 'playcanvas';
+import { UNIFORMTYPE_FLOAT, UNIFORMTYPE_UINT, UniformFormat } from 'playcanvas';
 
 /**
  * Shared WGSL declaration of the `struct Uniforms` block consumed by
@@ -19,18 +15,20 @@ import {
  * `playcanvas/src/platform/graphics/shader.js` for the preprocessor
  * wiring (the `cincludes` Map on the `Shader` constructor's definition).
  */
-const uniformsStruct = /* wgsl */`
+const uniformsStruct = /* wgsl */ `
 struct Uniforms {
     rightX: f32, rightY: f32, rightZ: f32, _p0: f32,
     downX: f32, downY: f32, downZ: f32, _p1: f32,
     forwardX: f32, forwardY: f32, forwardZ: f32, _p2: f32,
     eyeX: f32, eyeY: f32, eyeZ: f32, _p3: f32,
     focalX: f32, focalY: f32, near: f32, _p4: f32,
-    focusDistance: f32, apertureScale: f32, _p5: f32, _p6: f32,
-    imageWidth: u32, imageHeight: u32, splatStride: u32, chunkSize: u32,
+    focusDistance: f32, apertureScale: f32, offsetX: f32, offsetY: f32,
+    imageWidth: u32, imageHeight: u32, _p5: u32, chunkSize: u32,
     groupPixelMinX: u32, groupPixelMinY: u32, groupPixelMaxX: u32, groupPixelMaxY: u32,
     groupTilesX: u32, groupTilesY: u32, groupPixelOriginX: u32, groupPixelOriginY: u32,
     bgR: f32, bgG: f32, bgB: f32, bgA: f32,
+    numSplats: u32, rangeStart: u32, emitBase: u32, sliceIndex: u32,
+    sliceCount: u32, _p7: u32, _p8: u32, _p9: u32,
 }
 `;
 
@@ -67,11 +65,11 @@ const uniformFormatEntries = (): UniformFormat[] => [
     new UniformFormat('_p4', UNIFORMTYPE_FLOAT),
     new UniformFormat('focusDistance', UNIFORMTYPE_FLOAT),
     new UniformFormat('apertureScale', UNIFORMTYPE_FLOAT),
-    new UniformFormat('_p5', UNIFORMTYPE_FLOAT),
-    new UniformFormat('_p6', UNIFORMTYPE_FLOAT),
+    new UniformFormat('offsetX', UNIFORMTYPE_FLOAT),
+    new UniformFormat('offsetY', UNIFORMTYPE_FLOAT),
     new UniformFormat('imageWidth', UNIFORMTYPE_UINT),
     new UniformFormat('imageHeight', UNIFORMTYPE_UINT),
-    new UniformFormat('splatStride', UNIFORMTYPE_UINT),
+    new UniformFormat('_p5', UNIFORMTYPE_UINT),
     new UniformFormat('chunkSize', UNIFORMTYPE_UINT),
     new UniformFormat('groupPixelMinX', UNIFORMTYPE_UINT),
     new UniformFormat('groupPixelMinY', UNIFORMTYPE_UINT),
@@ -84,7 +82,18 @@ const uniformFormatEntries = (): UniformFormat[] => [
     new UniformFormat('bgR', UNIFORMTYPE_FLOAT),
     new UniformFormat('bgG', UNIFORMTYPE_FLOAT),
     new UniformFormat('bgB', UNIFORMTYPE_FLOAT),
-    new UniformFormat('bgA', UNIFORMTYPE_FLOAT)
+    new UniformFormat('bgA', UNIFORMTYPE_FLOAT),
+    // Scene size, and the splat / pair offsets of the range being emitted.
+    new UniformFormat('numSplats', UNIFORMTYPE_UINT),
+    new UniformFormat('rangeStart', UNIFORMTYPE_UINT),
+    new UniformFormat('emitBase', UNIFORMTYPE_UINT),
+    // Motion-blur slice being accumulated and the slice count (1 and 0 when
+    // finalize runs instead of accumulate).
+    new UniformFormat('sliceIndex', UNIFORMTYPE_UINT),
+    new UniformFormat('sliceCount', UNIFORMTYPE_UINT),
+    new UniformFormat('_p7', UNIFORMTYPE_UINT),
+    new UniformFormat('_p8', UNIFORMTYPE_UINT),
+    new UniformFormat('_p9', UNIFORMTYPE_UINT)
 ];
 
 export { uniformsStruct, uniformFormatEntries };

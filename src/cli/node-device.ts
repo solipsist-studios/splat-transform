@@ -1,4 +1,5 @@
-import { GraphicsDevice, WebgpuGraphicsDevice } from 'playcanvas';
+import type { GraphicsDevice } from 'playcanvas';
+import { WebgpuGraphicsDevice } from 'playcanvas';
 import { create, globals } from 'webgpu';
 
 import { logger } from '../lib';
@@ -6,46 +7,52 @@ import { logger } from '../lib';
 const initializeGlobals = () => {
     Object.assign(globalThis, globals);
 
-    // window stub
-    (globalThis as any).window = {
-        navigator: { userAgent: 'node.js' }
-    };
-
-    // document stub
-    (globalThis as any).document = {
-        createElement: (type: string) => {
-            if (type === 'canvas') {
-                return {
-                    getContext: (): null => {
-                        return null;
-                    },
-                    getBoundingClientRect: () => {
-                        return {
-                            left: 0,
-                            top: 0,
-                            width: 300,
-                            height: 150,
-                            right: 300,
-                            bottom: 150
-                        };
-                    },
-                    width: 300,
-                    height: 150
-                };
+    // window and document stubs
+    Object.assign(globalThis, {
+        window: { navigator: { userAgent: 'node.js' } },
+        document: {
+            createElement: (type: string) => {
+                if (type === 'canvas') {
+                    return {
+                        getContext: (): null => {
+                            return null;
+                        },
+                        getBoundingClientRect: () => {
+                            return {
+                                left: 0,
+                                top: 0,
+                                width: 300,
+                                height: 150,
+                                right: 300,
+                                bottom: 150
+                            };
+                        },
+                        width: 300,
+                        height: 150
+                    };
+                }
             }
         }
-    };
+    });
 };
 
 initializeGlobals();
 
+// Dawn option forcing a specific backend (e.g. 'vulkan'); none = Dawn's platform default.
+const backendOptions = (backend?: string) => (backend ? [`backend=${backend}`] : []);
+
 // Get Dawn's actual adapter names by triggering its error message.
 // This is the official documented method for enumerating adapters:
 // https://github.com/dawn-gpu/node-webgpu?tab=readme-ov-file#usage
-const getDawnAdapterNames = async (): Promise<string[]> => {
+const getDawnAdapterNames = async (backend?: string): Promise<string[]> => {
     try {
-        const gpu = create(['adapter=__list_adapters__']);
-        await gpu.requestAdapter();
+        const gpu = create([...backendOptions(backend), 'adapter=__list_adapters__']);
+        const adapter = await gpu.requestAdapter();
+
+        // A forced backend with no adapters resolves null instead of throwing
+        if (!adapter && backend) {
+            return [];
+        }
     } catch (e) {
         // Parse Dawn's error message to extract adapter names
         const message = e instanceof Error ? e.message : String(e);
@@ -54,9 +61,9 @@ const getDawnAdapterNames = async (): Promise<string[]> => {
 
         for (const line of lines) {
             // Look for lines like: " * backend: 'd3d12', name: 'NVIDIA RTX A2000 8GB Laptop GPU'"
-            const match = line.match(/name:\s*'([^']+)'/);
-            if (match) {
-                names.push(match[1]);
+            const match = line.match(/backend:\s*'([^']+)',\s*name:\s*'([^']+)'/);
+            if (match && (!backend || match[1] === backend)) {
+                names.push(match[2]);
             }
         }
 
@@ -76,9 +83,9 @@ let peakGpuBytes = 0;
 const getPeakGpuMemory = (): number => peakGpuBytes;
 
 // Cache enumerated adapters so we don't query Dawn multiple times
-let cachedAdapters: Array<{ index: number; name: string }> | null = null;
+let cachedAdapters: { index: number; name: string }[] | null = null;
 
-const enumerateAdapters = async () => {
+const enumerateAdapters = async (backend?: string) => {
     if (cachedAdapters) {
         return cachedAdapters;
     }
@@ -87,7 +94,7 @@ const enumerateAdapters = async () => {
         logger.info('Detecting GPU adapters...');
 
         // Get the actual adapter names directly from Dawn
-        const dawnAdapterNames = await getDawnAdapterNames();
+        const dawnAdapterNames = await getDawnAdapterNames(backend);
 
         // Cache and return the list
         cachedAdapters = dawnAdapterNames.map((name, index) => ({
@@ -105,12 +112,19 @@ const enumerateAdapters = async () => {
     }
 };
 
-const createDevice = async (adapterName?: string): Promise<GraphicsDevice> => {
+const createDevice = async (adapterName?: string, backend?: string): Promise<GraphicsDevice> => {
     // Use Dawn's adapter selection if a specific adapter name is provided
-    const dawnOptions = adapterName ? [`adapter=${adapterName}`] : [];
+    const dawnOptions = [...backendOptions(backend), ...(adapterName ? [`adapter=${adapterName}`] : [])];
 
     // @ts-ignore
     window.navigator.gpu = create(dawnOptions);
+
+    // A forced backend the machine lacks resolves a null adapter, which
+    // PlayCanvas would dereference with an opaque TypeError
+    // @ts-ignore
+    if (backend && !(await window.navigator.gpu.requestAdapter())) {
+        throw new Error(`No GPU adapter found for backend '${backend}'`);
+    }
 
     const canvas = document.createElement('canvas');
 
@@ -134,8 +148,8 @@ const createDevice = async (adapterName?: string): Promise<GraphicsDevice> => {
     // LOD chain ended up with several identical full-resolution levels. Handling
     // it here once means every GPU consumer (decimate, filters, voxelization, …)
     // fails loudly without wrapping each call site in its own error scope.
-    // @ts-ignore - wgpu is private on WebgpuGraphicsDevice but exposed in practice
-    const wgpu = (graphicsDevice as any).wgpu;
+    // wgpu is private on WebgpuGraphicsDevice but exposed in practice
+    const wgpu: GPUDevice | undefined = graphicsDevice['wgpu'];
 
     // A corrupted GPU result must never be written out, so we escalate to a hard
     // failure: re-raise on the next tick so main()'s uncaughtException handler
@@ -149,7 +163,7 @@ const createDevice = async (adapterName?: string): Promise<GraphicsDevice> => {
         });
     };
 
-    wgpu?.addEventListener?.('uncapturederror', (ev: any) => {
+    wgpu?.addEventListener?.('uncapturederror', (ev) => {
         const e = ev?.error;
         const kind = e?.constructor?.name === 'GPUOutOfMemoryError' ? 'out-of-memory' : 'error';
         escalateGpuError(`${kind}: ${e?.message || '(no message)'}`);
@@ -157,7 +171,7 @@ const createDevice = async (adapterName?: string): Promise<GraphicsDevice> => {
 
     // Skip the `destroyed` reason — that fires on intentional device.destroy()
     // during normal shutdown.
-    wgpu?.lost?.then((info: any) => {
+    wgpu?.lost?.then((info) => {
         if (info?.reason === 'destroyed') return;
         escalateGpuError(`device lost: reason=${info?.reason || 'unknown'}, message=${info?.message || '(none)'}`);
     });
@@ -172,11 +186,10 @@ const createDevice = async (adapterName?: string): Promise<GraphicsDevice> => {
     // captured. Blind spots: engine-internal readback staging buffers
     // bypass `_vram`, and Dawn's own overhead (pipelines, heap padding)
     // is invisible — the peak is a lower bound on true device memory.
-    // @ts-ignore - _vram is private on GraphicsDevice
-    const vram = (graphicsDevice as any)._vram;
-    (graphicsDevice as any)._vram = new Proxy(vram, {
+    const vram = graphicsDevice._vram;
+    graphicsDevice._vram = new Proxy(vram, {
         set(target, prop, value) {
-            target[prop] = value;
+            Reflect.set(target, prop, value);
             const total = target.tex + target.vb + target.ib + target.ub + target.sb;
             if (total > peakGpuBytes) {
                 peakGpuBytes = total;

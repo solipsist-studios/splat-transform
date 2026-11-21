@@ -1,4 +1,9 @@
-import { type SogstClip } from './writers/sogst-clip';
+import type { ExperienceSettings } from '@playcanvas/supersplat-viewer/settings';
+import type { GraphicsDevice } from 'playcanvas';
+
+import type { CameraTrack } from './render/camera-track';
+import type { SogBlindTexture } from './utils/sog-blind';
+import type { SogstClip } from './writers/sogst-clip';
 
 /**
  * Collision mesh shape generated alongside voxel output.
@@ -15,11 +20,22 @@ type Options = {
     /** Number of iterations for SOG SH compression (higher = better quality). Default: 10 */
     iterations?: number;
 
+    /**
+     * SOG SH palette size target: the visibility-weighted, view-averaged colour error the palette may
+     * add, in 8-bit levels. The writer picks the smallest palette that meets it. Default: 5. Ignored when
+     * `sogPaletteSize` is set, no GPU is available, or a single SOG's SH data exceeds the search's 2GB GPU
+     * budget (these use a fixed palette size).
+     */
+    shColorError?: number;
+
+    /** Lossless WebP compression effort for image, SOG, HTML and LOD output, 0–9. Omit to use the default WebP encoder. */
+    webpEffort?: number;
+
     /** LOD levels to read from LCC input. Default: all levels. */
     lodSelect?: number[];
 
     /** Viewer settings JSON for HTML output */
-    viewerSettingsJson?: any;
+    viewerSettingsJson?: ExperienceSettings;
 
     /** Whether to generate unbundled HTML output with separate files. Default: false */
     unbundled?: boolean;
@@ -30,8 +46,40 @@ type Options = {
     /** Approximate size of an LOD chunk in world units (meters). Default: 16 */
     lodChunkExtent?: number;
 
+    /** Gaussians (in thousands) below which an LOD chunk is not split for exceeding the extent. Default: 8 */
+    lodChunkMin?: number;
+
+    /** Gaussians (in thousands) per LOD file, per level from finest; the last value repeats. Default: lodChunkCount */
+    lodFileCount?: number[];
+
     /** SPZ format version to write. Default: 4. */
     spzVersion?: 3 | 4;
+
+    /**
+     * Write PLY opacity as the standard `opacity` logit even when some gaussian's opacity
+     * exceeds 1 (it is clamped to 1), instead of `opacity_linear`, for tools that don't read
+     * `opacity_linear`. Default false.
+     */
+    plyLogitOpacity?: boolean;
+
+    /** SOG format version to write (SOG, SOG bundle and LOD output). Default: 3. HTML output always embeds v2. */
+    sogVersion?: 2 | 3;
+
+    /**
+     * Per-gaussian SOG blind data (v3 only): source columns packed into blind textures, one entry per texture.
+     * Undefined stores the columns read from SOG blind data as they were stored; an empty list stores none.
+     */
+    sogBlind?: SogBlindTexture[];
+
+    /** JSON to store as the SOG / LOD output's `extras` (application-defined, as in glTF). Default: the source's extras. */
+    sogExtras?: unknown;
+
+    /**
+     * Fixed SH palette entries for SOG / SOG bundle output. Default: sized by `shColorError`, or where that
+     * can't run the gaussian count rounded down to a power of 2, at most 65536. v3 allows up to 262144
+     * (24-bit labels); v2 up to 65536. LOD output always uses the default.
+     */
+    sogPaletteSize?: number;
 
     /**
      * Temporal segment length in seconds for .sogst output. 0 disables
@@ -111,6 +159,9 @@ type Options = {
      */
     renderFStop?: number;
 
+    /** Circular-aperture samples per instant for image depth of field. Default: 32; only used with renderFStop. */
+    renderDofSamples?: number;
+
     /**
      * Camera-space Z of the focus plane in world units for image output.
      * Defaults to the distance from the camera to the look-at point when
@@ -130,7 +181,8 @@ type Options = {
      * End camera position for motion blur. When set, enables camera
      * motion blur: the renderer averages multiple sub-frames with the
      * camera interpolated between `renderCameraPosition` (shutter open)
-     * and `renderCameraEndPosition` (shutter close).
+     * and `renderCameraEndPosition` (shutter close). Not valid with
+     * `renderCameraTrack`, whose motion blur comes from `renderShutter`.
      */
     renderCameraEndPosition?: { x: number; y: number; z: number };
 
@@ -149,19 +201,57 @@ type Options = {
     renderUpEnd?: { x: number; y: number; z: number };
 
     /**
-     * Shutter fraction in `[0, 1]`. Controls what portion of the
-     * start→end camera segment is integrated, centered on the midpoint
-     * (standard shutter-angle convention: 1.0 = full motion, 0.5 = 180°
-     * shutter). Default: `1`. No effect without `renderCameraEndPosition`.
+     * Shutter fraction in `[0, 1]`. For a start→end camera segment, the
+     * portion the frame averages over, centered on the midpoint (standard
+     * shutter-angle convention: 1.0 = full motion, 0.5 = 180° shutter);
+     * default `0.5`. Along `renderCameraTrack`, setting it enables motion
+     * blur over that fraction of the frame interval; default off.
      */
     renderShutter?: number;
 
     /**
-     * Number of sub-frames to accumulate for motion blur. More samples =
-     * smoother streaks at proportionally higher cost. Default: `16`.
-     * No effect without `renderCameraEndPosition`.
+     * Renders averaged per motion-blurred frame, at evenly spaced instants
+     * across the shutter; cost is N× a single render. Default: `16`. No
+     * effect without motion blur.
      */
     renderMotionSamples?: number;
+
+    /**
+     * Camera animation to render as a frame sequence (see `loadCameraTrack`).
+     * Replaces `renderCameraPosition` / `renderLookAt` / `renderUp` / `renderFov`; the
+     * output filename gains a zero-padded frame index before its extension.
+     * With `renderShutter` set, each frame is motion-blurred over that
+     * fraction of the frame interval.
+     */
+    renderCameraTrack?: CameraTrack;
+
+    /**
+     * Inclusive frame range of `renderCameraTrack` to render. Default: every
+     * frame of the track.
+     */
+    renderFrames?: [number, number];
+
+    /**
+     * Most bytes the image writer may hold GPU-resident for the scene.
+     * Scenes over it, or that the device refuses to allocate, are streamed
+     * from the source on every pass instead. Default: no limit beyond the
+     * device's binding limits.
+     */
+    renderResidentBudget?: number;
+
+    /**
+     * Draw opacity above 1 (kept by decimation) with the
+     * over-unity plateau profile. Default true; false clamps it to 1, for
+     * debugging and A/B comparison.
+     */
+    renderCompensation?: boolean;
+
+    /**
+     * Screen-space filter, in pixels², of scenes trained with anti-aliasing
+     * (splat model `antialiased`), used in place of the 0.3 px² dilation.
+     * Default 0.1.
+     */
+    renderAntiAliasFilterSize?: number;
 };
 
 /**
@@ -180,6 +270,6 @@ type Param = {
  *
  * @returns Promise resolving to a GraphicsDevice instance.
  */
-type DeviceCreator = () => Promise<import('playcanvas').GraphicsDevice>;
+type DeviceCreator = () => Promise<GraphicsDevice>;
 
 export type { CollisionMeshShape, Options, Param, DeviceCreator };

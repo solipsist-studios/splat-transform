@@ -1,14 +1,13 @@
-import { type GraphicsDevice } from 'playcanvas';
+import type { GraphicsDevice } from 'playcanvas';
 
-import {
-    bestEdgesForPartition,
-    partitionBestOut,
-    type RecostState
-} from './recost-core';
-import { MAX_GROUP, type SelectionResult } from './select';
 import { GpuRecost, COMMIT_LOG_STRIDE } from '../gpu/gpu-recost';
 
-const NIL = 0xFFFFFFFF;
+import { bestEdgesForPartition, partitionBestOut } from './recost-core';
+import type { RecostState } from './recost-core';
+import { MAX_GROUP } from './select';
+import type { SelectionResult } from './select';
+
+const NIL = 0xffffffff;
 
 /** Quality-critical maximum validated commits between refreshes. */
 const WAVE = 4096;
@@ -57,7 +56,11 @@ const planBlockMerges = async (inputs: BlockPlanInputs): Promise<BlockPlan> => {
     if (neighbors.length !== N * D) throw new Error('block plan: malformed neighbour rows');
     if (coreCount < 1 || coreCount > N) throw new Error('block plan: invalid core count');
 
-    const parent = new Uint32Array(N);
+    // Root pointers, kept exact on every commit (the losing side has at most
+    // two members to repoint), so a lookup is one read. Exposed to the eval
+    // kernel as its `parent` array: a fully-compressed union-find is a valid
+    // state for it.
+    const rootOf = new Uint32Array(N);
     const size = new Uint32Array(N);
     const version = new Uint32Array(N);
     const mHead = new Uint32Array(N);
@@ -69,7 +72,7 @@ const planBlockMerges = async (inputs: BlockPlanInputs): Promise<BlockPlan> => {
     version.fill(1);
     mNext.fill(NIL);
     for (let i = 0; i < N; i++) {
-        parent[i] = i;
+        rootOf[i] = i;
         mHead[i] = i;
         mTail[i] = i;
     }
@@ -80,21 +83,14 @@ const planBlockMerges = async (inputs: BlockPlanInputs): Promise<BlockPlan> => {
         D,
         N,
         maxGroup: MAX_GROUP,
-        parent,
+        parent: rootOf,
         size,
         version,
         mHead,
         mNext
     };
 
-    const find = (x0: number): number => {
-        let x = x0;
-        while (parent[x] !== x) {
-            parent[x] = parent[parent[x]];
-            x = parent[x];
-        }
-        return x;
-    };
+    const find = (x: number): number => rootOf[x];
 
     // Fixed reverse adjacency of the generation-input KNN rows. Only core
     // query rows exist; halo rows are immutable and never need refresh roots.
@@ -126,22 +122,35 @@ const planBlockMerges = async (inputs: BlockPlanInputs): Promise<BlockPlan> => {
     let seqCounter = 0;
 
     const swap = (i: number, j: number): void => {
-        let t = hCost[i]; hCost[i] = hCost[j]; hCost[j] = t;
-        t = hA[i]; hA[i] = hA[j]; hA[j] = t;
-        t = hB[i]; hB[i] = hB[j]; hB[j] = t;
-        t = hSeq[i]; hSeq[i] = hSeq[j]; hSeq[j] = t;
-        t = hVb[i]; hVb[i] = hVb[j]; hVb[j] = t;
+        let t = hCost[i];
+        hCost[i] = hCost[j];
+        hCost[j] = t;
+        t = hA[i];
+        hA[i] = hA[j];
+        hA[j] = t;
+        t = hB[i];
+        hB[i] = hB[j];
+        hB[j] = t;
+        t = hSeq[i];
+        hSeq[i] = hSeq[j];
+        hSeq[j] = t;
+        t = hVb[i];
+        hVb[i] = hVb[j];
+        hVb[j] = t;
         heapIndex[hA[i]] = i;
         heapIndex[hA[j]] = j;
     };
-    const less = (i: number, j: number): boolean => hCost[i] < hCost[j] ||
-        (hCost[i] === hCost[j] && (hA[i] < hA[j] || (hA[i] === hA[j] && hB[i] < hB[j])));
+    const less = (i: number, j: number): boolean =>
+        hCost[i] < hCost[j] || (hCost[i] === hCost[j] && (hA[i] < hA[j] || (hA[i] === hA[j] && hB[i] < hB[j])));
     const heapRemoveAt = (at: number): void => {
         heapIndex[hA[at]] = -1;
         heapSize--;
         if (at === heapSize) return;
-        hCost[at] = hCost[heapSize]; hA[at] = hA[heapSize]; hB[at] = hB[heapSize];
-        hSeq[at] = hSeq[heapSize]; hVb[at] = hVb[heapSize];
+        hCost[at] = hCost[heapSize];
+        hA[at] = hA[heapSize];
+        hB[at] = hB[heapSize];
+        hSeq[at] = hSeq[heapSize];
+        hVb[at] = hVb[heapSize];
         heapIndex[hA[at]] = at;
         let i = at;
         if (i > 0 && less(i, (i - 1) >> 1)) {
@@ -169,15 +178,29 @@ const planBlockMerges = async (inputs: BlockPlanInputs): Promise<BlockPlan> => {
         if (existing >= 0) heapRemoveAt(existing);
         if (heapSize === heapCap) {
             const next = heapCap * 2;
-            const nextCost = new Float32Array(next); nextCost.set(hCost); hCost = nextCost;
-            const nextA = new Uint32Array(next); nextA.set(hA); hA = nextA;
-            const nextB = new Uint32Array(next); nextB.set(hB); hB = nextB;
-            const nextSeq = new Uint32Array(next); nextSeq.set(hSeq); hSeq = nextSeq;
-            const nextVb = new Uint32Array(next); nextVb.set(hVb); hVb = nextVb;
+            const nextCost = new Float32Array(next);
+            nextCost.set(hCost);
+            hCost = nextCost;
+            const nextA = new Uint32Array(next);
+            nextA.set(hA);
+            hA = nextA;
+            const nextB = new Uint32Array(next);
+            nextB.set(hB);
+            hB = nextB;
+            const nextSeq = new Uint32Array(next);
+            nextSeq.set(hSeq);
+            hSeq = nextSeq;
+            const nextVb = new Uint32Array(next);
+            nextVb.set(hVb);
+            hVb = nextVb;
             heapCap = next;
         }
         let i = heapSize++;
-        hCost[i] = cost; hA[i] = a; hB[i] = b; hSeq[i] = seq; hVb[i] = vb;
+        hCost[i] = cost;
+        hA[i] = a;
+        hB[i] = b;
+        hSeq[i] = seq;
+        hVb[i] = vb;
         heapIndex[a] = i;
         while (i > 0) {
             const p = (i - 1) >> 1;
@@ -189,7 +212,11 @@ const planBlockMerges = async (inputs: BlockPlanInputs): Promise<BlockPlan> => {
     const popped = { cost: 0, a: 0, b: 0, seq: 0, vb: 0 };
     const heapPop = (): boolean => {
         if (heapSize === 0) return false;
-        popped.cost = hCost[0]; popped.a = hA[0]; popped.b = hB[0]; popped.seq = hSeq[0]; popped.vb = hVb[0];
+        popped.cost = hCost[0];
+        popped.a = hA[0];
+        popped.b = hB[0];
+        popped.seq = hSeq[0];
+        popped.vb = hVb[0];
         heapRemoveAt(0);
         return true;
     };
@@ -198,16 +225,24 @@ const planBlockMerges = async (inputs: BlockPlanInputs): Promise<BlockPlan> => {
     const queuedRound = new Uint32Array(coreCount);
     let pendingCount = coreCount;
     let round = 1;
-    const queueRefresh = (root0: number): void => {
-        const root = find(root0);
+    // Queuing leaves the root's heap entry in place: bumping `lastSeq` makes
+    // any pop of it before the refresh discard it as stale, and the refresh
+    // then either revalidates the entry where it sits or replaces it. Most
+    // refreshes return the same best edge, so this skips a remove + re-insert
+    // per refresh — the dominant heap cost.
+    const queueRoot = (root: number): void => {
         if (root >= coreCount) return;
         if (queuedRound[root] === round) return;
         lastSeq[root] = ++seqCounter;
-        const existing = heapIndex[root];
-        if (existing >= 0) heapRemoveAt(existing);
         queuedRound[root] = round;
         pending[pendingCount++] = root;
     };
+    const queueRefresh = (row: number): void => queueRoot(find(row));
+
+    // Scratch for one commit's invalidation walk (grown on demand).
+    let invalQ = new Uint32Array(1 << 10);
+    let invalRoot = new Uint32Array(1 << 10);
+    let invalStamp = new Uint32Array(1 << 10);
     for (let i = 0; i < coreCount; i++) {
         pending[i] = i;
         queuedRound[i] = round;
@@ -218,7 +253,7 @@ const planBlockMerges = async (inputs: BlockPlanInputs): Promise<BlockPlan> => {
     if (requireGpu && !gpuFits) {
         throw new Error(
             'multi-block adaptive decimation requires a WebGPU block working set that fits the adapter limits ' +
-            `(core ${coreCount}, halo ${N - coreCount})`
+                `(core ${coreCount}, halo ${N - coreCount})`
         );
     }
     const gpu = gpuFits ? new GpuRecost(device!, N, D, MAX_GROUP, WAVE, coreCount) : undefined;
@@ -236,17 +271,34 @@ const planBlockMerges = async (inputs: BlockPlanInputs): Promise<BlockPlan> => {
     let heapPops = 0;
     let staleHeapPops = 0;
 
-    const refreshResult = (root: number, corePartner: number, coreCost: number, haloPartner: number, haloCost: number): void => {
+    const refreshResult = (
+        root: number,
+        corePartner: number,
+        coreCost: number,
+        haloPartner: number,
+        haloCost: number
+    ): void => {
+        const existing = heapIndex[root];
         const isFrozen = haloPartner !== NIL && haloCost <= coreCost;
         if (isFrozen) {
             if (frozenState[root] === 0) frozen++;
             frozenState[root] = 1;
+            if (existing >= 0) heapRemoveAt(existing);
             return;
         }
         if (frozenState[root] !== 0) unfrozen++;
         frozenState[root] = 0;
         if (corePartner !== NIL && Number.isFinite(coreCost)) {
-            heapPush(coreCost, root, corePartner, lastSeq[root], version[corePartner]);
+            if (existing >= 0 && hCost[existing] === coreCost && hB[existing] === corePartner) {
+                // Same best edge: revalidate in place. Order is by (cost, a, b)
+                // and `a` is unique per entry, so nothing moves.
+                hSeq[existing] = lastSeq[root];
+                hVb[existing] = version[corePartner];
+            } else {
+                heapPush(coreCost, root, corePartner, lastSeq[root], version[corePartner]);
+            }
+        } else if (existing >= 0) {
+            heapRemoveAt(existing);
         }
     };
 
@@ -257,13 +309,18 @@ const planBlockMerges = async (inputs: BlockPlanInputs): Promise<BlockPlan> => {
             while (wave < WAVE && heapPop()) {
                 heapPops++;
                 const a = popped.a;
-                if (parent[a] !== a || popped.seq !== lastSeq[a]) {
+                if (rootOf[a] !== a || popped.seq !== lastSeq[a]) {
                     staleHeapPops++;
                     continue;
                 }
                 const b = popped.b;
-                if (b === a || b >= coreCount || parent[b] !== b ||
-                    version[b] !== popped.vb || size[a] + size[b] > MAX_GROUP) {
+                if (
+                    b === a ||
+                    b >= coreCount ||
+                    rootOf[b] !== b ||
+                    version[b] !== popped.vb ||
+                    size[a] + size[b] > MAX_GROUP
+                ) {
                     staleHeapPops++;
                     queueRefresh(a);
                     continue;
@@ -283,7 +340,8 @@ const planBlockMerges = async (inputs: BlockPlanInputs): Promise<BlockPlan> => {
                 }
                 mNext[mTail[keep]] = mHead[lose];
                 mTail[keep] = mTail[lose];
-                parent[lose] = keep;
+                // lose's members now end the chain, so this walk covers exactly them.
+                for (let m = mHead[lose]; m !== NIL; m = mNext[m]) rootOf[m] = keep;
                 size[keep] += size[lose];
                 version[keep]++;
                 planPairs.push(a, b);
@@ -293,11 +351,28 @@ const planBlockMerges = async (inputs: BlockPlanInputs): Promise<BlockPlan> => {
                 queueRefresh(keep);
                 // Any root whose fixed pool references a changed member may
                 // have a different core/halo minimum, including frozen roots.
+                // Walked in passes — rows, then their roots, then the roots'
+                // round stamps — so each pass is a run of independent random
+                // reads that overlap in the memory system, instead of one
+                // dependent miss chain per row. Same row order and same dedup
+                // as queuing row by row, so the pending list is identical.
+                let n = 0;
+                for (let m = mHead[keep]; m !== NIL; m = mNext[m]) n += reverseOffsets[m + 1] - reverseOffsets[m];
+                if (n > invalQ.length) {
+                    const cap = Math.max(n, invalQ.length * 2);
+                    invalQ = new Uint32Array(cap);
+                    invalRoot = new Uint32Array(cap);
+                    invalStamp = new Uint32Array(cap);
+                }
+                n = 0;
                 for (let m = mHead[keep]; m !== NIL; m = mNext[m]) {
-                    for (let r = reverseOffsets[m]; r < reverseOffsets[m + 1]; r++) {
-                        reverseInvalidations++;
-                        queueRefresh(reverseRows[r]);
-                    }
+                    for (let r = reverseOffsets[m]; r < reverseOffsets[m + 1]; r++) invalQ[n++] = reverseRows[r];
+                }
+                reverseInvalidations += n;
+                for (let i = 0; i < n; i++) invalRoot[i] = rootOf[invalQ[i]];
+                for (let i = 0; i < n; i++) invalStamp[i] = queuedRound[invalRoot[i]];
+                for (let i = 0; i < n; i++) {
+                    if (invalStamp[i] !== round) queueRoot(invalRoot[i]);
                 }
             }
 
@@ -310,7 +385,7 @@ const planBlockMerges = async (inputs: BlockPlanInputs): Promise<BlockPlan> => {
                 await gpu.wave(commitLog!, wave, pending, pendingCount, outBest!);
                 for (let p = 0; p < pendingCount; p++) {
                     const root = pending[p];
-                    if (parent[root] !== root) continue;
+                    if (rootOf[root] !== root) continue;
                     const o = p * gpu.outputStride;
                     refreshResult(
                         root,
@@ -323,7 +398,7 @@ const planBlockMerges = async (inputs: BlockPlanInputs): Promise<BlockPlan> => {
             } else {
                 for (let p = 0; p < pendingCount; p++) {
                     const root = pending[p];
-                    if (parent[root] !== root) continue;
+                    if (rootOf[root] !== root) continue;
                     bestEdgesForPartition(st, root, coreCount);
                     refreshResult(
                         root,
@@ -420,11 +495,4 @@ const replayBlockPlan = (coreCount: number, plan: BlockPlan): SelectionResult =>
     };
 };
 
-export {
-    planBlockMerges,
-    replayBlockPlan,
-    WAVE,
-    type BlockPlan,
-    type BlockPlanDiagnostics,
-    type BlockPlanInputs
-};
+export { planBlockMerges, replayBlockPlan, WAVE, type BlockPlan, type BlockPlanDiagnostics, type BlockPlanInputs };

@@ -1,4 +1,4 @@
-import { type FileSystem, type Writer } from './file-system';
+import type { FileSystem, Writer } from './file-system';
 
 // write data to a memory buffer
 class MemoryWriter implements Writer {
@@ -69,14 +69,14 @@ class MemoryWriter implements Writer {
  * @example
  * ```ts
  * const fs = new MemoryFileSystem();
- * await writeFile({ filename: 'output.ply', ... }, fs);
+ * await writeSource({ filename: 'output.ply', outputFormat: 'ply', source, pool, options: {} }, fs);
  *
  * // Get the generated data
  * const data = fs.results.get('output.ply');
  * ```
  */
 class MemoryFileSystem implements FileSystem {
-    results: Map<string, Uint8Array> = new Map();
+    results = new Map<string, Uint8Array>();
 
     createWriter(filename: string): Writer {
         return new MemoryWriter((result: Uint8Array[]) => {

@@ -14,9 +14,9 @@ class WebPCodec {
      */
     static wasmUrl: string | null = null;
 
-    private static modulePromise: Promise<any> | null = null;
+    private static modulePromise: ReturnType<typeof createModule> | null = null;
 
-    Module: any;
+    Module: Awaited<ReturnType<typeof createModule>>;
 
     /**
      * The effective webp.wasm location to hand to worker threads (which can't
@@ -60,8 +60,25 @@ class WebPCodec {
         return instance;
     }
 
-    encodeLosslessRGBA(rgba: Uint8Array, width: number, height: number, stride = width * 4) {
+    /**
+     * Encode RGBA pixels as a lossless WebP.
+     *
+     * @param rgba - Pixels, `height` rows of `stride` bytes.
+     * @param width - Image width.
+     * @param height - Image height.
+     * @param stride - Row stride in bytes. Default: `width * 4`.
+     * @param effort - Compression effort 0–9. Higher levels spend more time
+     * trying to reduce file size. Omit to use the default libwebp lossless encoder.
+     * Explicit levels also preserve RGB values in fully transparent pixels;
+     * the default WebP encoder may discard those invisible values.
+     * @returns The encoded WebP bytes.
+     */
+    encodeLosslessRGBA(rgba: Uint8Array, width: number, height: number, stride = width * 4, effort?: number) {
         const { Module } = this;
+
+        if (effort !== undefined && (!Number.isInteger(effort) || effort < 0 || effort > 9)) {
+            throw new Error(`WebP lossless effort must be an integer in [0, 9], got ${effort}`);
+        }
 
         const inPtr = Module._malloc(rgba.length);
         const outPtrPtr = Module._malloc(4);
@@ -69,7 +86,10 @@ class WebPCodec {
 
         Module.HEAPU8.set(rgba, inPtr);
 
-        const ok = Module._webp_encode_lossless_rgba(inPtr, width, height, stride, outPtrPtr, outSizePtr);
+        const ok =
+            effort === undefined
+                ? Module._webp_encode_lossless_rgba(inPtr, width, height, stride, outPtrPtr, outSizePtr)
+                : Module._webp_encode_lossless_rgba_level(inPtr, width, height, stride, effort, outPtrPtr, outSizePtr);
         if (!ok) {
             throw new Error('WebP lossless encode failed');
         }
@@ -79,12 +99,14 @@ class WebPCodec {
         const bytes = Module.HEAPU8.slice(outPtr, outPtr + outSize);
 
         Module._webp_free(outPtr);
-        Module._free(inPtr); Module._free(outPtrPtr); Module._free(outSizePtr);
+        Module._free(inPtr);
+        Module._free(outPtrPtr);
+        Module._free(outSizePtr);
 
         return bytes;
     }
 
-    decodeRGBA(webp: Uint8Array): { rgba: Uint8Array, width: number, height: number } {
+    decodeRGBA(webp: Uint8Array): { rgba: Uint8Array; width: number; height: number } {
         const { Module } = this;
 
         const input = webp;
@@ -98,7 +120,10 @@ class WebPCodec {
 
         const ok = Module._webp_decode_rgba(inPtr, input.length, outPtrPtr, widthPtr, heightPtr);
         if (!ok) {
-            Module._free(inPtr); Module._free(outPtrPtr); Module._free(widthPtr); Module._free(heightPtr);
+            Module._free(inPtr);
+            Module._free(outPtrPtr);
+            Module._free(widthPtr);
+            Module._free(heightPtr);
             throw new Error('WebP decode failed');
         }
 
@@ -109,7 +134,10 @@ class WebPCodec {
         const bytes = Module.HEAPU8.slice(outPtr, outPtr + size);
 
         Module._webp_free(outPtr);
-        Module._free(inPtr); Module._free(outPtrPtr); Module._free(widthPtr); Module._free(heightPtr);
+        Module._free(inPtr);
+        Module._free(outPtrPtr);
+        Module._free(widthPtr);
+        Module._free(heightPtr);
 
         return { rgba: bytes, width, height };
     }

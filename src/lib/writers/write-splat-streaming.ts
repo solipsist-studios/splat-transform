@@ -1,5 +1,5 @@
-import { type ChunkDataPool, type ChunkSource } from '../chunk';
-import { type FileSystem } from '../io/write';
+import type { ChunkDataPool, ChunkSource } from '../chunk';
+import type { FileSystem } from '../io/write';
 import { bakeTransform } from '../ops';
 import { logger, Transform } from '../utils';
 
@@ -60,11 +60,11 @@ const writeSplatStreaming = async (
 
             await baked.read({ chunkIndex: k, position: pos, geometric: geo, color: col });
 
-            const P = pos.field('position');   // count × 3
-            const R = geo.field('rotation');   // count × 4
-            const S = geo.field('scale');      // count × 3
-            const O = geo.field('opacity');    // count × 1
-            const C = col.field('dc');         // count × 3
+            const P = pos.field('position'); // count × 3
+            const R = geo.field('rotation'); // count × 4
+            const S = geo.field('scale'); // count × 3
+            const O = geo.field('opacity'); // count × 1
+            const C = col.field('dc'); // count × 3
 
             for (let i = 0; i < count; i++) {
                 const off = i * 32;
@@ -79,12 +79,20 @@ const writeSplatStreaming = async (
                 dv.setUint8(off + 24, clamp((0.5 + C[i * 3 + 0] * SH_C0) * 255));
                 dv.setUint8(off + 25, clamp((0.5 + C[i * 3 + 1] * SH_C0) * 255));
                 dv.setUint8(off + 26, clamp((0.5 + C[i * 3 + 2] * SH_C0) * 255));
-                dv.setUint8(off + 27, clamp((1 / (1 + Math.exp(-O[i]))) * 255));
+                dv.setUint8(off + 27, clamp(O[i] * 255)); // true opacity, clamped to 1
 
-                dv.setUint8(off + 28, clamp(R[i * 4 + 0] * 128 + 128));
-                dv.setUint8(off + 29, clamp(R[i * 4 + 1] * 128 + 128));
-                dv.setUint8(off + 30, clamp(R[i * 4 + 2] * 128 + 128));
-                dv.setUint8(off + 31, clamp(R[i * 4 + 3] * 128 + 128));
+                // rot_* are not necessarily unit length; normalize before
+                // quantizing so components beyond +-1 are not clamped
+                const r0 = R[i * 4 + 0],
+                    r1 = R[i * 4 + 1],
+                    r2 = R[i * 4 + 2],
+                    r3 = R[i * 4 + 3];
+                const len = Math.sqrt(r0 * r0 + r1 * r1 + r2 * r2 + r3 * r3);
+                const rs = len > 0 ? 128 / len : 0;
+                dv.setUint8(off + 28, clamp(r0 * rs + 128));
+                dv.setUint8(off + 29, clamp(r1 * rs + 128));
+                dv.setUint8(off + 30, clamp(r2 * rs + 128));
+                dv.setUint8(off + 31, clamp(r3 * rs + 128));
             }
 
             await writer.write(record.subarray(0, count * 32));

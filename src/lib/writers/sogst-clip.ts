@@ -18,7 +18,10 @@ type SogstClip = {
 };
 
 const parseFloats = (value: string) => {
-    return value.split(/\s+/).filter(v => v.length > 0).map(Number);
+    return value
+        .split(/\s+/)
+        .filter((v) => v.length > 0)
+        .map(Number);
 };
 
 /**
@@ -116,7 +119,9 @@ const requireSogstClip = (clip: Partial<SogstClip>): SogstClip => {
     }
 
     if (problems.length > 0) {
-        throw new Error(`sogst output requires clip scalars: ${problems.join(', ')}. Expected 'comment sogst.time_min', 'comment sogst.time_max' and 'comment sogst.fps' in the input PLY header, or explicit overrides.`);
+        throw new Error(
+            `sogst output requires clip scalars: ${problems.join(', ')}. Expected 'comment sogst.time_min', 'comment sogst.time_max' and 'comment sogst.fps' in the input PLY header, or explicit overrides.`
+        );
     }
 
     return clip as SogstClip;

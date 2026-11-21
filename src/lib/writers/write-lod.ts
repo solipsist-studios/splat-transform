@@ -1,23 +1,26 @@
 import { basename, dirname, resolve } from 'pathe';
 import { BoundingBox, Mat4, Quat, Vec3 } from 'playcanvas';
 
-import { logWrittenFile } from './utils';
-import { writeSogSource } from './write-sog.js';
-import { type ChunkDataPool, type ChunkSource, type ReadRequest, createChunkDataPool } from '../chunk';
+import { createChunkDataPool } from '../chunk';
+import type { ChunkDataPool, ChunkSource, ReadRequest } from '../chunk';
 import { Column, DataTable } from '../data-table';
-import {
-    EPS_COV, det3, ellipsoidArea, quatToRotmat, sigmaFromRotVar, sigmoid, type SplatView
-} from '../decimate/moment-match';
-import { type FileSystem } from '../io/write';
+import type { FileSystem } from '../io/write';
 import { bakeTransform, permuteSource, sortMortonColumns } from '../ops';
-import { BTreeNode, BTree } from '../spatial';
+import type { BTreeNode } from '../spatial';
+import { BTree } from '../spatial';
+import type { SplatModel } from '../splat-model';
 import type { DeviceCreator } from '../types';
 import { logger, Transform } from '../utils';
+import type { SogBlindTexture } from '../utils/sog-blind';
 import { version } from '../version';
 
+import { logWrittenFile } from './utils';
+import { finishSogWrite, startSogWrite, writeSogSource } from './write-sog.js';
+import type { SogVersion } from './write-sog.js';
+
 type Aabb = {
-    min: number[],
-    max: number[]
+    min: number[];
+    max: number[];
 };
 
 type MetaLod = {
@@ -29,8 +32,7 @@ type MetaLod = {
 type MetaNode = {
     bound: Aabb;
     children?: MetaNode[];
-    lods?: { [key: number]: MetaLod };
-    errors?: number[];
+    lods?: Record<number, MetaLod>;
 };
 
 type LodMeta = {
@@ -39,21 +41,27 @@ type LodMeta = {
         generator: string;
         /** Gaussians per file unit the partition aimed for (`--lod-chunk-count` × 1024). */
         chunkGaussians: number;
-        /** Largest leaf extent the partition allowed, in world units (`--lod-chunk-extent`). */
+        /**
+         * Largest leaf extent the partition allowed, in world units (`--lod-chunk-extent`),
+         * for leaves holding more than `chunkMinGaussians`.
+         */
         chunkExtent: number;
+        /**
+         * Gaussians below which a leaf was not split for extent (`--lod-chunk-min` × 1024).
+         * Sparser regions form leaves as wide as they need to be to hold this many.
+         */
+        chunkMinGaussians: number;
     };
     count: number;
+    /** How the scene was trained, for all its files; omitted for `default`, as in SOG `meta.json`. */
+    model?: SplatModel;
     counts: number[];
     lodLevels: number;
-    /**
-     * Whether every leaf carries an `errors` table. Declared here so a consumer
-     * can pick its LOD allocation strategy up front instead of searching the tree
-     * for the field (the engine's budget balancer needs exactly this answer).
-     */
-    lodErrors: boolean;
     environment?: string;
     filenames: string[];
     tree: MetaNode;
+    extras?: unknown;
+    comments?: readonly string[];
 };
 
 const boundUnion = (result: Aabb, a: Aabb, b: Aabb) => {
@@ -79,7 +87,9 @@ const boundUnion = (result: Aabb, a: Aabb, b: Aabb) => {
  * SH degree — the point of the streaming LOD writer for very large scenes.
  */
 type SlimColumns = {
-    x: Float32Array; y: Float32Array; z: Float32Array;
+    x: Float32Array;
+    y: Float32Array;
+    z: Float32Array;
 };
 
 /**
@@ -105,14 +115,18 @@ const positionsFromSlim = (parent: ChunkSource, slim: SlimColumns, flat: Uint32A
             const { indices, indexOffset, count } = request;
             for (let j = 0; j < count; j++) {
                 const g = flat[indices[indexOffset + j]];
-                out[j * 3] = slim.x[g]; out[j * 3 + 1] = slim.y[g]; out[j * 3 + 2] = slim.z[g];
+                out[j * 3] = slim.x[g];
+                out[j * 3 + 1] = slim.y[g];
+                out[j * 3 + 2] = slim.z[g];
             }
         } else {
             const base = request.chunkIndex * chunkSize;
             const count = Math.min(chunkSize, flat.length - base);
             for (let j = 0; j < count; j++) {
                 const g = flat[base + j];
-                out[j * 3] = slim.x[g]; out[j * 3 + 1] = slim.y[g]; out[j * 3 + 2] = slim.z[g];
+                out[j * 3] = slim.x[g];
+                out[j * 3 + 1] = slim.y[g];
+                out[j * 3 + 2] = slim.z[g];
             }
         }
         if (request.geometric || request.color || request.other) {
@@ -127,8 +141,12 @@ const positionsFromSlim = (parent: ChunkSource, slim: SlimColumns, flat: Uint32A
 // pass can run over gathered batches; the math mirrors the legacy per-gaussian
 // path exactly (quaternion order (rot_1, rot_2, rot_3, rot_0); scale = exp).
 const accumulateBound = (
-    min: number[], max: number[],
-    pos: Float32Array, rot: Float32Array, scale: Float32Array, count: number
+    min: number[],
+    max: number[],
+    pos: Float32Array,
+    rot: Float32Array,
+    scale: Float32Array,
+    count: number
 ): void => {
     const p = new Vec3();
     const r = new Quat();
@@ -165,22 +183,20 @@ const accumulateBound = (
     }
 };
 
-const invalidGaussian = (lod: number, row: number, what: string): Error => new Error(
-    `LOD ${lod} gaussian ${row} has ${what}; ` +
-    'run --filter-nan to drop invalid gaussians before writing LODs'
-);
+const invalidGaussian = (lod: number, row: number, what: string): Error =>
+    new Error(
+        `LOD ${lod} gaussian ${row} has ${what}; ` + 'run --filter-nan to drop invalid gaussians before writing LODs'
+    );
 
 /**
  * Reject a batch of gaussians whose geometry is not finite. The bounds pass reads
- * every gaussian's geometric record once, so this covers the whole scene:
- * everything downstream — the error metric above all, whose footprint mass runs
- * through `sigmoid`/`exp` — may then assume finite input rather than each stage
- * carrying its own opinion about invalid data. {@link assertFiniteColor} does the
- * same for the layer this pass does not read.
+ * every gaussian's record once, so this covers the whole scene: everything
+ * downstream may then assume finite input rather than each stage carrying its own
+ * opinion about invalid data. {@link assertFiniteColor} does the same for the colour layer.
  *
- * The rules mirror `filterNaNRows`, including its two deliberate exceptions
- * (`scale_*` may be `-Infinity`, `opacity` may be `+Infinity`, both harmless
- * here), so anything `--filter-nan` keeps is accepted.
+ * The rules mirror `filterNaNRows`, including its deliberate exception
+ * (`scale_*` may be `-Infinity`, harmless here), so anything `--filter-nan`
+ * keeps is accepted.
  *
  * @param pos - Packed xyz for the batch.
  * @param geo - Packed 8-float geometric records for the batch.
@@ -190,8 +206,12 @@ const invalidGaussian = (lod: number, row: number, what: string): Error => new E
  * @param lod - Structural LOD the batch was read from.
  */
 const assertFiniteGeometry = (
-    pos: Float32Array, geo: Float32Array, count: number,
-    rows: Uint32Array, offset: number, lod: number
+    pos: Float32Array,
+    geo: Float32Array,
+    count: number,
+    rows: Uint32Array,
+    offset: number,
+    lod: number
 ): void => {
     const reject = (i: number, what: string) => {
         throw invalidGaussian(lod, rows[offset + i], what);
@@ -214,8 +234,38 @@ const assertFiniteGeometry = (
             const v = geo[o + e];
             if (!isFinite(v) && v !== -Infinity) reject(i, 'a non-finite scale');
         }
-        const opacity = geo[o + 7];
-        if (!isFinite(opacity) && opacity !== Infinity) reject(i, 'a non-finite opacity');
+        if (!isFinite(geo[o + 7])) reject(i, 'a non-finite opacity');
+    }
+};
+
+/**
+ * Reject a batch of gaussians whose color or stored SH is not finite — the
+ * companion to {@link assertFiniteGeometry}, run on the same bounds-pass read so
+ * the whole scene is covered. A non-finite coefficient would corrupt the SOG
+ * colour codebooks, so it is refused up front like invalid geometry.
+ *
+ * @param color - Packed color/SH records for the batch.
+ * @param count - Gaussians in the batch.
+ * @param colorDim - Floats per gaussian (3 + stored SH).
+ * @param rows - Rows local to `lod`, indexed from `offset`, for error messages.
+ * @param offset - Index of the batch's first row within `rows`.
+ * @param lod - Structural LOD the batch was read from.
+ */
+const assertFiniteColor = (
+    color: Float32Array,
+    count: number,
+    colorDim: number,
+    rows: Uint32Array,
+    offset: number,
+    lod: number
+): void => {
+    for (let i = 0; i < count; i++) {
+        const base = i * colorDim;
+        for (let c = 0; c < colorDim; c++) {
+            if (!isFinite(color[base + c])) {
+                throw invalidGaussian(lod, rows[offset + i], 'a non-finite color or SH coefficient');
+            }
+        }
     }
 };
 
@@ -223,9 +273,13 @@ const assertFiniteGeometry = (
 // but rotation/scale are gathered from the source by index so the geometric layer
 // is never wholly resident — the bounds-pass analog of the per-unit heavy gather.
 // `bins` maps LOD -> flat analysis indices; each is gathered from its own LOD
-// (flat index `g` -> local row `g - cum[lod]`).
+// (flat index `g` -> local row `g - cum[lod]`). The colour layer rides along on
+// the same record read purely to be validated.
 const calcBound = async (
-    source: ChunkSource, pool: ChunkDataPool, bins: Map<number, Uint32Array>, cum: number[],
+    source: ChunkSource,
+    pool: ChunkDataPool,
+    bins: Map<number, Uint32Array>,
+    cum: number[],
     tick?: (n: number) => void
 ): Promise<Aabb> => {
     const min = [Infinity, Infinity, Infinity];
@@ -233,6 +287,7 @@ const calcBound = async (
 
     const batch = pool.chunkSize;
     const { layouts } = source.meta;
+    const colorDim = layouts.color!.stride >> 2;
 
     for (const [lodValue, flat] of bins) {
         const base = cum[lodValue];
@@ -243,15 +298,24 @@ const calcBound = async (
             const count = Math.min(batch, local.length - off);
             const pos = pool.acquire('position', layouts.position!, count);
             const geo = pool.acquire('geometric', layouts.geometric!, count);
-            await source.read({ indices: local, indexOffset: off, count, lod: lodValue, position: pos, geometric: geo });
+            const color = pool.acquire('color', layouts.color!, count);
+            await source.read({
+                indices: local,
+                indexOffset: off,
+                count,
+                lod: lodValue,
+                position: pos,
+                geometric: geo,
+                color
+            });
             // position is full-stride packed xyz — read the pool buffer in place
             // rather than copying it out per batch
             const posBatch = new Float32Array(pos.data, 0, count * 3);
-            assertFiniteGeometry(
-                posBatch, new Float32Array(geo.data, 0, count * 8), count, local, off, lodValue
-            );
+            assertFiniteGeometry(posBatch, new Float32Array(geo.data, 0, count * 8), count, local, off, lodValue);
+            assertFiniteColor(new Float32Array(color.data, 0, count * colorDim), count, colorDim, local, off, lodValue);
             accumulateBound(
-                min, max,
+                min,
+                max,
                 posBatch,
                 geo.field('rotation') as Float32Array,
                 geo.field('scale') as Float32Array,
@@ -259,6 +323,7 @@ const calcBound = async (
             );
             pos.release();
             geo.release();
+            color.release();
             tick?.(count);
         }
     }
@@ -313,491 +378,6 @@ const binIndices = (parent: BTreeNode, lodOf: (index: number) => number): Map<nu
     return result;
 };
 
-const distanceToAabbSq = (node: BTreeNode, x: number, y: number, z: number): number => {
-    const { min, max } = node.aabb;
-    const dx = x < min[0] ? min[0] - x : x > max[0] ? x - max[0] : 0;
-    const dy = y < min[1] ? min[1] - y : y > max[1] ? y - max[1] : 0;
-    const dz = z < min[2] ? min[2] - z : z > max[2] ? z - max[2] : 0;
-    return dx * dx + dy * dy + dz * dz;
-};
-
-/**
- * The k nearest candidates of each of several structural LODs to every query, in
- * center space — one traversal per query, serving every LOD.
- *
- * `ranges` holds `[lo, hi)` per LOD in flat analysis index space: LOD is
- * structural, so a level's gaussians are exactly one contiguous index range and
- * the level test is two comparisons rather than a lookup. Sharing the traversal
- * is what makes the error pass affordable — every splat of the reference level is
- * matched against every coarser level, so searching them separately would repeat
- * the same descent once per level.
- *
- * A node is descended while any level can still improve on it, and a leaf's
- * candidates are examined for a level only when that level's own k-th distance
- * says they could, so each level's result is identical to a search of its own.
- * Each node's distance is computed once, by its parent, and passed in.
- *
- * @param root - Root of the tree to search.
- * @param slim - Resident position columns.
- * @param queries - Flat analysis indices to search from.
- * @param ranges - Flat `[lo, hi)` pairs, one per LOD to match against.
- * @param k - Neighbours per query per LOD.
- * @returns Per LOD, `k` flat indices per query, nearest first, `-1` for none.
- */
-const findNearest = (
-    root: BTreeNode, slim: SlimColumns, queries: Uint32Array, ranges: Int32Array, k: number
-): Int32Array[] => {
-    const targets = ranges.length >> 1;
-    const results: Int32Array[] = [];
-    for (let t = 0; t < targets; t++) {
-        const result = new Int32Array(queries.length * k);
-        result.fill(-1);
-        results.push(result);
-    }
-    const distances = new Float64Array(targets * k);
-    const targetK = new Int32Array(targets);
-    for (let t = 0; t < targets; t++) {
-        targetK[t] = Math.min(k, ranges[2 * t + 1] - ranges[2 * t]);
-    }
-
-    const px = slim.x, py = slim.y, pz = slim.z;
-
-    // Per-query state lives out here so the traversal is one function compiled
-    // once, not a fresh closure allocated per query.
-    let x = 0, y = 0, z = 0;
-    let output = 0;
-
-    // the walk can stop where no level can improve: the largest k-th distance
-    let radius = Infinity;
-
-    const visit = (node: BTreeNode, distance: number): void => {
-        if (distance > radius) return;
-
-        const { indices } = node;
-        if (indices) {
-            for (let t = 0; t < targets; t++) {
-                const base = t * k;
-                const worst = base + targetK[t] - 1;
-                if (distance > distances[worst]) continue;
-
-                const lo = ranges[2 * t];
-                const hi = ranges[2 * t + 1];
-                const result = results[t];
-                for (let i = 0; i < indices.length; i++) {
-                    const candidate = indices[i];
-                    if (candidate < lo || candidate >= hi) continue;
-                    const dx = px[candidate] - x;
-                    const dy = py[candidate] - y;
-                    const dz = pz[candidate] - z;
-                    const d = dx * dx + dy * dy + dz * dz;
-                    if (d >= distances[worst]) continue;
-
-                    let insert = targetK[t] - 1;
-                    while (insert > 0 && d < distances[base + insert - 1]) {
-                        distances[base + insert] = distances[base + insert - 1];
-                        result[output + insert] = result[output + insert - 1];
-                        insert--;
-                    }
-                    distances[base + insert] = d;
-                    result[output + insert] = candidate;
-                }
-            }
-
-            radius = 0;
-            for (let t = 0; t < targets; t++) {
-                const d = distances[t * k + targetK[t] - 1];
-                if (d > radius) radius = d;
-            }
-            return;
-        }
-
-        const left = node.left!;
-        const right = node.right!;
-        const dl = distanceToAabbSq(left, x, y, z);
-        const dr = distanceToAabbSq(right, x, y, z);
-        if (dl <= dr) {
-            visit(left, dl);
-            visit(right, dr);
-        } else {
-            visit(right, dr);
-            visit(left, dl);
-        }
-    };
-
-    for (let q = 0; q < queries.length; q++) {
-        distances.fill(Infinity);
-        const g = queries[q];
-        x = px[g]; y = py[g]; z = pz[g];
-        output = q * k;
-        radius = Infinity;
-        visit(root, distanceToAabbSq(root, x, y, z));
-    }
-
-    return results;
-};
-
-const uniqueGlobals = (queries: Uint32Array, neighbourSets: Int32Array[]): Uint32Array => {
-    let capacity = queries.length;
-    for (const neighbours of neighbourSets) capacity += neighbours.length;
-    const combined = new Uint32Array(capacity);
-    combined.set(queries);
-    let count = queries.length;
-    for (const neighbours of neighbourSets) {
-        for (let i = 0; i < neighbours.length; i++) {
-            if (neighbours[i] >= 0) combined[count++] = neighbours[i];
-        }
-    }
-    const sorted = combined.subarray(0, count);
-    sorted.sort();
-    let unique = 0;
-    for (let i = 0; i < sorted.length; i++) {
-        if (i === 0 || sorted[i] !== sorted[i - 1]) sorted[unique++] = sorted[i];
-    }
-    return sorted.slice(0, unique);
-};
-
-const indexOfSorted = (values: Uint32Array, value: number): number => {
-    let lo = 0;
-    let hi = values.length - 1;
-    while (lo <= hi) {
-        const mid = (lo + hi) >>> 1;
-        const candidate = values[mid];
-        if (candidate < value) lo = mid + 1;
-        else if (candidate > value) hi = mid - 1;
-        else return mid;
-    }
-    return -1;
-};
-
-/**
- * Reject a batch of gaussians whose color or stored SH is not finite — the
- * companion to {@link assertFiniteGeometry} for the layer the bounds pass does not
- * read. A single non-finite coefficient makes {@link splatError} return `NaN` for
- * every pair the splat takes part in, and `directional` discards `NaN` matches, so
- * a level would report *less* error the more of it is broken. Coverage is again
- * the whole scene: every gaussian of a leaf is gathered as its own level's query.
- *
- * @param color - Packed color/SH records for the batch.
- * @param count - Gaussians in the batch.
- * @param colorDim - Floats per gaussian (3 + stored SH).
- * @param rows - Rows local to `lod`, indexed from `offset`, for error messages.
- * @param offset - Index of the batch's first row within `rows`.
- * @param lod - Structural LOD the batch was read from.
- */
-const assertFiniteColor = (
-    color: Float32Array, count: number, colorDim: number,
-    rows: Uint32Array, offset: number, lod: number
-): void => {
-    for (let i = 0; i < count; i++) {
-        const base = i * colorDim;
-        for (let c = 0; c < colorDim; c++) {
-            if (!isFinite(color[base + c])) {
-                throw invalidGaussian(lod, rows[offset + i], 'a non-finite color or SH coefficient');
-            }
-        }
-    }
-};
-
-const gatherView = async (
-    source: ChunkSource, pool: ChunkDataPool, slim: SlimColumns,
-    globals: Uint32Array, lod: number, base: number
-): Promise<SplatView> => {
-    const { layouts } = source.meta;
-    const colorDim = layouts.color!.stride >> 2;
-    const view: SplatView = {
-        pos: new Float32Array(globals.length * 3),
-        geo: new Float32Array(globals.length * 8),
-        color: new Float32Array(globals.length * colorDim),
-        colorDim
-    };
-    const local = new Uint32Array(globals.length);
-    for (let i = 0; i < globals.length; i++) {
-        const g = globals[i];
-        local[i] = g - base;
-        view.pos[i * 3] = slim.x[g];
-        view.pos[i * 3 + 1] = slim.y[g];
-        view.pos[i * 3 + 2] = slim.z[g];
-    }
-
-    for (let off = 0; off < local.length; off += pool.chunkSize) {
-        const count = Math.min(pool.chunkSize, local.length - off);
-        const geo = pool.acquire('geometric', layouts.geometric!, count);
-        const color = pool.acquire('color', layouts.color!, count);
-        await source.read({ indices: local, indexOffset: off, count, lod, geometric: geo, color });
-        const colorBatch = new Float32Array(color.data, 0, count * colorDim);
-        assertFiniteColor(colorBatch, count, colorDim, local, off, lod);
-        view.geo.set(new Float32Array(geo.data, 0, count * 8), off * 8);
-        view.color.set(colorBatch, off * colorDim);
-        geo.release();
-        color.release();
-    }
-
-    return view;
-};
-
-const concatViews = (views: SplatView[]): SplatView => {
-    const { colorDim } = views[0];
-    let count = 0;
-    for (const v of views) count += v.pos.length / 3;
-    const result: SplatView = {
-        pos: new Float32Array(count * 3),
-        geo: new Float32Array(count * 8),
-        color: new Float32Array(count * colorDim),
-        colorDim
-    };
-    let row = 0;
-    for (const v of views) {
-        result.pos.set(v.pos, row * 3);
-        result.geo.set(v.geo, row * 8);
-        result.color.set(v.color, row * colorDim);
-        row += v.pos.length / 3;
-    }
-    return result;
-};
-
-const PI_1_5 = Math.PI ** 1.5;
-const TWO_PI_1_5 = (2 * Math.PI) ** 1.5;
-
-/**
- * Per-splat terms of the field-L2: the covariance, the footprint mass used to
- * weight it, the gaussian's opacity, sqrt(det sigma), and its self inner product
- * <f, f> = alpha^2 * pi^1.5 * sqrt(det sigma).
- *
- * `sigma` and `mass` are what the decimator's `buildCostCache` computes (same
- * math, same f32 storage, so the same values); the rest of that cache serves the
- * MC-KL edge cost, which this path does not evaluate, so it is not built here.
- */
-type ErrorCache = {
-    sigma: Float32Array;
-    mass: Float32Array;
-    alpha: Float64Array;
-    sqrtDet: Float64Array;
-    self: Float64Array;
-};
-
-const buildErrorCache = (view: SplatView): ErrorCache => {
-    const { geo } = view;
-    const n = geo.length / 8;
-    const sigma = new Float32Array(n * 9);
-    const mass = new Float32Array(n);
-    const alpha = new Float64Array(n);
-    const sqrtDet = new Float64Array(n);
-    const self = new Float64Array(n);
-    const rot = new Float32Array(9);
-
-    for (let i = 0; i < n; i++) {
-        const i8 = 8 * i;
-        const i9 = 9 * i;
-
-        const linAlpha = sigmoid(geo[i8 + 7]);
-        const sx = Math.max(Math.exp(geo[i8 + 4]), 1e-12);
-        const sy = Math.max(Math.exp(geo[i8 + 5]), 1e-12);
-        const sz = Math.max(Math.exp(geo[i8 + 6]), 1e-12);
-
-        let qw = geo[i8], qx = geo[i8 + 1], qy = geo[i8 + 2], qz = geo[i8 + 3];
-        const invq = 1 / Math.max(Math.hypot(qw, qx, qy, qz), 1e-12);
-        qw *= invq; qx *= invq; qy *= invq; qz *= invq;
-
-        quatToRotmat(qw, qx, qy, qz, rot, 0);
-        sigmaFromRotVar(rot, 0, sx * sx + EPS_COV, sy * sy + EPS_COV, sz * sz + EPS_COV, sigma, i9);
-
-        const root = Math.sqrt(Math.max(det3(sigma, i9), 1e-300));
-        alpha[i] = linAlpha;
-        sqrtDet[i] = root;
-        self[i] = linAlpha * linAlpha * PI_1_5 * root;
-        mass[i] = linAlpha * ellipsoidArea(sx, sy, sz) + 1e-12;
-    }
-
-    return { sigma, mass, alpha, sqrtDet, self };
-};
-
-const sumScratch = new Float64Array(9);
-
-/**
- * Approximation error between two splats: the relative field-L2 of the density
- * each one paints plus the stored-SH L2.
- *
- * Writing f(x) = alpha * exp(-0.5 (x-mu)^T sigma^-1 (x-mu)), every inner product
- * <f_i, f_j> is closed form, so
- *
- *   ||f_i - f_j||^2 / (||f_i||^2 + ||f_j||^2)
- *
- * is exact: zero only for identical splats, monotone in their separation, and
- * bounded by 1 once they no longer overlap. The decimator's edge cost is not
- * usable here — as a one-sample MC estimate of a KL it carries ~1.2 nats of
- * noise, far more than the error a well-decimated leaf actually has, and it is
- * blind to opacity (alpha only sets the merge weights there).
- *
- * Both terms are non-negative, so a pair whose geometric term alone already
- * reaches `cutoff` cannot beat it: `Infinity` is returned without summing the SH
- * coefficients, which is the bulk of the arithmetic at 3 SH bands.
- *
- * @param view - Splat columns.
- * @param cache - Per-splat cache from {@link buildErrorCache}.
- * @param i - First splat (view row).
- * @param j - Second splat (view row).
- * @param cutoff - Error to beat; pass `Infinity` for the unconditional error.
- * @returns The error, zero when the two splats are identical.
- */
-const splatError = (
-    view: SplatView, cache: ErrorCache, i: number, j: number, cutoff: number
-): number => {
-    const s = sumScratch;
-    const i9 = 9 * i, j9 = 9 * j;
-    for (let a = 0; a < 9; a++) s[a] = cache.sigma[i9 + a] + cache.sigma[j9 + a];
-    const detS = Math.max(det3(s, 0), 1e-300);
-
-    // d^T (sigma_i + sigma_j)^-1 d, via the adjugate (symmetric, so no transpose)
-    const { pos } = view;
-    const dx = pos[3 * i] - pos[3 * j];
-    const dy = pos[3 * i + 1] - pos[3 * j + 1];
-    const dz = pos[3 * i + 2] - pos[3 * j + 2];
-    const ax = (s[4] * s[8] - s[5] * s[7]) * dx + (s[2] * s[7] - s[1] * s[8]) * dy + (s[1] * s[5] - s[2] * s[4]) * dz;
-    const ay = (s[5] * s[6] - s[3] * s[8]) * dx + (s[0] * s[8] - s[2] * s[6]) * dy + (s[2] * s[3] - s[0] * s[5]) * dz;
-    const az = (s[3] * s[7] - s[4] * s[6]) * dx + (s[1] * s[6] - s[0] * s[7]) * dy + (s[0] * s[4] - s[1] * s[3]) * dz;
-    const quad = (dx * ax + dy * ay + dz * az) / detS;
-
-    const cross = cache.alpha[i] * cache.alpha[j] * TWO_PI_1_5 *
-        cache.sqrtDet[i] * cache.sqrtDet[j] / Math.sqrt(detS) * Math.exp(-0.5 * quad);
-    const total = cache.self[i] + cache.self[j];
-    const geoError = Math.max(0, total - 2 * cross) / Math.max(total, 1e-300);
-    if (geoError >= cutoff) return Infinity;
-
-    const { color, colorDim } = view;
-    let colorError = 0;
-    for (let c = 0; c < colorDim; c++) {
-        const d = color[i * colorDim + c] - color[j * colorDim + c];
-        colorError += d * d;
-    }
-
-    return geoError + colorError;
-};
-
-const calcErrors = async (
-    source: ChunkSource, pool: ChunkDataPool, slim: SlimColumns, root: BTreeNode,
-    bins: Map<number, Uint32Array>, cum: number[], numLods: number
-): Promise<number[]> => {
-    // Symmetric Chamfer-style error against the finest representation present in
-    // this leaf, plus the alpha-mass a level fails to carry. Center-space KNN
-    // supplies a small candidate set (including candidates across leaf
-    // boundaries); the final match uses the closed-form {@link splatError}. This
-    // compares arbitrary input LODs, so it does not depend on how those LODs
-    // were produced.
-    const errors = new Array(numLods).fill(0);
-    const referenceLod = Math.min(...bins.keys());
-    const referenceQueries = bins.get(referenceLod)!;
-    const k = 4;
-
-    const targetLods = [...bins.keys()].filter(lod => lod !== referenceLod).sort((a, b) => a - b);
-    if (targetLods.length === 0) return errors;
-
-    // Forward (reference -> each level) shares one traversal per reference splat;
-    // reverse (each level -> reference) is a separate query set per level.
-    const targetRanges = new Int32Array(targetLods.length * 2);
-    targetLods.forEach((lod, i) => {
-        targetRanges[2 * i] = cum[lod];
-        targetRanges[2 * i + 1] = cum[lod + 1];
-    });
-    const referenceRange = Int32Array.of(cum[referenceLod], cum[referenceLod + 1]);
-
-    const forwards = findNearest(root, slim, referenceQueries, targetRanges, k);
-    const reverses = targetLods.map(lod => findNearest(root, slim, bins.get(lod)!, referenceRange, k)[0]);
-
-    // One gathered section per level, holding that level's own splats plus every
-    // splat another level matched into it, concatenated into a single view. All
-    // levels are handled in one pass so the reference level — the largest, and a
-    // participant in every pair — is read and cached once instead of once per
-    // level pair.
-    const order = [referenceLod, ...targetLods];
-    const globals: Uint32Array[] = new Array(numLods);
-    globals[referenceLod] = uniqueGlobals(referenceQueries, reverses);
-    targetLods.forEach((lod, i) => {
-        globals[lod] = uniqueGlobals(bins.get(lod)!, [forwards[i]]);
-    });
-
-    const offsets = new Int32Array(numLods);
-    const sections: SplatView[] = [];
-    let rows = 0;
-    for (const lod of order) {
-        offsets[lod] = rows;
-        sections.push(await gatherView(source, pool, slim, globals[lod], lod, cum[lod]));
-        rows += globals[lod].length;
-    }
-
-    const view = concatViews(sections);
-    const cache = buildErrorCache(view);
-
-    // Rows of a level's own splats, in query order. The reference level's are
-    // reused by every pair.
-    const rowsOf = (queries: Uint32Array, lod: number): Int32Array => {
-        const result = new Int32Array(queries.length);
-        const offset = offsets[lod];
-        const g = globals[lod];
-        for (let i = 0; i < queries.length; i++) result[i] = offset + indexOfSorted(g, queries[i]);
-        return result;
-    };
-    const referenceRows = rowsOf(referenceQueries, referenceLod);
-
-    // `mass` (alpha * ellipsoid area) is a splat's share of what the leaf
-    // paints, so it weights both the per-splat mean and the coverage term —
-    // a hair-thin splat and one spanning the whole leaf are not equals.
-    const directional = (
-        queryRows: Int32Array, neighbours: Int32Array, neighbourLod: number
-    ): number => {
-        let total = 0;
-        let weight = 0;
-        const neighbourOffset = offsets[neighbourLod];
-        const neighbourGlobals = globals[neighbourLod];
-        for (let i = 0; i < queryRows.length; i++) {
-            const queryRow = queryRows[i];
-            let best = Infinity;
-            for (let j = 0; j < k; j++) {
-                const neighbour = neighbours[i * k + j];
-                if (neighbour < 0) continue;
-                const neighbourRow = neighbourOffset + indexOfSorted(neighbourGlobals, neighbour);
-                const error = splatError(view, cache, queryRow, neighbourRow, best);
-                if (error < best) best = error;
-            }
-            if (best === Infinity) continue;
-            total += cache.mass[queryRow] * best;
-            weight += cache.mass[queryRow];
-        }
-        return weight > 0 ? total / weight : 0;
-    };
-
-    const massOf = (queryRows: Int32Array): number => {
-        let mass = 0;
-        for (let i = 0; i < queryRows.length; i++) mass += cache.mass[queryRows[i]];
-        return mass;
-    };
-
-    // Nearest-neighbour matching cannot see thinning: drop every second
-    // splat of an overlapping group and each survivor still has a
-    // near-identical partner, while the alpha the group accumulates halves.
-    // Sky gaps are exactly that, so compare the mass the levels carry.
-    const referenceMass = massOf(referenceRows);
-    targetLods.forEach((lod, i) => {
-        const targetRows = rowsOf(bins.get(lod)!, lod);
-        const coverageError = Math.max(0, 1 - massOf(targetRows) / Math.max(referenceMass, 1e-300));
-        const forwardError = directional(referenceRows, forwards[i], lod);
-        const reverseError = directional(targetRows, reverses[i], referenceLod);
-        errors[lod] = 0.5 * (forwardError + reverseError) + coverageError;
-    });
-
-    // Keep the table monotone across levels. This does not keep a finer level on
-    // the engine's Pareto frontier — that domination test accepts an equal error,
-    // so a cheaper coarser level displaces the finer one either way — but the
-    // budget balancer ranks transitions by error reduction per splat *across*
-    // nodes, so a coarser level must never advertise less error than the finer
-    // one it stands in for.
-    let previous = 0;
-    for (const lod of [...bins.keys()].sort((a, b) => a - b)) {
-        previous = errors[lod] = Math.max(errors[lod], previous);
-    }
-
-    return errors;
-};
-
 /**
  * Read positions out of a multi-LOD source into flat per-gaussian arrays — one
  * sequential pass across every structural LOD (LOD 0 first, then 1, …, laid out
@@ -834,7 +414,9 @@ const extractSlim = async (source: ChunkSource, pool: ChunkDataPool): Promise<Sl
             const p = new Float32Array(pos.data, 0, count * 3);
             for (let i = 0; i < count; i++) {
                 const di = base + i;
-                cols.x[di] = p[i * 3]; cols.y[di] = p[i * 3 + 1]; cols.z[di] = p[i * 3 + 2];
+                cols.x[di] = p[i * 3];
+                cols.y[di] = p[i * 3 + 1];
+                cols.z[di] = p[i * 3 + 2];
             }
             base += count;
             pos.release();
@@ -853,9 +435,43 @@ type WriteLodSourceOptions = {
     mainSource: ChunkSource;
     envSource: ChunkSource | null;
     iterations: number;
+    /** SH palette colour error target in 8-bit levels, per unit (see {@link WriteSogSourceOptions}). */
+    colorError?: number;
+    /** Lossless WebP compression effort, 0–9. Omit to use the default WebP encoder. */
+    webpEffort?: number;
+    /** Supplies the GPU that SOG encoding uses. */
     createDevice?: DeviceCreator;
+    /** SOG version of every unit and the environment. Default 3. */
+    sogVersion?: SogVersion;
+    /** Per-gaussian blind data carried into every unit (v3 only). */
+    sogBlind?: SogBlindTexture[];
+    /**
+     * Application-defined JSON for lod-meta.json's `extras` (as in glTF). Undefined writes
+     * the main source's extras, if any; null writes none. Units never carry extras. Written
+     * only with SOG v3 units.
+     */
+    extras?: unknown;
     chunkCount: number;
     chunkExtent: number;
+    /**
+     * Gaussians, in thousands, below which a node is not split for exceeding
+     * `chunkExtent`. Default 8. A leaf is the unit of streaming, culling and LOD
+     * choice, and costs the same to stream, evaluate and describe whether it holds
+     * eighty gaussians or eight thousand; without a floor a wide sparse region —
+     * sky, floaters, distant background — is cut down to the extent limit
+     * regardless of content, into tens of thousands of near-empty leaves that
+     * inflate the manifest and the runtime's per-node work while carrying nothing
+     * the allocator would not buy whole anyway. Dense regions never reach the
+     * floor, so their leaves are unchanged.
+     */
+    chunkMin?: number;
+    /**
+     * Gaussians, in thousands, per file unit for each structural level, finest first;
+     * the last value repeats for coarser levels. Defaults to `chunkCount` for every
+     * level. Only the packing of leaves into files changes; leaves are split by
+     * `chunkCount` as before.
+     */
+    fileCounts?: number[];
 };
 
 /**
@@ -874,7 +490,21 @@ type WriteLodSourceOptions = {
  * @ignore
  */
 const writeLodSource = async (options: WriteLodSourceOptions, fs: FileSystem) => {
-    const { filename, envSource, iterations, createDevice, chunkCount, chunkExtent } = options;
+    const {
+        filename,
+        envSource,
+        iterations,
+        colorError,
+        webpEffort,
+        createDevice,
+        sogVersion,
+        sogBlind,
+        extras,
+        chunkCount,
+        chunkExtent,
+        chunkMin = 8,
+        fileCounts
+    } = options;
 
     // Bake the pending coordinate-space transform to PLY once, up front, so the
     // partition/bounds passes (extractSlim, calcBound, morton) and the per-unit
@@ -910,22 +540,21 @@ const writeLodSource = async (options: WriteLodSourceOptions, fs: FileSystem) =>
     await fs.mkdir(outputDir);
 
     // construct a kd-tree based on centroids from all lods
-    const centroidsTable = new DataTable([
-        new Column('x', slim.x),
-        new Column('y', slim.y),
-        new Column('z', slim.z)
-    ]);
+    const centroidsTable = new DataTable([new Column('x', slim.x), new Column('y', slim.y), new Column('z', slim.z)]);
 
     let bTree: BTree | null = new BTree(centroidsTable);
 
     // approximate number of gaussians we'll place into file units
     const binSize = chunkCount * 1024;
     const binDim = chunkExtent;
+    const binMin = chunkMin * 1024;
+    const unitSize = (lod: number) =>
+        (fileCounts?.length ? fileCounts[Math.min(lod, fileCounts.length - 1)] : chunkCount) * 1024;
 
     // map of lod -> file units -> subunits (each subunit a tight Uint32Array of
     // gaussian indices). This is the bulk retained bookkeeping; Uint32Array keeps
     // it off the V8 heap at 4 B/gaussian.
-    const lodFiles: Map<number, Uint32Array[][]> = new Map();
+    const lodFiles = new Map<number, Uint32Array[][]>();
     const filenames: string[] = [];
     let lodLevels = 0;
 
@@ -934,11 +563,13 @@ const writeLodSource = async (options: WriteLodSourceOptions, fs: FileSystem) =>
     const chunkingBar = logger.bar('chunking', cum[numLods]);
 
     const build = async (node: BTreeNode): Promise<MetaNode> => {
-        if (!node.indices && (node.count > binSize || (node.aabb && node.aabb.largestDim() > binDim))) {
-            const children = [
-                await build(node.left),
-                await build(node.right)
-            ];
+        // Split when the node holds more than a unit, or when it is wider than the
+        // extent limit and holds enough gaussians to be worth two leaves.
+        if (
+            !node.indices &&
+            (node.count > binSize || (node.aabb && node.aabb.largestDim() > binDim && node.count > binMin))
+        ) {
+            const children = [await build(node.left), await build(node.right)];
 
             const bound = {
                 min: [0, 0, 0],
@@ -949,7 +580,7 @@ const writeLodSource = async (options: WriteLodSourceOptions, fs: FileSystem) =>
             return { bound, children };
         }
 
-        const lods: { [key: number]: MetaLod } = { };
+        const lods: Record<number, MetaLod> = {};
         const bins = binIndices(node, lodOf);
 
         for (const [lodValue, indices] of bins) {
@@ -974,18 +605,16 @@ const writeLodSource = async (options: WriteLodSourceOptions, fs: FileSystem) =>
 
             lastFile.push(indices);
 
-            if (fileSize + indices.length > binSize) {
+            if (fileSize + indices.length > unitSize(lodValue)) {
                 fileList.push([]);
             }
 
             lodLevels = Math.max(lodLevels, lodValue + 1);
         }
 
-        // Bound and approximation errors over the leaf's full structural LOD data.
-        const bound = await calcBound(mainSource, pool, bins, cum, n => chunkingBar.tick(n));
-        const errors = await calcErrors(mainSource, pool, slim, bTree!.root, bins, cum, numLods);
-
-        return { bound, lods, errors };
+        // Bound over the leaf's full structural LOD data.
+        const bound = await calcBound(mainSource, pool, bins, cum, (n) => chunkingBar.tick(n));
+        return { bound, lods };
     };
 
     let tree: MetaNode;
@@ -995,15 +624,9 @@ const writeLodSource = async (options: WriteLodSourceOptions, fs: FileSystem) =>
         chunkingBar.end();
     }
 
-    const trimErrors = (node: MetaNode): void => {
-        if (node.errors) node.errors.length = lodLevels;
-        for (const child of node.children ?? []) trimErrors(child);
-    };
-    trimErrors(tree);
-
     // The kd-tree is dead once the partition is built (lodFiles holds its own
-    // index copies): release its N×4B index buffer and node AABBs before the
-    // unit writes, where peak memory lives.
+    // index copies): release its N×4B index buffer and node AABBs before the unit
+    // writes, where peak memory lives.
     bTree = null;
 
     // count splats per lod level
@@ -1019,25 +642,34 @@ const writeLodSource = async (options: WriteLodSourceOptions, fs: FileSystem) =>
         asset: {
             generator: `splat-transform v${version}`,
             chunkGaussians: binSize,
-            chunkExtent: binDim
+            chunkExtent: binDim,
+            chunkMinGaussians: binMin
         },
         count: counts.reduce((acc, curr) => acc + curr, 0),
+        ...(mainSource.meta.model === 'default' ? {} : { model: mainSource.meta.model }),
         counts,
         lodLevels,
-        lodErrors: true,
         ...(hasEnv ? { environment: 'env/meta.json' } : {}),
         filenames,
         tree
     };
+    // extras and comments are SOG v3 additions: a scene written as v2 keeps the v2-era lod-meta.json
+    if ((sogVersion ?? 3) === 3) {
+        const lodExtras = extras === null ? undefined : (extras ?? mainSource.meta.extras);
+        if (lodExtras !== undefined) meta.extras = lodExtras;
+        if (mainSource.meta.comments?.length) meta.comments = mainSource.meta.comments;
+    }
 
-    // write the meta file with float precision quantization (approx. 32-bit float => ~7 significant digits)
-    const replacer = (_key: string, value: any) => {
+    // the meta file's own floats are quantized (approx. 32-bit float => ~7 significant digits); the
+    // application's extras are written as given
+    const replacer = (_key: string, value: unknown) => {
         if (typeof value === 'number') {
             if (!Number.isFinite(value)) return value;
             return Number.isInteger(value) ? value : +value.toPrecision(7);
         }
         return value;
     };
+    const quantize = <T>(value: T): T => JSON.parse(JSON.stringify(value, replacer));
 
     const writingGroup = logger.group('Writing');
 
@@ -1053,6 +685,13 @@ const writeLodSource = async (options: WriteLodSourceOptions, fs: FileSystem) =>
 
     let sogIndex = 0;
 
+    // Unit writes overlap (see below), so every write shares one in-flight
+    // device request: a creator that only caches its resolved device would
+    // otherwise be called again before the first call resolves, creating a
+    // second device.
+    let devicePromise: ReturnType<DeviceCreator> | undefined;
+    const sharedCreateDevice = createDevice && (() => (devicePromise ??= createDevice()));
+
     // write the environment sog
     if (hasEnv) {
         sogIndex++;
@@ -1066,7 +705,25 @@ const writeLodSource = async (options: WriteLodSourceOptions, fs: FileSystem) =>
             await writeSogSource(
                 envSource!,
                 pool,
-                { filename: envPathname, bundle: false, iterations, createDevice, logging: 'flat' },
+                {
+                    filename: envPathname,
+                    bundle: false,
+                    iterations,
+                    colorError,
+                    webpEffort,
+                    createDevice: sharedCreateDevice,
+                    version: sogVersion,
+                    // the environment is a separate scene and may lack some columns: keep the fields it has
+                    blind: sogBlind
+                        ?.map((fields) =>
+                            fields.filter((f) => envSource!.meta.extraColumns.some((c) => c.name === f.column))
+                        )
+                        .filter((fields) => fields.length > 0),
+                    // the scene's extras and comments live in lod-meta.json only
+                    extras: null,
+                    comments: null,
+                    logging: 'flat'
+                },
                 fs
             );
         } finally {
@@ -1075,72 +732,111 @@ const writeLodSource = async (options: WriteLodSourceOptions, fs: FileSystem) =>
     }
 
     // write lod-meta.json
-    const metaJson = (new TextEncoder()).encode(JSON.stringify(meta, replacer));
+    const metaJson = new TextEncoder().encode(
+        JSON.stringify({ ...meta, asset: quantize(meta.asset), tree: quantize(meta.tree) })
+    );
     const writer = await fs.createWriter(filename);
     await writer.write(metaJson);
     await writer.close();
     logWrittenFile(basename(filename), writer.bytesWritten);
 
     // write file units
+    const units: { lodValue: number; index: number; fileUnit: Uint32Array[] }[] = [];
     for (const [lodValue, fileUnits] of lodFiles) {
         for (let i = 0; i < fileUnits.length; ++i) {
-            const fileUnit = fileUnits[i];
-
-            if (fileUnit.length === 0) {
-                continue;
+            if (fileUnits[i].length > 0) {
+                units.push({ lodValue, index: i, fileUnit: fileUnits[i] });
             }
+        }
+    }
 
-            const groupName = `${lodValue}_${i}`;
-            sogIndex++;
-            const unitGroup = logger.group(groupName, { index: sogIndex, total: sogTotal });
+    // Gather a unit and start its SOG write (quantization, GPU k-means).
+    const startUnit = ({ lodValue, fileUnit }: (typeof units)[number]) => {
+        // Morton-order each subunit and concatenate into the unit's
+        // global (flat) row order.
+        const totalIndices = fileUnit.reduce((acc, curr) => acc + curr.length, 0);
+        const orderedIndices = new Uint32Array(totalIndices);
+        for (let j = 0, offset = 0; j < fileUnit.length; ++j) {
+            orderedIndices.set(fileUnit[j], offset);
+            sortMortonColumns(slim.x, slim.y, slim.z, orderedIndices.subarray(offset, offset + fileUnit[j].length));
+            offset += fileUnit[j].length;
+        }
 
-            try {
-                // ensure output folder exists before any files are written
-                const pathname = resolve(outputDir, `${lodValue}_${i}/meta.json`);
-                await fs.mkdir(dirname(pathname));
+        // This file unit's flat indices all belong to LOD `lodValue`;
+        // convert to rows local to that LOD for the gather.
+        const base = cum[lodValue];
+        const orderedLocal = new Uint32Array(totalIndices);
+        for (let j = 0; j < totalIndices; ++j) orderedLocal[j] = orderedIndices[j] - base;
 
-                // Morton-order each subunit and concatenate into the unit's
-                // global (flat) row order.
-                const totalIndices = fileUnit.reduce((acc, curr) => acc + curr.length, 0);
-                const orderedIndices = new Uint32Array(totalIndices);
-                for (let j = 0, offset = 0; j < fileUnit.length; ++j) {
-                    orderedIndices.set(fileUnit[j], offset);
-                    sortMortonColumns(slim.x, slim.y, slim.z, orderedIndices.subarray(offset, offset + fileUnit[j].length));
-                    offset += fileUnit[j].length;
-                }
+        // Gather the ordered subset lazily from LOD `lodValue` (no per-unit
+        // copy) and encode via the chunk-native SOG writer. The rows are
+        // already in write order, so pass an identity ordering to skip the
+        // writer's own Morton pass.
+        const unitSource = positionsFromSlim(
+            permuteSource(mainSource, orderedLocal, { lod: lodValue }),
+            slim,
+            orderedIndices
+        );
+        const identity = new Uint32Array(totalIndices);
+        for (let j = 0; j < totalIndices; ++j) identity[j] = j;
 
-                // This file unit's flat indices all belong to LOD `lodValue`;
-                // convert to rows local to that LOD for the gather.
-                const base = cum[lodValue];
-                const orderedLocal = new Uint32Array(totalIndices);
-                for (let j = 0; j < totalIndices; ++j) orderedLocal[j] = orderedIndices[j] - base;
+        return {
+            identity,
+            state: startSogWrite(unitSource, pool, {
+                iterations,
+                colorError,
+                createDevice: sharedCreateDevice,
+                indices: identity,
+                version: sogVersion,
+                blind: sogBlind,
+                extras: null,
+                comments: null
+            })
+        };
+    };
 
-                // Gather the ordered subset lazily from LOD `lodValue` (no per-unit
-                // copy) and encode via the chunk-native SOG writer. The rows are
-                // already in write order, so pass an identity ordering to skip the
-                // writer's own Morton pass.
-                const unitSource = positionsFromSlim(
-                    permuteSource(mainSource, orderedLocal, { lod: lodValue }),
-                    slim, orderedIndices
-                );
-                const identity = new Uint32Array(totalIndices);
-                for (let j = 0; j < totalIndices; ++j) identity[j] = j;
+    // Units are pipelined one deep: once a unit is gathered and its k-means
+    // queued, the next unit is gathered and queued behind it, so the GPU stays
+    // busy through each unit's CPU tail (texture packing, codebook
+    // quantization, WebP encodes) — that tail left an A10G idle ~2.5s per
+    // unit. Gathers stay sequential (one source read at a time), the started
+    // unit logs nothing until its turn, and at most two units' layers are
+    // resident.
+    let next = units.length > 0 ? startUnit(units[0]) : null;
+    for (let u = 0; u < units.length; ++u) {
+        const { lodValue, index } = units[u];
+        const current = next!;
+        const state = await current.state;
 
-                await writeSogSource(unitSource, pool, {
+        next = u + 1 < units.length ? startUnit(units[u + 1]) : null;
+        // eslint-disable-next-line @typescript-eslint/no-empty-function -- preserve rejection-only control flow
+        next?.state.catch(() => {});
+
+        sogIndex++;
+        const unitGroup = logger.group(`${lodValue}_${index}`, { index: sogIndex, total: sogTotal });
+
+        try {
+            // ensure output folder exists before any files are written
+            const pathname = resolve(outputDir, `${lodValue}_${index}/meta.json`);
+            await fs.mkdir(dirname(pathname));
+
+            await finishSogWrite(
+                state,
+                {
                     filename: pathname,
                     bundle: false,
-                    iterations,
-                    createDevice,
-                    indices: identity,
+                    webpEffort,
+                    indices: current.identity,
                     logging: 'flat'
-                }, fs);
-            } finally {
-                unitGroup.end();
-            }
+                },
+                fs
+            );
+        } finally {
+            unitGroup.end();
         }
     }
 
     writingGroup.end();
 };
 
-export { findNearest, positionsFromSlim, writeLodSource, type WriteLodSourceOptions };
+export { positionsFromSlim, writeLodSource, type WriteLodSourceOptions };

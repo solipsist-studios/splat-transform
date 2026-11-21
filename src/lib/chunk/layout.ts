@@ -1,8 +1,10 @@
+import type { SogBlindOrigin } from '../utils/sog-blind';
+
 /**
  * ChunkLayer identifiers — the disjoint storage tiers of a gaussian source.
  *
  * - `position`        - xyz (vec3<f32>)
- * - `geometric`       - rotation quaternion + scale + opacity
+ * - `geometric`       - rotation quaternion + log scale + true (linear) opacity
  * - `color`           - DC + spherical harmonics rest coefficients
  * - `other`           - user-defined extra columns (e.g. blind data)
  */
@@ -15,15 +17,17 @@ type ChunkLayer = 'position' | 'geometric' | 'color' | 'other';
  * - 1 - DC + 1st band (3 + 9 = 12 coefficients)
  * - 2 - DC + 1st + 2nd (3 + 24 = 27 coefficients)
  * - 3 - DC + 1st + 2nd + 3rd (3 + 45 = 48 coefficients)
+ * - 4 - DC + 1st..4th (3 + 72 = 75 coefficients)
  */
-type SHBands = 0 | 1 | 2 | 3;
+type SHBands = 0 | 1 | 2 | 3 | 4;
 
 /** Number of `f_rest_*` SH coefficients (excluding the 3 DC coefficients) per band level. */
 const SH_REST_COUNTS: Readonly<Record<SHBands, number>> = {
     0: 0,
     1: 9,
     2: 24,
-    3: 45
+    3: 45,
+    4: 72
 };
 
 /** Bytes per gaussian for the `position` layer. */
@@ -77,6 +81,7 @@ const positionFields = (): ChunkFieldMap => ({
 const geometricFields = (): ChunkFieldMap => ({
     rotation: { byteOffset: 0, components: 4, type: 'float32' },
     scale: { byteOffset: 16, components: 3, type: 'float32' },
+    // true opacity A, linear (not a logit): 0 to 1, above 1 for merged gaussians
     opacity: { byteOffset: 28, components: 1, type: 'float32' }
 });
 
@@ -95,14 +100,14 @@ const colorFields = (shBands: SHBands): ChunkFieldMap => {
 };
 
 /** Canonical layer order for reporting. */
-const LAYER_ORDER: ReadonlyArray<ChunkLayer> = ['position', 'geometric', 'color', 'other'];
+const LAYER_ORDER: readonly ChunkLayer[] = ['position', 'geometric', 'color', 'other'];
 
 /**
  * List a source's available layers in canonical ({@link LAYER_ORDER}) order.
  * @param layers - The source's available layers.
  * @returns The layers as an ordered array.
  */
-const orderedLayers = (layers: ReadonlySet<ChunkLayer>): ChunkLayer[] => LAYER_ORDER.filter(l => layers.has(l));
+const orderedLayers = (layers: ReadonlySet<ChunkLayer>): ChunkLayer[] => LAYER_ORDER.filter((l) => layers.has(l));
 
 /**
  * Whether a source's available layers constitute gaussian splat data:
@@ -121,7 +126,18 @@ const hasGaussianLayers = (layers: ReadonlySet<ChunkLayer>): boolean => {
 type ExtraColumn = {
     readonly name: string;
     readonly type: 'float32' | 'uint32';
+    /** How the SOG file it was read from stored it as blind data; a SOG write stores it the same way by default. */
+    readonly sogBlind?: SogBlindOrigin;
 };
+
+/**
+ * Name of the PLY property (and DataTable column) holding true opacity `A`,
+ * linear and unclamped, in place of the `opacity` logit, which cannot carry
+ * opacity above 1. A PLY file carries one or the other; a reader finding
+ * `opacity_linear` uses it. Inside a `ChunkSource` there is no such
+ * column: the geometric layer's opacity slot holds `A` itself.
+ */
+const OPACITY_LINEAR_COLUMN = 'opacity_linear';
 
 /**
  * Compute the byte stride and field map for an `other` layer given its extra columns.
@@ -129,9 +145,7 @@ type ExtraColumn = {
  * @param extras - The extra columns, in storage order.
  * @returns The byte stride and field map for the `other` layer.
  */
-const otherLayout = (
-    extras: ReadonlyArray<ExtraColumn>
-): { stride: number; fields: ChunkFieldMap } => {
+const otherLayout = (extras: readonly ExtraColumn[]): { stride: number; fields: ChunkFieldMap } => {
     const fields: Record<string, ChunkField> = {};
     let offset = 0;
     for (const e of extras) {
@@ -149,6 +163,7 @@ export {
     type LayerLayout,
     type ExtraColumn,
     SH_REST_COUNTS,
+    OPACITY_LINEAR_COLUMN,
     POSITION_STRIDE,
     GEOMETRIC_STRIDE,
     DEFAULT_CHUNK_SIZE,

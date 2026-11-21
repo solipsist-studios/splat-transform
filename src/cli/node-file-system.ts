@@ -1,16 +1,10 @@
 import { randomBytes } from 'crypto';
-import { FileHandle, mkdir, open, rename, stat, unlink } from 'node:fs/promises';
+import type { FileHandle } from 'node:fs/promises';
+import { mkdir, open, rename, stat, unlink } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 
-import {
-    BufferedReadStream,
-    ReadStream,
-    type FileSystem,
-    type ProgressCallback,
-    type ReadFileSystem,
-    type ReadSource,
-    type Writer
-} from '../lib';
+import { BufferedReadStream, ReadStream } from '../lib';
+import type { FileSystem, ProgressCallback, ReadFileSystem, ReadSource, Writer } from '../lib';
 
 // ============================================================================
 // Read implementations
@@ -23,17 +17,11 @@ class NodeReadStream extends ReadStream {
     private fileHandle: FileHandle;
     private position: number;
     private end: number;
-    private closed: boolean = false;
+    private closed = false;
     private progress: ProgressCallback | undefined;
     private totalSize: number | undefined;
 
-    constructor(
-        fileHandle: FileHandle,
-        start: number,
-        end: number,
-        progress?: ProgressCallback,
-        totalSize?: number
-    ) {
+    constructor(fileHandle: FileHandle, start: number, end: number, progress?: ProgressCallback, totalSize?: number) {
         super(end - start);
         this.fileHandle = fileHandle;
         this.position = start;
@@ -80,7 +68,7 @@ class NodeReadSource implements ReadSource {
     readonly seekable: boolean = true;
 
     private fileHandle: FileHandle;
-    private closed: boolean = false;
+    private closed = false;
     private progress: ProgressCallback | undefined;
 
     constructor(fileHandle: FileHandle, size: number, progress?: ProgressCallback) {
@@ -89,7 +77,7 @@ class NodeReadSource implements ReadSource {
         this.progress = progress;
     }
 
-    read(start: number = 0, end: number = this.size): ReadStream {
+    read(start = 0, end: number = this.size): ReadStream {
         if (this.closed) {
             throw new Error('Source has been closed');
         }
@@ -99,14 +87,8 @@ class NodeReadSource implements ReadSource {
         const clampedEnd = Math.max(clampedStart, Math.min(end, this.size));
 
         // Wrap with BufferedReadStream to reduce async overhead from file reads
-        const raw = new NodeReadStream(
-            this.fileHandle,
-            clampedStart,
-            clampedEnd,
-            this.progress,
-            this.size
-        );
-        return new BufferedReadStream(raw, 4 * 1024 * 1024);  // 4MB chunks
+        const raw = new NodeReadStream(this.fileHandle, clampedStart, clampedEnd, this.progress, this.size);
+        return new BufferedReadStream(raw, 4 * 1024 * 1024); // 4MB chunks
     }
 
     close(): void {
@@ -131,6 +113,10 @@ class NodeReadFileSystem implements ReadFileSystem {
 // Write implementations
 // ============================================================================
 
+// Node rejects a single write of more than 2^31-1 bytes with ERR_OUT_OF_RANGE,
+// so larger buffers are written in pieces of at most this size.
+const MAX_WRITE_BYTES = 1 << 30;
+
 /**
  * Writer implementation for writing to Node.js file handles.
  */
@@ -144,7 +130,8 @@ class FileWriter implements Writer {
         this.write = async (data: Uint8Array) => {
             let offset = 0;
             while (offset < data.byteLength) {
-                const { bytesWritten } = await fileHandle.write(data, offset, data.byteLength - offset);
+                const length = Math.min(data.byteLength - offset, MAX_WRITE_BYTES);
+                const { bytesWritten } = await fileHandle.write(data, offset, length);
                 if (bytesWritten === 0) {
                     throw new Error('Failed to write all data to file.');
                 }
@@ -165,8 +152,8 @@ class FileWriter implements Writer {
         this.abort = async () => {
             // discard: close and remove the temp file, never touching the
             // target filename (best-effort — this runs on already-failing paths)
-            await fileHandle.close().catch(() => {});
-            await unlink(tmpFilename).catch(() => {});
+            await fileHandle.close().catch<undefined>(() => undefined);
+            await unlink(tmpFilename).catch<undefined>(() => undefined);
         };
     }
 }

@@ -1,21 +1,10 @@
-import { fileChunkSource, readExact, sortGatherSlots, gatherRuns } from './reader-utils';
-import {
-    type ReadRequest,
-    type ChunkSource,
-    type ChunkSourceMetadata,
-    type ChunkDataPool,
-    type LayerLayout,
-    type ChunkLayer,
-    POSITION_STRIDE,
-    GEOMETRIC_STRIDE,
-    colorStride,
-    positionFields,
-    geometricFields,
-    colorFields
-} from '../chunk';
+import { POSITION_STRIDE, GEOMETRIC_STRIDE, colorStride, positionFields, geometricFields, colorFields } from '../chunk';
+import type { ReadRequest, ChunkSource, ChunkSourceMetadata, ChunkDataPool, LayerLayout, ChunkLayer } from '../chunk';
 import { Column, DataTable } from '../data-table';
-import { type ReadSource } from '../io/read';
+import type { ReadSource } from '../io/read';
 import { Transform } from '../utils';
+
+import { fileChunkSource, readExact, sortGatherSlots, gatherRuns } from './reader-utils';
 
 const SH_C0 = 0.28209479177387814;
 
@@ -47,16 +36,17 @@ const decodeGeometric = (dv: DataView, u8: Uint8Array, o: number, geo: Float32Ar
         geo[g + 2] = r2 / len;
         geo[g + 3] = r3 / len;
     } else {
-        geo[g] = 1; geo[g + 1] = 0; geo[g + 2] = 0; geo[g + 3] = 0;
+        geo[g] = 1;
+        geo[g + 1] = 0;
+        geo[g + 2] = 0;
+        geo[g + 3] = 0;
     }
     // scale: linear in .splat -> log space
     geo[g + 4] = Math.log(dv.getFloat32(o + 12, true));
     geo[g + 5] = Math.log(dv.getFloat32(o + 16, true));
     geo[g + 6] = Math.log(dv.getFloat32(o + 20, true));
-    // opacity: u8 -> inverse sigmoid (logit), clamped off the asymptotes
-    const eps = 1e-6;
-    const a = Math.max(eps, Math.min(1 - eps, u8[o + 27] / 255));
-    geo[g + 7] = Math.log(a / (1 - a));
+    // opacity: u8 -> true opacity
+    geo[g + 7] = u8[o + 27] / 255;
 };
 
 const decodeColor = (u8: Uint8Array, o: number, col: Float32Array, i: number): void => {
@@ -140,7 +130,12 @@ const readSplat = async (source: ReadSource, pool: ChunkDataPool): Promise<Chunk
         // Decode `n` records held in `buf` (record `t` at byte `srcRec(t)*32`)
         // into the output slots given by `dstRow`. Shared by both the
         // contiguous-chunk and the scatter-gather paths so they stay identical.
-        const decode = (buf: Uint8Array, n: number, dstRow: (t: number) => number, srcRec: (t: number) => number = t => t): void => {
+        const decode = (
+            buf: Uint8Array,
+            n: number,
+            dstRow: (t: number) => number,
+            srcRec: (t: number) => number = (t) => t
+        ): void => {
             const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
             for (let t = 0; t < n; t++) {
                 const o = srcRec(t) * BYTES_PER_SPLAT;
@@ -156,10 +151,10 @@ const readSplat = async (source: ReadSource, pool: ChunkDataPool): Promise<Chunk
             // coalescing nearby records into one bounded range read.
             const { indices, indexOffset, count } = request;
             if (count <= 0) return;
-            const slot = sortGatherSlots(count, s => indices[indexOffset + s]);
+            const slot = sortGatherSlots(count, (s) => indices[indexOffset + s]);
             const rowAt = (t: number) => indices[indexOffset + slot[t]];
 
-            for (const run of gatherRuns(count, t => rowAt(t) * BYTES_PER_SPLAT, BYTES_PER_SPLAT)) {
+            for (const run of gatherRuns(count, (t) => rowAt(t) * BYTES_PER_SPLAT, BYTES_PER_SPLAT)) {
                 const firstRow = run.firstByte / BYTES_PER_SPLAT;
                 const byteLen = run.recordCount * BYTES_PER_SPLAT;
 
@@ -171,12 +166,20 @@ const readSplat = async (source: ReadSource, pool: ChunkDataPool): Promise<Chunk
                         gatherScratch = new Uint8Array(byteLen);
                     }
                     buf = gatherScratch.subarray(0, byteLen);
-                    if (await readExact(source.read(run.firstByte, run.firstByte + byteLen), buf, 0, byteLen) !== byteLen) {
+                    if (
+                        (await readExact(source.read(run.firstByte, run.firstByte + byteLen), buf, 0, byteLen)) !==
+                        byteLen
+                    ) {
                         throw new Error(`readSplat: short gather read at row ${firstRow}`);
                     }
                 }
                 const { j0 } = run;
-                decode(buf, run.j1 - j0, t => slot[j0 + t], t => rowAt(j0 + t) - firstRow);
+                decode(
+                    buf,
+                    run.j1 - j0,
+                    (t) => slot[j0 + t],
+                    (t) => rowAt(j0 + t) - firstRow
+                );
             }
             return;
         }
@@ -195,11 +198,11 @@ const readSplat = async (source: ReadSource, pool: ChunkDataPool): Promise<Chunk
         } else {
             scratch ??= new Uint8Array(chunkSize * BYTES_PER_SPLAT);
             buf = scratch.subarray(0, byteLen);
-            if (await readExact(source.read(byteStart, byteStart + byteLen), buf, 0, byteLen) !== byteLen) {
+            if ((await readExact(source.read(byteStart, byteStart + byteLen), buf, 0, byteLen)) !== byteLen) {
                 throw new Error(`readSplat: short read for chunk ${request.chunkIndex}`);
             }
         }
-        decode(buf, count, t => t);
+        decode(buf, count, (t) => t);
     };
 
     return fileChunkSource(source, meta, read);
@@ -224,11 +227,20 @@ const decodeSplatToDataTable = async (source: ReadSource): Promise<DataTable> =>
         throw new Error('Invalid .splat file: file is empty');
     }
 
-    const x = new Float32Array(numSplats), y = new Float32Array(numSplats), z = new Float32Array(numSplats);
-    const s0 = new Float32Array(numSplats), s1 = new Float32Array(numSplats), s2 = new Float32Array(numSplats);
-    const c0 = new Float32Array(numSplats), c1 = new Float32Array(numSplats), c2 = new Float32Array(numSplats);
+    const x = new Float32Array(numSplats),
+        y = new Float32Array(numSplats),
+        z = new Float32Array(numSplats);
+    const s0 = new Float32Array(numSplats),
+        s1 = new Float32Array(numSplats),
+        s2 = new Float32Array(numSplats);
+    const c0 = new Float32Array(numSplats),
+        c1 = new Float32Array(numSplats),
+        c2 = new Float32Array(numSplats);
     const op = new Float32Array(numSplats);
-    const r0 = new Float32Array(numSplats), r1 = new Float32Array(numSplats), r2 = new Float32Array(numSplats), r3 = new Float32Array(numSplats);
+    const r0 = new Float32Array(numSplats),
+        r1 = new Float32Array(numSplats),
+        r2 = new Float32Array(numSplats),
+        r3 = new Float32Array(numSplats);
 
     const dv = new DataView(fileBuffer.buffer, fileBuffer.byteOffset, fileBuffer.byteLength);
     const pos = new Float32Array(3);
@@ -239,19 +251,43 @@ const decodeSplatToDataTable = async (source: ReadSource): Promise<DataTable> =>
         decodePosition(dv, o, pos, 0);
         decodeGeometric(dv, fileBuffer, o, geo, 0);
         decodeColor(fileBuffer, o, col, 0);
-        x[i] = pos[0]; y[i] = pos[1]; z[i] = pos[2];
-        r0[i] = geo[0]; r1[i] = geo[1]; r2[i] = geo[2]; r3[i] = geo[3];
-        s0[i] = geo[4]; s1[i] = geo[5]; s2[i] = geo[6]; op[i] = geo[7];
-        c0[i] = col[0]; c1[i] = col[1]; c2[i] = col[2];
+        x[i] = pos[0];
+        y[i] = pos[1];
+        z[i] = pos[2];
+        r0[i] = geo[0];
+        r1[i] = geo[1];
+        r2[i] = geo[2];
+        r3[i] = geo[3];
+        s0[i] = geo[4];
+        s1[i] = geo[5];
+        s2[i] = geo[6];
+        // the DataTable holds the PLY logit; the shared decoder gives true opacity
+        const a = Math.max(1e-6, Math.min(1 - 1e-6, geo[7]));
+        op[i] = Math.log(a / (1 - a));
+        c0[i] = col[0];
+        c1[i] = col[1];
+        c2[i] = col[2];
     }
 
-    return new DataTable([
-        new Column('x', x), new Column('y', y), new Column('z', z),
-        new Column('scale_0', s0), new Column('scale_1', s1), new Column('scale_2', s2),
-        new Column('f_dc_0', c0), new Column('f_dc_1', c1), new Column('f_dc_2', c2),
-        new Column('opacity', op),
-        new Column('rot_0', r0), new Column('rot_1', r1), new Column('rot_2', r2), new Column('rot_3', r3)
-    ], Transform.PLY);
+    return new DataTable(
+        [
+            new Column('x', x),
+            new Column('y', y),
+            new Column('z', z),
+            new Column('scale_0', s0),
+            new Column('scale_1', s1),
+            new Column('scale_2', s2),
+            new Column('f_dc_0', c0),
+            new Column('f_dc_1', c1),
+            new Column('f_dc_2', c2),
+            new Column('opacity', op),
+            new Column('rot_0', r0),
+            new Column('rot_1', r1),
+            new Column('rot_2', r2),
+            new Column('rot_3', r3)
+        ],
+        Transform.PLY
+    );
 };
 
 export { readSplat, decodeSplatToDataTable };

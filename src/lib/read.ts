@@ -1,11 +1,24 @@
-import { type ChunkLayer, type ChunkSource, type ChunkSourceMetadata, type ExtraColumn, type SHBands, createChunkDataPool, hasGaussianLayers, orderedLayers } from './chunk';
+import { createChunkDataPool, hasGaussianLayers, orderedLayers } from './chunk';
+import type { ChunkLayer, ChunkSource, ChunkSourceMetadata, ExtraColumn, SHBands } from './chunk';
 import { dataTableToChunkSource } from './compat/data-table';
-import { ReadFileSystem, ZipReadFileSystem } from './io/read';
-import { readKsplat, readMjs, readPly, readSogSource, readSplat, readSpz, statSogSource } from './readers';
+import type { ReadFileSystem } from './io/read';
+import { ZipReadFileSystem } from './io/read';
+import {
+    readGlb,
+    readKsplat,
+    readMjs,
+    readPly,
+    readSogSource,
+    readSplat,
+    readSpz,
+    statSogSource,
+    statSpzSource
+} from './readers';
 import { readLccSource } from './readers/read-lcc';
 import { readLcc2Source } from './readers/read-lcc2';
 import { readLodSource } from './readers/read-lod';
-import { Options, Param } from './types';
+import type { SplatModel } from './splat-model';
+import type { Options, Param } from './types';
 
 /**
  * Supported input file formats for Gaussian splat data.
@@ -19,8 +32,9 @@ import { Options, Param } from './types';
  * - `splat` - Antimatter15 splat format
  * - `ksplat` - Kevin Kwok's compressed splat format
  * - `mjs` - JavaScript module generator
+ * - `glb` - Binary glTF with KHR_gaussian_splatting extension
  */
-type InputFormat = 'mjs' | 'ksplat' | 'splat' | 'sog' | 'ply' | 'spz' | 'lcc' | 'lcc2' | 'lod';
+type InputFormat = 'mjs' | 'ksplat' | 'splat' | 'sog' | 'ply' | 'spz' | 'lcc' | 'lcc2' | 'lod' | 'glb';
 
 /**
  * Determines the input format based on file extension.
@@ -72,6 +86,8 @@ const getInputFormat = (filename: string): InputFormat => {
         return 'lcc2';
     } else if (lowerFilename.endsWith('.lcc')) {
         return 'lcc';
+    } else if (lowerFilename.endsWith('.glb')) {
+        return 'glb';
     }
 
     throw new Error(`Unsupported input file type: ${filename}`);
@@ -97,7 +113,7 @@ type ReadFileOptions = {
  * Reads a Gaussian splat file and returns its data as {@link ChunkSource}s
  * (usually one; a Streamed SOG/LCC/LCC2 container yields a single structural multi-LOD source).
  *
- * Readers are chunk-native: `ply`/`splat`/`spz`/`lcc`/`lcc2`/`lod` return lazy /
+ * Readers are chunk-native: `ply`/`splat`/`spz`/`glb`/`lcc`/`lcc2`/`lod` return lazy /
  * streaming sources whose `close()` releases the underlying file(s); whole-blob
  * formats (`sog`/`mjs`/`ksplat`) are decoded up front and returned resident.
  * Callers that need a `DataTable` materialize at their own boundary (and call
@@ -162,7 +178,7 @@ const readFile = async (readFileOptions: ReadFileOptions): Promise<ChunkSource[]
     }
 
     // Single-source binary formats over a seekable ReadSource. Lazy readers
-    // (ply/splat/spz) hand the source's lifetime to the returned ChunkSource —
+    // (ply/splat/spz/glb) hand the source's lifetime to the returned ChunkSource —
     // its close() releases it — so the source is NOT closed here on success;
     // ksplat is eager and is done with the source once decoded. On error the
     // source is released (close() is idempotent).
@@ -172,6 +188,7 @@ const readFile = async (readFileOptions: ReadFileOptions): Promise<ChunkSource[]
         if (inputFormat === 'ply') return [await readPly(source, pool)];
         if (inputFormat === 'splat') return [await readSplat(source, pool)];
         if (inputFormat === 'spz') return [await readSpz(source, pool)];
+        if (inputFormat === 'glb') return [await readGlb(source, pool)];
         if (inputFormat === 'ksplat') {
             const dataTable = await readKsplat(source);
             source.close();
@@ -189,8 +206,10 @@ const readFile = async (readFileOptions: ReadFileOptions): Promise<ChunkSource[]
  * to a full read, for validating/inspecting a file (e.g. before upload) without
  * decoding its gaussian data. Reports every LOD level.
  *
- * Integrity (truncation/corruption) is enforced by the readers themselves, which
- * throw on a size mismatch — so a returned `FileInfo` implies a sound file.
+ * For formats opened via {@link readFile}, integrity (truncation/corruption) is
+ * enforced by the readers themselves, which throw on a size mismatch — so a
+ * returned `FileInfo` implies a sound file. The `sog` and `spz` header peeks
+ * validate the header but not the payload.
  */
 type FileInfo = {
     /** Detected input format. */
@@ -210,6 +229,8 @@ type FileInfo = {
     lodCounts: number[];
     /** SH band count present in the file. */
     shBands: SHBands;
+    /** Splat model the file is tagged with (`'default'` when untagged). */
+    model: SplatModel;
     /** Layers the file exposes, in canonical order. */
     layers: ChunkLayer[];
     /**
@@ -222,8 +243,10 @@ type FileInfo = {
 
 // The subset of ChunkSourceMetadata a FileInfo is built from — satisfied by a
 // full ChunkSource.meta as well as the header-only SOG/PLY peeks.
-type MetaSummary = Pick<ChunkSourceMetadata,
-    'numGaussians' | 'numLods' | 'lodCounts' | 'shBands' | 'availableLayers' | 'extraColumns'>;
+type MetaSummary = Pick<
+    ChunkSourceMetadata,
+    'numGaussians' | 'numLods' | 'lodCounts' | 'shBands' | 'model' | 'availableLayers' | 'extraColumns'
+>;
 
 const buildFileInfo = (format: InputFormat, meta: MetaSummary): FileInfo => ({
     format,
@@ -232,6 +255,7 @@ const buildFileInfo = (format: InputFormat, meta: MetaSummary): FileInfo => ({
     numLods: meta.numLods,
     lodCounts: [...meta.lodCounts],
     shBands: meta.shBands,
+    model: meta.model,
     layers: orderedLayers(meta.availableLayers),
     extraColumns: [...meta.extraColumns]
 });
@@ -241,13 +265,16 @@ const buildFileInfo = (format: InputFormat, meta: MetaSummary): FileInfo => ({
  * from the header alone wherever possible, without decoding gaussian data, and
  * across every LOD level.
  *
- * `sog` is peeked from `meta.json` (no WebP decode); every other format opens via
- * {@link readFile} (header-only for the lazy readers; eager for `ksplat`/`mjs`)
- * and reads its `meta`. Integrity is enforced by the readers, which throw on a
- * size mismatch, so a returned `FileInfo` implies a structurally sound file —
- * but not necessarily splat data: a permissive container (e.g. a point-cloud
- * PLY) reads fine with `gaussian: false`. To test "is this a valid splat",
- * check both: a throw means unreadable, `gaussian` is the data verdict.
+ * `sog` is peeked from `meta.json` (no WebP decode) and `spz` from its 16-byte
+ * header (no payload decode: gzip-wrapped v1-3 files inflate only enough of the
+ * stream to reach the header); every other format opens via {@link readFile}
+ * (header-only for the lazy readers; eager for `ksplat`/`mjs`) and reads its
+ * `meta`. For those, integrity is enforced by the readers, which throw on a size
+ * mismatch, so a returned `FileInfo` implies a structurally sound file; the
+ * `sog`/`spz` peeks validate the header but not the payload. A `FileInfo` doesn't
+ * imply splat data either: a permissive container (e.g. a point-cloud PLY) reads
+ * fine with `gaussian: false`. To test "is this a valid splat", check both: a
+ * throw means unreadable, `gaussian` is the data verdict.
  *
  * @param readFileOptions - Same inputs as {@link readFile}.
  * @returns The file's {@link FileInfo}.
@@ -275,6 +302,16 @@ const readFileInfo = async (readFileOptions: ReadFileOptions): Promise<FileInfo>
         } else {
             const stat = await statSogSource(fileSystem, filename);
             if (stat) return buildFileInfo('sog', stat);
+        }
+    }
+
+    // SPZ: header-only peek (no decompression of the scene).
+    if (inputFormat === 'spz') {
+        const source = await fileSystem.createSource(filename);
+        try {
+            return buildFileInfo('spz', await statSpzSource(source));
+        } finally {
+            source.close();
         }
     }
 

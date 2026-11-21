@@ -1,4 +1,4 @@
-import { type ChunkDataPool, type ChunkSource } from '../chunk';
+import type { ChunkDataPool, ChunkSource } from '../chunk';
 import { logger } from '../utils';
 
 // Sort `indices` in place into morton (Z-order), reading each point's xyz from
@@ -11,8 +11,13 @@ import { logger } from '../utils';
 // re-sorted by a finer pass over its sub-range.
 const sortMortonStrided = (
     indices: Uint32Array,
-    xa: ArrayLike<number>, ya: ArrayLike<number>, za: ArrayLike<number>,
-    stride: number, ox: number, oy: number, oz: number
+    xa: ArrayLike<number>,
+    ya: ArrayLike<number>,
+    za: ArrayLike<number>,
+    stride: number,
+    ox: number,
+    oy: number,
+    oz: number
 ): void => {
     const generate = (indices: Uint32Array) => {
         if (indices.length === 0) {
@@ -32,13 +37,19 @@ const sortMortonStrided = (
             return (Part1By2(z) << 2) + (Part1By2(y) << 1) + Part1By2(x);
         };
 
-        let mx = Infinity, my = Infinity, mz = Infinity;
-        let Mx = -Infinity, My = -Infinity, Mz = -Infinity;
+        let mx = Infinity,
+            my = Infinity,
+            mz = Infinity;
+        let Mx = -Infinity,
+            My = -Infinity,
+            Mz = -Infinity;
 
         // scene extents across these splats (world-space positions)
         for (let i = 0; i < indices.length; ++i) {
             const b = indices[i] * stride;
-            const x = xa[b + ox], y = ya[b + oy], z = za[b + oz];
+            const x = xa[b + ox],
+                y = ya[b + oy],
+                z = za[b + oz];
             if (x < mx) mx = x;
             if (x > Mx) Mx = x;
             if (y < my) my = y;
@@ -47,7 +58,9 @@ const sortMortonStrided = (
             if (z > Mz) Mz = z;
         }
 
-        const xlen = Mx - mx, ylen = My - my, zlen = Mz - mz;
+        const xlen = Mx - mx,
+            ylen = My - my,
+            zlen = Mz - mz;
         if (!isFinite(xlen) || !isFinite(ylen) || !isFinite(zlen)) {
             logger.debug('invalid extents', xlen, ylen, zlen);
             return;
@@ -56,9 +69,9 @@ const sortMortonStrided = (
             return; // all points identical
         }
 
-        const xmul = (xlen === 0) ? 0 : 1024 / xlen;
-        const ymul = (ylen === 0) ? 0 : 1024 / ylen;
-        const zmul = (zlen === 0) ? 0 : 1024 / zlen;
+        const xmul = xlen === 0 ? 0 : 1024 / xlen;
+        const ymul = ylen === 0 ? 0 : 1024 / ylen;
+        const zmul = zlen === 0 ? 0 : 1024 / zlen;
 
         const morton = new Uint32Array(indices.length);
         for (let i = 0; i < indices.length; ++i) {
@@ -69,22 +82,48 @@ const sortMortonStrided = (
             morton[i] = encodeMorton3(ix, iy, iz);
         }
 
-        // sort indices by morton code
-        const order = new Uint32Array(indices.length);
-        for (let i = 0; i < order.length; i++) {
-            order[i] = i;
+        // Sort indices by morton code: LSD radix, three stable passes of 10
+        // bits over the 30-bit key. Stable, so equal codes keep their input
+        // order (matching a stable comparison sort), and linear rather than
+        // n log n through a comparator callback. Passes ping-pong between
+        // `indices`/`morton` and the scratch pair; three passes end in scratch,
+        // so the result is copied back into the caller's `indices`.
+        const n = indices.length;
+        const scratchIndices = new Uint32Array(n);
+        const scratchMorton = new Uint32Array(n);
+        const counts = new Uint32Array(1024);
+        let srcIdx: Uint32Array = indices,
+            srcKey: Uint32Array = morton;
+        let dstIdx: Uint32Array = scratchIndices,
+            dstKey: Uint32Array = scratchMorton;
+        for (let shift = 0; shift < 30; shift += 10) {
+            counts.fill(0);
+            for (let i = 0; i < n; ++i) {
+                counts[(srcKey[i] >>> shift) & 1023]++;
+            }
+            // exclusive prefix sum -> bucket start offsets
+            let sum = 0;
+            for (let d = 0; d < 1024; ++d) {
+                const c = counts[d];
+                counts[d] = sum;
+                sum += c;
+            }
+            for (let i = 0; i < n; ++i) {
+                const o = counts[(srcKey[i] >>> shift) & 1023]++;
+                dstIdx[o] = srcIdx[i];
+                dstKey[o] = srcKey[i];
+            }
+            [srcIdx, dstIdx] = [dstIdx, srcIdx];
+            [srcKey, dstKey] = [dstKey, srcKey];
         }
-        order.sort((a, b) => morton[a] - morton[b]);
-
-        const tmpIndices = indices.slice();
-        for (let i = 0; i < indices.length; ++i) {
-            indices[i] = tmpIndices[order[i]];
-        }
+        indices.set(srcIdx);
+        const sortedMorton = srcKey;
 
         // recursively refine the largest equal-code buckets
-        let start = 0, end = 1;
-        while (start < indices.length) {
-            while (end < indices.length && morton[order[end]] === morton[order[start]]) {
+        let start = 0,
+            end = 1;
+        while (start < n) {
+            while (end < n && sortedMorton[end] === sortedMorton[start]) {
                 ++end;
             }
             if (end - start > 256) {
@@ -101,11 +140,16 @@ const sortMortonStrided = (
  * Sort `indices` in place into morton (Z-order) using interleaved positions
  * `[x, y, z, x, y, z, ...]` — the natural packing of the `position` layer.
  *
- * @param positions - Interleaved xyz; gaussian `g` is at `positions[g*3 + {0,1,2}]`.
+ * `stride` lets the same call sort a wider record whose first three words are
+ * xyz, e.g. a packed `[x, y, z, w]` GPU texture row viewed as floats, without
+ * copying the positions out first.
+ *
+ * @param positions - Interleaved xyz; gaussian `g` is at `positions[g*stride + {0,1,2}]`.
  * @param indices - Indices to sort in place.
+ * @param stride - Words per gaussian in `positions` (default 3).
  */
-const sortMortonInterleaved = (positions: ArrayLike<number>, indices: Uint32Array): void => {
-    sortMortonStrided(indices, positions, positions, positions, 3, 0, 1, 2);
+const sortMortonInterleaved = (positions: ArrayLike<number>, indices: Uint32Array, stride = 3): void => {
+    sortMortonStrided(indices, positions, positions, positions, stride, 0, 1, 2);
 };
 
 /**
@@ -119,7 +163,12 @@ const sortMortonInterleaved = (positions: ArrayLike<number>, indices: Uint32Arra
  * @param z - Z coordinates, indexed by gaussian.
  * @param indices - Indices to sort in place.
  */
-const sortMortonColumns = (x: ArrayLike<number>, y: ArrayLike<number>, z: ArrayLike<number>, indices: Uint32Array): void => {
+const sortMortonColumns = (
+    x: ArrayLike<number>,
+    y: ArrayLike<number>,
+    z: ArrayLike<number>,
+    indices: Uint32Array
+): void => {
     sortMortonStrided(indices, x, y, z, 1, 0, 0, 0);
 };
 

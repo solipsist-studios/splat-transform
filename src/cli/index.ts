@@ -4,16 +4,14 @@ import { basename, dirname, join, resolve } from 'node:path';
 import process, { exit } from 'node:process';
 import { parseArgs } from 'node:util';
 
-import { GraphicsDevice, Vec3 } from 'playcanvas';
+import type { GraphicsDevice } from 'playcanvas';
+import { Vec3 } from 'playcanvas';
 
-import { createDevice, enumerateAdapters, getPeakGpuMemory } from './node-device';
-import { NodeFileSystem, NodeReadFileSystem } from './node-file-system';
 import {
     bakeTransform,
     combine,
     concatSource,
     createChunkDataPool,
-    DataTable,
     dataTableToChunkSource,
     decimateSource,
     decimateSourceAdaptive,
@@ -26,6 +24,7 @@ import {
     parseSogstComments,
     processSourceBridged,
     readFile,
+    readFileInfo,
     readPly,
     readPlyComments,
     resolveSplatModel,
@@ -39,28 +38,42 @@ import {
     WorkerQueue,
     writeLodSource,
     writeSource,
-    type ChunkSource,
-    type ChunkSourceMetadata,
-    type ProcessAction,
-    type FilterFloaters,
-    type FilterCluster,
-    type Options as LibOptions,
-    type CollisionMeshShape,
-    type ReadFileSystem,
     logger
+} from '../lib';
+import type {
+    DataTable,
+    ChunkSource,
+    ChunkSourceMetadata,
+    ProcessAction,
+    FilterFloaters,
+    FilterCluster,
+    Options as LibOptions,
+    CollisionMeshShape,
+    ReadFileSystem,
+    SogBlindTexture
 } from '../lib';
 // CLI-only internals (deliberately off the public lib surface): the LOD-path
 // level resolver and the container source readers the LOD writer drives
 // directly (single-scene callers get these via readFile).
+import { resolveComments, withComments } from '../lib/comments';
+import { resolveExtras, withExtras } from '../lib/extras';
 import { resolveLodLevels } from '../lib/ops';
 import { readLccSource, readLccEnvironmentSource } from '../lib/readers/read-lcc';
 import { readLcc2Source, readLcc2EnvironmentSource } from '../lib/readers/read-lcc2';
 import { readLodSource, readLodEnvironmentSource } from '../lib/readers/read-lod';
+import { loadCameraTrack } from '../lib/render/camera-track';
+import type { CameraTrack } from '../lib/render/camera-track';
+import { formatFileInfo } from '../lib/source-info';
+import { combineBlindOrigins, isBlindEncoding, withBlindOrigins } from '../lib/utils/sog-blind';
+import { frameFilename } from '../lib/writers/utils';
+
+import { createDevice, enumerateAdapters, getPeakGpuMemory } from './node-device';
+import { NodeFileSystem, NodeReadFileSystem } from './node-file-system';
 
 /**
  * CLI-specific options extending library options.
  */
-interface CliOptions extends LibOptions {
+type CliOptions = {
     overwrite: boolean;
     help: boolean;
     version: boolean;
@@ -69,17 +82,18 @@ interface CliOptions extends LibOptions {
     mem: boolean;
     noTty: boolean | undefined;
     listGpus: boolean;
-    deviceIdx: number;  // -1 = auto, -2 = CPU, 0+ = GPU index
-    scratchDir: string | undefined;  // decimation spill location (default: output directory)
-    memoryBudgetBytes: number;  // decimation residency policy ceiling (not an allocation, not user-facing)
-}
+    deviceIdx: number; // -1 = auto, -2 = CPU, 0+ = GPU index
+    gpuBackend: string | undefined; // forced Dawn backend; undefined = platform default
+    scratchDir: string | undefined; // decimation intermediate location (explicit only, never defaulted)
+    memoryBudgetBytes: number; // decimation residency policy ceiling (not an allocation, not user-facing)
+} & LibOptions;
 
 const fileExists = async (filename: string) => {
     try {
         await lstat(filename);
         return true;
-    } catch (e: any) {
-        if (e?.code === 'ENOENT') {
+    } catch (e) {
+        if ((e as { code?: string })?.code === 'ENOENT') {
             return false;
         }
         throw e; // real error (permissions, etc)
@@ -157,17 +171,29 @@ const cliOptionsConfig = {
     tty: { type: 'boolean' },
     'sh-iterations': { type: 'string', short: 'i', default: '10' },
     'max-workers': { type: 'string' },
+    'webp-effort': { type: 'string' },
     'list-gpus': { type: 'boolean', default: false },
     gpu: { type: 'string', short: 'g', default: '-1' },
+    'gpu-backend': { type: 'string' },
     'select-lod': { type: 'string', short: 'L', default: '' },
     'viewer-settings': { type: 'string', default: '' },
     'lod-chunk-count': { type: 'string', default: '512' },
     'lod-chunk-extent': { type: 'string', default: '16' },
+    'lod-chunk-min': { type: 'string', default: '8' },
+    'lod-file-count': { type: 'string', default: '' },
     'spz-version': { type: 'string', default: '4' },
+    'ply-logit-opacity': { type: 'boolean', default: false },
+    'sog-version': { type: 'string', default: '3' },
+    'sog-blind': { type: 'string', multiple: true },
+    'sog-extras': { type: 'string' },
+    'sh-palette-size': { type: 'string' },
+    'sh-color-error': { type: 'string', default: '5' },
     'segment-duration': { type: 'string', short: 'T', default: '' },
     'segment-frames': { type: 'string', default: '' },
     fps: { type: 'string', short: 'f', default: '' },
     unbundled: { type: 'boolean', default: false },
+    // negated as --no-compensation (parseArgs allowNegative)
+    compensation: { type: 'boolean' },
     'voxel-size': { type: 'string' },
     'voxel-opacity': { type: 'string' },
     'voxel-external-fill': { type: 'string' },
@@ -175,22 +201,26 @@ const cliOptionsConfig = {
     'voxel-carve': { type: 'string' },
     'seed-pos': { type: 'string', default: '' },
     'collision-mesh': { type: 'string' },
-    'projection': { type: 'string' },
+    projection: { type: 'string' },
     'camera-pos': { type: 'string' },
     'camera-target': { type: 'string' },
     'camera-up': { type: 'string' },
     'camera-fov': { type: 'string' },
-    'resolution': { type: 'string' },
+    resolution: { type: 'string' },
     'camera-near': { type: 'string' },
-    'background': { type: 'string' },
+    'aa-filter-size': { type: 'string' },
+    background: { type: 'string' },
     'f-stop': { type: 'string' },
+    'dof-samples': { type: 'string' },
     'focus-distance': { type: 'string' },
     'sensor-size': { type: 'string' },
     'camera-pos-end': { type: 'string' },
     'camera-target-end': { type: 'string' },
     'camera-up-end': { type: 'string' },
-    'shutter': { type: 'string' },
+    shutter: { type: 'string' },
     'motion-samples': { type: 'string' },
+    'camera-track': { type: 'string' },
+    frames: { type: 'string' },
 
     'scratch-dir': { type: 'string' },
 
@@ -203,7 +233,7 @@ const cliOptionsConfig = {
     'filter-harmonics': { type: 'string', short: 'H', multiple: true },
     'filter-box': { type: 'string', short: 'B', multiple: true },
     'filter-sphere': { type: 'string', short: 'S', multiple: true },
-    'decimate': { type: 'string', short: 'd', multiple: true },
+    decimate: { type: 'string', short: 'd', multiple: true },
     'decimate-adaptive': { type: 'string', multiple: true },
     'filter-cluster': { type: 'string', short: 'C', multiple: true },
     'filter-floaters': { type: 'string', short: 'F', multiple: true },
@@ -214,9 +244,10 @@ const cliOptionsConfig = {
     'morton-order': { type: 'boolean', short: 'm', multiple: true }
 } as const;
 
-const stringOptionNames = new Set(Object.entries(cliOptionsConfig)
-.filter(([, v]) => v.type === 'string')
-.flatMap(([name, v]) => [`--${name}`, ...('short' in v ? [`-${v.short}`] : [])])
+const stringOptionNames = new Set(
+    Object.entries(cliOptionsConfig)
+        .filter(([, v]) => v.type === 'string')
+        .flatMap(([name, v]) => [`--${name}`, ...('short' in v ? [`-${v.short}`] : [])])
 );
 
 const isNumericValue = (s: string) => /^-?\d[\d.,e+-]*$/.test(s);
@@ -227,7 +258,7 @@ const isTextJsonFormat = (s: string) => /^(?:text|json)$/i.test(s);
 // next argv token is consumed as the value; when omitted (or rejected) the
 // option is normalized to an empty `--option=` form.
 type OptionalValueValidator = (next: string) => boolean;
-const optionalValueOptions: Map<string, OptionalValueValidator> = new Map([
+const optionalValueOptions = new Map<string, OptionalValueValidator>([
     ['--filter-cluster', isNumericValue],
     ['-C', isNumericValue],
     ['--filter-floaters', isNumericValue],
@@ -242,8 +273,8 @@ const optionalValueOptions: Map<string, OptionalValueValidator> = new Map([
 
 const shortToLong = new Map<string, string>(
     Object.entries(cliOptionsConfig)
-    .filter(([, v]) => 'short' in v)
-    .map(([name, v]) => [`-${(v as { short: string }).short}`, `--${name}`])
+        .filter(([, v]) => 'short' in v)
+        .map(([name, v]) => [`-${(v as { short: string }).short}`, `--${name}`])
 );
 
 /**
@@ -311,7 +342,7 @@ const parseArguments = async () => {
     };
 
     const parseVec = (value: string, count: number): number[] => {
-        const parts = value.split(',').map(p => parseNumber(p));
+        const parts = value.split(',').map((p) => parseNumber(p));
         if (parts.length !== count) {
             throw new Error(`Expected ${count} comma-separated values, got ${parts.length}: ${value}`);
         }
@@ -334,14 +365,56 @@ const parseArguments = async () => {
         throw new Error(`Invalid collision mesh shape: ${value}. Expected smooth or faces.`);
     };
 
+    // --sog-blind <field>[,<field>...], field = <column>[:<encoding>[[min,max]]]; the
+    // range's comma sits inside brackets, so fields split on top-level commas only
+    const parseSogBlind = (value: string): SogBlindTexture => {
+        const invalid = (why: string) =>
+            new Error(`Invalid sog-blind value: ${value}. ${why} Must be <column>[:<encoding>][,...].`);
+        const parts: string[] = [];
+        let depth = 0;
+        let start = 0;
+        for (let i = 0; i < value.length; i++) {
+            if (value[i] === '[') depth++;
+            else if (value[i] === ']') depth--;
+            else if (value[i] === ',' && depth === 0) {
+                parts.push(value.slice(start, i));
+                start = i + 1;
+            }
+        }
+        parts.push(value.slice(start));
+        return parts.map((part) => {
+            const m = /^([^:[\],]+)(?::([a-z0-9]+)(?:\[([^,\]]+),([^,\]]+)\])?)?$/.exec(part.trim());
+            if (!m) throw invalid(`Malformed field '${part}'.`);
+            const [, column, name, min, max] = m;
+            let encoding: SogBlindTexture[number]['encoding'];
+            if (name !== undefined) {
+                if (!isBlindEncoding(name)) {
+                    throw invalid(`Unknown encoding '${name}' (u8, u16, u24, u32, f16, f32, unorm8, unorm16).`);
+                }
+                encoding = name;
+            }
+            return {
+                column,
+                ...(encoding !== undefined ? { encoding } : {}),
+                ...(min !== undefined ? { range: [parseNumber(min), parseNumber(max)] as [number, number] } : {})
+            };
+        });
+    };
+
     const parseComparator = (value: string): 'lt' | 'lte' | 'gt' | 'gte' | 'eq' | 'neq' => {
         switch (value) {
-            case 'lt': return 'lt';
-            case 'lte': return 'lte';
-            case 'gt': return 'gt';
-            case 'gte': return 'gte';
-            case 'eq': return 'eq';
-            case 'neq': return 'neq';
+            case 'lt':
+                return 'lt';
+            case 'lte':
+                return 'lte';
+            case 'gt':
+                return 'gt';
+            case 'gte':
+                return 'gte';
+            case 'eq':
+                return 'eq';
+            case 'neq':
+                return 'neq';
             default:
                 throw new Error(`Invalid comparator value: ${value}`);
         }
@@ -353,12 +426,17 @@ const parseArguments = async () => {
     let deviceIdx: number;
     const gpuValue = v.gpu.toLowerCase();
     if (gpuValue === 'cpu') {
-        deviceIdx = -2;  // -2 indicates CPU mode
+        deviceIdx = -2; // -2 indicates CPU mode
     } else {
         deviceIdx = parseInteger(v.gpu);
         if (deviceIdx < -1) {
             throw new Error(`Invalid GPU index: ${deviceIdx}. Must be >= 0 or 'cpu'.`);
         }
+    }
+
+    const gpuBackend = v['gpu-backend']?.toLowerCase();
+    if (gpuBackend !== undefined && !['vulkan', 'd3d12', 'metal'].includes(gpuBackend)) {
+        throw new Error(`Invalid GPU backend: ${v['gpu-backend']}. Must be 'vulkan', 'd3d12' or 'metal'.`);
     }
 
     // Cap the SOG worker pool (0 = inline/serial). Lower trades speed for peak
@@ -441,14 +519,18 @@ const parseArguments = async () => {
     if (v['segment-duration']) {
         const segmentDuration = parseNumber(v['segment-duration']);
         if (!Number.isFinite(segmentDuration) || segmentDuration < 0) {
-            throw new Error(`Invalid segment-duration value: ${v['segment-duration']}. Must be a finite number >= 0 (0 disables segmentation).`);
+            throw new Error(
+                `Invalid segment-duration value: ${v['segment-duration']}. Must be a finite number >= 0 (0 disables segmentation).`
+            );
         }
     }
 
     if (v['segment-frames']) {
         const segmentFrames = parseNumber(v['segment-frames']);
         if (!Number.isFinite(segmentFrames) || segmentFrames < 0) {
-            throw new Error(`Invalid segment-frames value: ${v['segment-frames']}. Must be a finite number >= 0 (0 disables segmentation).`);
+            throw new Error(
+                `Invalid segment-frames value: ${v['segment-frames']}. Must be a finite number >= 0 (0 disables segmentation).`
+            );
         }
     }
 
@@ -463,6 +545,15 @@ const parseArguments = async () => {
     if (spzVersion !== 3 && spzVersion !== 4) {
         throw new Error(`Invalid spz-version value: ${v['spz-version']}. Must be 3 or 4.`);
     }
+    const sogVersion = parseInteger(v['sog-version']);
+    if (sogVersion !== 2 && sogVersion !== 3) {
+        throw new Error(`Invalid sog-version value: ${v['sog-version']}. Must be 2 or 3.`);
+    }
+    const blindValues = v['sog-blind'];
+    if (blindValues?.includes('none') && blindValues.length > 1) {
+        throw new Error('Invalid sog-blind value: none cannot be combined with fields.');
+    }
+    const sogBlind = blindValues?.[0] === 'none' ? [] : blindValues?.map(parseSogBlind);
 
     // Image render options (apply when output is .webp).
     let renderProjection: 'pinhole' | 'equirect' | undefined;
@@ -499,9 +590,18 @@ const parseArguments = async () => {
         renderHeight = parseInteger(m[2]);
     }
     const renderNear = v['camera-near'] !== undefined ? parseNumber(v['camera-near'], 0) : undefined;
+    const renderAntiAliasFilterSize =
+        v['aa-filter-size'] !== undefined ? parseNumber(v['aa-filter-size'], 0) : undefined;
+    if (renderAntiAliasFilterSize !== undefined && renderAntiAliasFilterSize <= 0) {
+        throw new Error(`Invalid --aa-filter-size value: ${v['aa-filter-size']}. Must be > 0.`);
+    }
     const renderFStop = v['f-stop'] !== undefined ? parseNumber(v['f-stop'], 0) : undefined;
     if (renderFStop !== undefined && renderFStop <= 0) {
         throw new Error(`Invalid --f-stop value: ${v['f-stop']}. Must be > 0.`);
+    }
+    const renderDofSamples = v['dof-samples'] !== undefined ? parseInteger(v['dof-samples']) : undefined;
+    if (renderDofSamples !== undefined && renderDofSamples < 1) {
+        throw new Error(`Invalid --dof-samples value: ${v['dof-samples']}. Must be >= 1.`);
     }
     const renderFocusDistance = v['focus-distance'] !== undefined ? parseNumber(v['focus-distance'], 0) : undefined;
     if (renderFocusDistance !== undefined && renderFocusDistance <= 0) {
@@ -534,6 +634,38 @@ const parseArguments = async () => {
     if (renderMotionSamples !== undefined && renderMotionSamples < 1) {
         throw new Error(`Invalid --motion-samples value: ${v['motion-samples']}. Must be >= 1.`);
     }
+    const webpEffort = v['webp-effort'] !== undefined ? parseInteger(v['webp-effort']) : undefined;
+    if (webpEffort !== undefined && (webpEffort < 0 || webpEffort > 9)) {
+        throw new Error(`Invalid --webp-effort value: ${v['webp-effort']}. Must be in [0, 9].`);
+    }
+    // Camera animation: an editor project (.ssproj directory or its document.json),
+    // viewer settings.json, or a plain frames list. Poses without a fov use --camera-fov,
+    // poses without an up vector use --camera-up.
+    let renderCameraTrack: CameraTrack | undefined;
+    if (v['camera-track'] !== undefined) {
+        let trackPath = v['camera-track'];
+        if ((await lstat(trackPath).catch((): null => null))?.isDirectory()) {
+            trackPath = join(trackPath, 'document.json');
+        }
+        let trackJson: unknown;
+        try {
+            trackJson = JSON.parse(await pathReadFile(trackPath, 'utf-8'));
+        } catch (e) {
+            throw new Error(`Failed to read camera track JSON: ${trackPath} (${(e as Error).message})`);
+        }
+        renderCameraTrack = loadCameraTrack(trackJson, renderFov ?? 60, renderUp);
+    }
+    let renderFrames: [number, number] | undefined;
+    if (v.frames !== undefined) {
+        const m = v.frames.match(/^(\d+)(?:-(\d+))?$/);
+        if (!m) {
+            throw new Error(`Invalid --frames value: ${v.frames}. Expected a frame or an inclusive range, e.g. 0-47.`);
+        }
+        renderFrames = [parseInteger(m[1]), parseInteger(m[2] ?? m[1])];
+        if (renderFrames[1] < renderFrames[0]) {
+            throw new Error(`Invalid --frames value: ${v.frames}. The range end precedes its start.`);
+        }
+    }
     let renderBackground: { r: number; g: number; b: number; a: number } | undefined;
     if (v.background !== undefined) {
         const parts = v.background.split(',').map((p: string) => parseNumber(p.trim()));
@@ -558,19 +690,40 @@ const parseArguments = async () => {
         mem: v.memory,
         noTty: v.tty === undefined ? undefined : !v.tty,
         iterations: parseInteger(v['sh-iterations']),
+        webpEffort,
         listGpus: v['list-gpus'],
         deviceIdx,
+        gpuBackend,
         scratchDir: v['scratch-dir'],
         // Residency policy ceiling for decimation (not an upfront allocation).
         // Half the machine's RAM, capped at 48 GiB — derived here because the
         // library is node-free and cannot read os.totalmem() itself.
         memoryBudgetBytes: Math.min(48 * 2 ** 30, Math.floor(totalmem() / 2)),
-        lodSelect: v['select-lod'].split(',').filter(v => !!v).map(parseInteger),
-        viewerSettingsJson: viewerSettingsPath && await readJsonFile(viewerSettingsPath),
+        // The image writer's GPU-resident copy of the scene shares RAM with the
+        // in-memory table on unified-memory machines, so bound it the same way.
+        renderResidentBudget: Math.min(48 * 2 ** 30, Math.floor(totalmem() / 2)),
+        renderCompensation: v.compensation !== false,
+        renderAntiAliasFilterSize,
+        lodSelect: v['select-lod']
+            .split(',')
+            .filter((v) => !!v)
+            .map(parseInteger),
+        viewerSettingsJson: viewerSettingsPath && (await readJsonFile(viewerSettingsPath)),
         unbundled: v.unbundled,
         lodChunkCount: parseInteger(v['lod-chunk-count']),
         lodChunkExtent: parseInteger(v['lod-chunk-extent']),
+        lodChunkMin: parseInteger(v['lod-chunk-min']),
+        lodFileCount: v['lod-file-count']
+            .split(',')
+            .filter((v) => !!v)
+            .map(parseInteger),
         spzVersion: spzVersion as 3 | 4,
+        plyLogitOpacity: v['ply-logit-opacity'],
+        sogVersion: sogVersion as 2 | 3,
+        sogBlind,
+        ...(v['sog-extras'] !== undefined ? { sogExtras: await readJsonFile(v['sog-extras']) } : {}),
+        ...(v['sh-palette-size'] !== undefined ? { sogPaletteSize: parseInteger(v['sh-palette-size']) } : {}),
+        shColorError: parseNumber(v['sh-color-error'], 0.01),
         segmentDuration: v['segment-duration'] ? parseNumber(v['segment-duration']) : undefined,
         segmentFrames: v['segment-frames'] ? parseNumber(v['segment-frames']) : undefined,
         // clip scalars normally come from the input PLY's sogst.* comments;
@@ -594,13 +747,16 @@ const parseArguments = async () => {
         renderNear,
         renderBackground,
         renderFStop,
+        renderDofSamples,
         renderFocusDistance,
         renderSensorSize,
         renderCameraEndPosition,
         renderLookAtEnd,
         renderUpEnd,
         renderShutter,
-        renderMotionSamples
+        renderMotionSamples,
+        renderCameraTrack,
+        renderFrames
     };
 
     for (const t of tokens) {
@@ -654,12 +810,12 @@ const parseArguments = async () => {
                 }
                 case 'filter-harmonics': {
                     const shBands = parseInteger(t.value);
-                    if (![0, 1, 2, 3].includes(shBands)) {
-                        throw new Error(`Invalid filter-harmonics value: ${t.value}. Must be 0, 1, 2, or 3.`);
+                    if (![0, 1, 2, 3, 4].includes(shBands)) {
+                        throw new Error(`Invalid filter-harmonics value: ${t.value}. Must be 0, 1, 2, 3 or 4.`);
                     }
                     current.processActions.push({
                         kind: 'filterBands',
-                        value: shBands as 0 | 1 | 2 | 3
+                        value: shBands as 0 | 1 | 2 | 3 | 4
                     });
 
                     break;
@@ -825,7 +981,7 @@ USAGE
   • Use 'null' as output to discard file output.
 
 SUPPORTED INPUTS
-    .ply   .compressed.ply   .sog   .spz   meta.json   lod-meta.json   .ksplat   .splat   .mjs   .lcc   .lcc2
+    .ply   .compressed.ply   .sog   .spz   meta.json   lod-meta.json   .ksplat   .splat   .glb   .mjs   .lcc   .lcc2
 
     Input filenames may also be http(s):// URLs (downloaded on demand;
     .mjs generators are local-only).
@@ -837,7 +993,7 @@ ACTIONS (executed in order; can be repeated)
     -t, --translate        <x,y,z>          Translate Gaussians by (x, y, z)
     -r, --rotate           <x,y,z>          Rotate Gaussians by Euler angles, in degrees
     -s, --scale            <factor>         Uniformly scale Gaussians by factor
-    -H, --filter-harmonics <0|1|2|3>        Remove spherical harmonic bands > n
+    -H, --filter-harmonics <0|1|2|3|4>      Remove spherical harmonic bands > n
     -N, --filter-nan                        Remove Gaussians with NaN values, most Inf values, or a zero-norm rotation
     -B, --filter-box       <x,y,z,X,Y,Z>    Remove Gaussians outside box (min, max corners)
     -S, --filter-sphere    <x,y,z,radius>   Remove Gaussians outside sphere
@@ -849,8 +1005,8 @@ ACTIONS (executed in order; can be repeated)
         --decimate-adaptive <n|n%>          Simplify, allocating removal by local error (adaptive).
                                               Much better on mixed-scale content such as skies.
                                               Either must be the final action, with a .ply output
-        --scratch-dir      <path>           Directory for decimation spill files (deep targets on huge
-                                              scenes). Default: the output file's directory
+        --scratch-dir      <path>           Directory for intermediate levels when a deep decimation
+                                              target exceeds memory. Nothing is written without it
     -F, --filter-floaters  [size,op,min]    Remove Gaussians not contributing to any solid voxel. Default: 0.05,0.1,0.004
     -C, --filter-cluster   [res,op,min]     Keep only the connected cluster at --seed-pos. Default: 1.0,0.999,0.1
     -p, --params           <key=val,...>    Pass parameters to .mjs generator script
@@ -867,15 +1023,36 @@ GENERAL
         --memory                            Show peak memory in progress output
         --tty                               Interactive bar rendering (--no-tty to disable)
     -w, --overwrite                         Overwrite output file if it exists
+        --webp-effort      <0-9>            Lossless WebP compression effort for image, SOG, HTML and LOD output.
+                                            Higher tries harder to reduce size. Default: libwebp’s default lossless settings.
 
 GPU (used by SOG compression and GPU voxelization: --filter-cluster, --filter-floaters, .voxel.json output)
         --list-gpus                         List available GPU adapters and exit
     -g, --gpu              <n|cpu>          Device for GPU operations: GPU adapter index | 'cpu'
                                               ('cpu' disables GPU and is incompatible with GPU-only features)
+        --gpu-backend      <name>           Force the WebGPU backend: vulkan | d3d12 | metal. Default: platform default
+                                              (e.g. vulkan works around Dawn D3D12 bugs on Windows)
 
 SOG COMPRESSION (.sog, meta.json, lod-meta.json, .html outputs)
-    -i, --sh-iterations    <n>              SH compression iterations (more=better). Default: 10
-        --max-workers      <n>              Worker threads for SOG encoding (0 = inline/serial). Default: 4
+    -i, --sh-iterations    <n>              SH compression iterations with --sh-palette-size (more=better). Default: 10
+        --sh-palette-size  <n>              Fixed SH palette entries for .sog / meta.json (more=better, slower). Up to
+                                              262144 with SOG v3, 65536 with v2. Default: sized by --sh-color-error
+        --sh-color-error   <levels>         SH palette size target: the visibility-weighted colour error (in 8-bit
+                                              levels) the palette may add; the smallest palette meeting it is
+                                              written, up to 262144 entries with SOG v3, 65536 with v2. Default: 5
+        --max-workers      <n>              Worker threads for SOG and image-sequence encoding (0 = inline/serial). Default: 4
+        --sog-version      <2|3>            SOG format version to write. 2 is for older viewers: it drops opacity
+                                              above 1, blind data and a 4th SH band. Default: 3 (.html always embeds 3)
+        --sog-blind        <field>[,...]    Store columns as per-gaussian blind data (v3): one blind texture per flag,
+                                              its fields filling 4 bytes (R,G,B,A) in order. field = <col>[:<enc>]
+                                              enc: u8 u16 u24 u32 (unsigned integers), f16 f32 (float bits),
+                                              unorm8 unorm16 (float in [0,1], or unorm8[min,max]). Default: the
+                                              fewest-byte uint that fits. Repeatable, e.g. --sog-blind id
+                                              --sog-blind a:unorm8,b:unorm8,depth:f16. Without the flag, columns read
+                                              from SOG blind data are stored as they were; --sog-blind none stores none
+        --sog-extras       <file.json>      Store this JSON as the output's extras (meta.json / lod-meta.json,
+                                              SOG v3 only), application-defined data as in glTF. Default: the input's
+                                              extras, if any
 
 SOGST OUTPUT (.sogst)
     SOG extended to spacetime. Needs an input PLY carrying the standard 3DGS columns
@@ -890,6 +1067,11 @@ SOGST OUTPUT (.sogst)
 SPZ OUTPUT (.spz)
         --spz-version      <3|4>            The SPZ format version to write. Default: 4
 
+PLY OUTPUT (.ply)
+        --ply-logit-opacity                 Write the standard opacity logit even when some gaussian's opacity
+                                              exceeds 1 (clamped to 1), instead of opacity_linear. For tools that
+                                              don't read opacity_linear
+
 HTML VIEWER OUTPUT (.html)
         --viewer-settings  <settings.json>  HTML viewer settings JSON file
         --unbundled                         Generate unbundled HTML viewer with separate files
@@ -900,6 +1082,8 @@ LOD INPUT (lod-meta.json, .lcc, .lcc2)
 LOD OUTPUT (lod-meta.json)
         --lod-chunk-count  <n>              Approximate number of Gaussians per LOD chunk in K. Default: 512
         --lod-chunk-extent <n>              Approximate size of an LOD chunk in world units (m). Default: 16
+        --lod-chunk-min    <n>              Gaussians in K below which a chunk is not split for extent. Default: 8
+        --lod-file-count   <n,n,...>        Gaussians in K per LOD file, per level from finest; the last repeats. Default: --lod-chunk-count
 
 VOXEL OUTPUT (.voxel.json)
         --voxel-size       <n>              Voxel size for .voxel.json. Default: 0.05
@@ -921,22 +1105,38 @@ IMAGE OUTPUT (.webp) — lossless WebP rendered via GPU rasterizer
         --resolution       <WxH>            Output resolution, e.g. 1920x1080. Default: 1280x720 (pinhole) or 2048x1024 (equirect)
         --camera-near      <n>              Near clip distance. Default: 0.2 (matches reference 3DGS)
         --background       <r,g,b[,a]>      Background color in [0,1]. Default: 0,0,0,1
+        --no-compensation                   Clamp opacity above 1 (from decimation) to 1 and draw every
+                                              gaussian at opacity <= 1. For debugging and A/B comparison.
+        --aa-filter-size   <px²>            Screen-space filter of scenes trained with anti-aliasing (splat model
+                                              antialiased), used in place of the 0.3 px² dilation. Default: 0.1
         --f-stop           <N>              Aperture as a photographic f-stop (e.g. 2.8, 5.6, 11). Enables defocus blur;
                                             smaller = more blur. Pinhole only. Default: disabled (no defocus).
         --focus-distance   <n>              Camera-space Z of the focus plane (world units). Default: distance to --camera-target.
                                             Pinhole only; only meaningful with --f-stop.
+        --dof-samples      <n>              Aperture samples per instant with --f-stop. Default: 32. More samples reduce
+                                            sampling artifacts at greater cost; multiplies --motion-samples when combined.
         --sensor-size      <n>              Vertical sensor height in world units. Gives --f-stop a physical meaning.
                                             Default: 0.024 (35mm full-frame, world units = meters). Scale to your world:
                                             world unit = decimeter → 0.24, world unit = millimeter → 24.
-        --camera-pos-end   <x,y,z>          End camera position. When set, enables camera motion blur: the renderer
-                                            averages sub-frames with the camera interpolated from --camera-pos (shutter open)
-                                            to --camera-pos-end (shutter close). Default: disabled (no motion blur).
+        --camera-pos-end   <x,y,z>          End camera position. When set, enables camera motion blur: the camera moves
+                                            from --camera-pos (shutter open) to --camera-pos-end (shutter close) and the
+                                            frame averages renders at instants across the shutter. Default: disabled.
         --camera-target-end <x,y,z>         End camera target. Default: same as --camera-target. Only with --camera-pos-end.
         --camera-up-end    <x,y,z>          End up vector. Default: same as --camera-up. Only with --camera-pos-end.
-        --shutter          <0..1>           Fraction of the start→end segment integrated, centered on the midpoint
-                                            (1.0 = full motion; 0.5 = 180° shutter). Default: 1. Only with --camera-pos-end.
-        --motion-samples   <n>              Sub-frames to accumulate for motion blur. Cost is N× a single render.
-                                            Default: 16. Only with --camera-pos-end.
+        --shutter          <0..1>           Fraction of the start→end segment averaged, centered on its midpoint. Default: 0.5.
+                                            With --camera-track, fraction of the frame interval averaged around each frame.
+                                            Default for tracks: off. 1.0 = full interval; 0.5 = 180° shutter.
+        --motion-samples   <n>              Renders averaged per motion-blurred frame, at evenly spaced instants across
+                                            the shutter. Cost is N× a single render; too few show as discrete copies
+                                            where the motion between instants exceeds a couple of pixels. Default: 16.
+        --camera-track     <path>           Render a camera animation as a frame sequence: a supersplat editor project
+                                            (.ssproj directory or its document.json), a viewer settings.json with
+                                            animTracks, or a JSON { frameRate, frames: [{ position, target, fov, up }] }.
+                                            Frames are written as <name>.NNNN.webp. Replaces --camera-pos/--camera-target;
+                                            the track's target is the defocus focus point. A frame's up vector tilts the
+                                            camera; frames without one use --camera-up. With --shutter, each frame is
+                                            motion-blurred over that fraction of the frame interval.
+        --frames           <a[-b]>          Inclusive frame range of the track to render. Default: all frames.
 
 EXAMPLES
     # Convert formats
@@ -1023,7 +1223,7 @@ const main = async () => {
 
     const renderer = new TextRenderer({
         write,
-        output: chunk => process.stdout.write(chunk),
+        output: (chunk) => process.stdout.write(chunk),
         getPeakCpuMemory: peakCpuMemoryBytes,
         getPeakGpuMemory
     });
@@ -1073,7 +1273,7 @@ const main = async () => {
     if (options.listGpus) {
         logger.info('Enumerating available GPU adapters...');
         try {
-            const adapters = await enumerateAdapters();
+            const adapters = await enumerateAdapters(options.gpuBackend);
             if (adapters.length === 0) {
                 logger.info('No GPU adapters found.');
                 logger.info('This could mean:');
@@ -1132,6 +1332,18 @@ const main = async () => {
                 failExit(`File '${outputFilename}' already exists. Use -w option to overwrite.`);
             }
 
+            // a camera track writes one file per frame, not the named output
+            if (outputFormat === 'image' && options.renderCameraTrack) {
+                const first = options.renderFrames?.[0] ?? 0;
+                const last = options.renderFrames?.[1] ?? options.renderCameraTrack.frameCount - 1;
+                for (let frame = first; frame <= last; frame++) {
+                    const file = frameFilename(outputFilename, frame, last);
+                    if (await fileExists(file)) {
+                        failExit(`File '${file}' already exists. Use -w option to overwrite.`);
+                    }
+                }
+            }
+
             // for unbundled HTML, also check for additional files
             if (outputFormat === 'html' && options.unbundled) {
                 const outputDir = dirname(outputFilename);
@@ -1157,30 +1369,33 @@ const main = async () => {
         // ops (decimate / voxel filters) and the GPU writers (image / voxel).
         // deviceIdx: -1 = auto, -2 = CPU, 0+ = specific GPU index
         let cachedDevice: GraphicsDevice | undefined;
-        const deviceCreator = options.deviceIdx === -2 ? undefined : async () => {
-            if (cachedDevice) {
-                return cachedDevice;
-            }
+        const deviceCreator =
+            options.deviceIdx === -2
+                ? undefined
+                : async () => {
+                      if (cachedDevice) {
+                          return cachedDevice;
+                      }
 
-            let adapterName: string | undefined;
-            if (options.deviceIdx >= 0) {
-                const adapters = await enumerateAdapters();
-                const adapter = adapters[options.deviceIdx];
-                if (adapter) {
-                    adapterName = adapter.name;
-                } else {
-                    logger.warn(`GPU adapter index ${options.deviceIdx} not found, using default`);
-                }
-            }
+                      let adapterName: string | undefined;
+                      if (options.deviceIdx >= 0) {
+                          const adapters = await enumerateAdapters(options.gpuBackend);
+                          const adapter = adapters[options.deviceIdx];
+                          if (adapter) {
+                              adapterName = adapter.name;
+                          } else {
+                              logger.warn(`GPU adapter index ${options.deviceIdx} not found, using default`);
+                          }
+                      }
 
-            cachedDevice = await createDevice(adapterName);
-            return cachedDevice;
-        };
+                      cachedDevice = await createDevice(adapterName, options.gpuBackend);
+                      return cachedDevice;
+                  };
 
         // A single input has an unambiguous format for --info/--stats to report;
         // with multiple (combined) inputs the format is omitted.
-        const soleInputFormat = inputArgs.length === 1 ?
-            getInputFormat(resolveInput(inputArgs[0].filename).classifyName) : undefined;
+        const soleInputFormat =
+            inputArgs.length === 1 ? getInputFormat(resolveInput(inputArgs[0].filename).classifyName) : undefined;
         const processOptions = { createDevice: deviceCreator, sourceFormat: soleInputFormat };
 
         // declare phase total: one Read phase per input + one Write phase
@@ -1194,7 +1409,9 @@ const main = async () => {
         // writer, so it keeps the full multi-LOD source — `--info`/`--stats`
         // there report every level. lod-meta output keeps every level (path below).
         if (outputFormat !== null && outputFormat !== 'lod' && options.lodSelect.length > 1) {
-            throw new Error('Cannot write multiple LOD levels (--select-lod) to a single-scene output; select one level, or output lod-meta.json.');
+            throw new Error(
+                'Cannot write multiple LOD levels (--select-lod) to a single-scene output; select one level, or output lod-meta.json.'
+            );
         }
 
         // Single-scene pipeline (one chunk-native path for every non-lod output).
@@ -1209,34 +1426,55 @@ const main = async () => {
         // voxel/spz). LOD output has its own structural path below; this pipeline
         // also handles null output (processing for side-effects, skipping the
         // write). A --tag-lod tag on single-scene output is rejected after the LOD path.
-        const singleSceneActions = [...inputArgs.flatMap(a => a.processActions), ...outputArg.processActions];
+        const singleSceneActions = [...inputArgs.flatMap((a) => a.processActions), ...outputArg.processActions];
 
         // v1 decimation is terminal: the merge stream writes straight into the
         // destination, so decimate must be the last action and the output must
         // be plain PLY. Anything else needs two invocations (decimate to PLY,
         // then convert).
-        const decimateIdx = singleSceneActions.map((a, i) => (a.kind === 'decimate' ? i : -1)).filter(i => i >= 0);
+        const decimateIdx = singleSceneActions.map((a, i) => (a.kind === 'decimate' ? i : -1)).filter((i) => i >= 0);
         if (decimateIdx.length > 0) {
-            const ok = decimateIdx.length === 1 &&
+            const ok =
+                decimateIdx.length === 1 &&
                 decimateIdx[0] === singleSceneActions.length - 1 &&
                 !isNullOutput &&
                 outputFormat === 'ply';
             if (!ok) {
                 failExit(
                     '--decimate must be the final action and the output must be .ply ' +
-                    `(got ${isNullOutput ? 'no output' : `.${outputFormat}`}${decimateIdx[0] !== singleSceneActions.length - 1 || decimateIdx.length > 1 ? ', with actions after decimate' : ''}). ` +
-                    'Write a decimated PLY first, then convert in a second invocation.'
+                        `(got ${isNullOutput ? 'no output' : `.${outputFormat}`}${decimateIdx[0] !== singleSceneActions.length - 1 || decimateIdx.length > 1 ? ', with actions after decimate' : ''}). ` +
+                        'Write a decimated PLY first, then convert in a second invocation.'
                 );
             }
         }
-        const decimateAction = decimateIdx.length === 1 ?
-            singleSceneActions[decimateIdx[0]] as CliDecimate :
-            null;
+        const decimateAction = decimateIdx.length === 1 ? (singleSceneActions[decimateIdx[0]] as CliDecimate) : null;
 
+        // `--info` alone on one input with no output: report through readFileInfo,
+        // which reads only the header where the format allows (sog, spz) instead of
+        // opening, and for eager readers decoding, the whole file. The output is
+        // what the info action prints for the same file.
+        const [onlyAction] = singleSceneActions;
         if (
-            isNullOutput ||
-            (outputFormat !== 'lod' && singleSceneActions.every(a => a.kind !== 'lod'))
+            isNullOutput &&
+            inputArgs.length === 1 &&
+            singleSceneActions.length === 1 &&
+            onlyAction.kind === 'info' &&
+            soleInputFormat !== 'mjs'
         ) {
+            const { filename: inFile, fileSystem } = resolveInput(inputArgs[0].filename);
+            const info = await readFileInfo({
+                filename: inFile,
+                inputFormat: soleInputFormat,
+                options: { ...options, lodSelect: [] },
+                params: [],
+                fileSystem
+            });
+            logger.output(formatFileInfo(info, onlyAction.format));
+            reportDone();
+            exit(0);
+        }
+
+        if (isNullOutput || (outputFormat !== 'lod' && singleSceneActions.every((a) => a.kind !== 'lod'))) {
             const pool = createChunkDataPool();
 
             // Open one input as a full (all-LOD) ChunkSource via readFile — native
@@ -1244,17 +1482,25 @@ const main = async () => {
             // inputs. LOD selection is a selectLod node below (real single-LOD
             // writers only), so readFile always reads every level. mjs generators
             // need their params + a file:// URL.
-            const openInput = async (inputArg: typeof inputArgs[number]): Promise<ChunkSource> => {
+            const openInput = async (inputArg: (typeof inputArgs)[number]): Promise<ChunkSource> => {
                 const { filename: inFile, fileSystem, classifyName } = resolveInput(inputArg.filename);
                 const fmt = getInputFormat(classifyName);
                 if (fmt === 'mjs' && isHttpUrl(inputArg.filename)) {
                     throw new Error(`.mjs generator inputs cannot be loaded from a URL: ${inputArg.filename}`);
                 }
-                const params = inputArg.processActions.filter(a => a.kind === 'param').map((p) => {
-                    return { name: p.name, value: p.value };
-                });
+                const params = inputArg.processActions
+                    .filter((a) => a.kind === 'param')
+                    .map((p) => {
+                        return { name: p.name, value: p.value };
+                    });
                 const readFilename = fmt === 'mjs' ? `file://${inFile}` : inFile;
-                const srcs = await readFile({ filename: readFilename, inputFormat: fmt, options: { ...options, lodSelect: [] }, params, fileSystem });
+                const srcs = await readFile({
+                    filename: readFilename,
+                    inputFormat: fmt,
+                    options: { ...options, lodSelect: [] },
+                    params,
+                    fileSystem
+                });
                 return srcs.length === 1 ? srcs[0] : concatSource(srcs, pool);
             };
 
@@ -1262,20 +1508,21 @@ const main = async () => {
             // combine() does); mixed layout -> bridge through the DataTable combine().
             const combineSources = async (sources: ChunkSource[]): Promise<ChunkSource> => {
                 if (sources.length === 1) return sources[0];
-                const sig = (m: ChunkSourceMetadata) => `${m.shBands}|${[...m.availableLayers].sort().join(',')}|${m.extraColumns.map(e => `${e.name}:${e.type}`).join(',')}`;
-                if (sources.every(s => sig(s.meta) === sig(sources[0].meta))) {
+                const sig = (m: ChunkSourceMetadata) =>
+                    `${m.shBands}|${[...m.availableLayers].sort().join(',')}|${m.extraColumns.map((e) => `${e.name}:${e.type}`).join(',')}`;
+                if (sources.every((s) => sig(s.meta) === sig(sources[0].meta))) {
                     const ref = sources[0].meta.transform;
-                    const unified = sources.every(s => s.meta.transform.equals(ref)) ?
-                        sources :
-                        sources.map(s => bakeTransform(s, Transform.IDENTITY));
+                    const unified = sources.every((s) => s.meta.transform.equals(ref))
+                        ? sources
+                        : sources.map((s) => bakeTransform(s, Transform.IDENTITY));
                     return concatSource(unified, pool);
                 }
                 // Mismatched layouts: combine() can union them, concatSource can't.
                 // A DataTable carries no model tag, so resolve it here as
                 // concatSource would (mixed -> 'default', with a warning).
-                const model = resolveSplatModel(sources.map(s => s.meta.model));
-                if (sources.some(s => s.meta.model !== model)) {
-                    const seen = [...new Set(sources.map(s => s.meta.model))].join(', ');
+                const model = resolveSplatModel(sources.map((s) => s.meta.model));
+                if (sources.some((s) => s.meta.model !== model)) {
+                    const seen = [...new Set(sources.map((s) => s.meta.model))].join(', ');
                     logger.warn(`mixed splat models (${seen}); writing the result as '${model}'`);
                 }
                 const dts: DataTable[] = [];
@@ -1283,7 +1530,16 @@ const main = async () => {
                     dts.push(await materializeToDataTable(s, pool));
                     await s.close();
                 }
-                return dataTableToChunkSource(combine(dts), pool.chunkSize, undefined, model);
+                const combined = dataTableToChunkSource(combine(dts), pool.chunkSize, undefined, model);
+                // a DataTable carries no blind origins: merge the inputs' by column name
+                const extraColumns = combineBlindOrigins(
+                    sources.map((s) => s.meta.extraColumns),
+                    combined.meta.extraColumns
+                );
+                return withComments(
+                    withExtras(withBlindOrigins(combined, extraColumns), resolveExtras(sources)),
+                    resolveComments(sources)
+                );
             };
 
             const phase = logger.group(`Output ${outputArg.filename}`, { index: phaseTotal, total: phaseTotal });
@@ -1301,12 +1557,17 @@ const main = async () => {
                     const level = resolveLodLevels(options.lodSelect, src.meta.numLods)[0] ?? 0;
                     src = selectLod(src, level);
                 }
-                const actions = stripLodTags(inputArg.processActions).filter(a => a.kind !== 'decimate');
+                const actions = stripLodTags(inputArg.processActions).filter((a) => a.kind !== 'decimate');
                 processed.push(await processSourceBridged(src, actions, pool, processOptions));
             }
 
             let combined = await combineSources(processed);
-            combined = await processSourceBridged(combined, stripLodTags(outputArg.processActions).filter(a => a.kind !== 'decimate'), pool, processOptions);
+            combined = await processSourceBridged(
+                combined,
+                stripLodTags(outputArg.processActions).filter((a) => a.kind !== 'decimate'),
+                pool,
+                processOptions
+            );
 
             if (combined.meta.numGaussians === 0) {
                 throw new Error('No Gaussians to write');
@@ -1314,35 +1575,42 @@ const main = async () => {
 
             if (decimateAction) {
                 const n = combined.meta.numGaussians;
-                const keepCount = decimateAction.count !== null ?
-                    Math.min(decimateAction.count, n) :
-                    Math.round(n * (decimateAction.percent ?? 100) / 100);
+                const keepCount =
+                    decimateAction.count !== null
+                        ? Math.min(decimateAction.count, n)
+                        : Math.round((n * (decimateAction.percent ?? 100)) / 100);
                 if (keepCount < 1) {
                     failExit(`--decimate target resolves to ${keepCount} gaussians; must keep at least 1`);
                 }
-                const spill = {
-                    writeFs: new NodeFileSystem(),
-                    readFs: new NodeReadFileSystem(),
-                    scratchDir: options.scratchDir ?? dirname(outputFilename),
-                    remove: (path: string) => unlink(path)
-                };
-                combined = decimateAction.adaptive ?
-                    await decimateSourceAdaptive(combined, pool, {
-                        targetCount: keepCount,
-                        createDevice: deviceCreator,
-                        memoryBudgetBytes: options.memoryBudgetBytes,
-                        spill
-                    }) :
-                    await decimateSource(combined, pool, {
-                        targetCount: keepCount,
-                        createDevice: deviceCreator,
-                        memoryBudgetBytes: options.memoryBudgetBytes,
-                        spill
-                    });
+                // Explicit only: a deep target that exceeds the memory budget fails
+                // rather than writing intermediates somewhere the user did not name.
+                const spill = options.scratchDir
+                    ? {
+                          writeFs: new NodeFileSystem(),
+                          readFs: new NodeReadFileSystem(),
+                          scratchDir: options.scratchDir,
+                          remove: (path: string) => unlink(path)
+                      }
+                    : undefined;
+                combined = decimateAction.adaptive
+                    ? await decimateSourceAdaptive(combined, pool, {
+                          targetCount: keepCount,
+                          createDevice: deviceCreator,
+                          memoryBudgetBytes: options.memoryBudgetBytes,
+                          spill
+                      })
+                    : await decimateSource(combined, pool, {
+                          targetCount: keepCount,
+                          createDevice: deviceCreator,
+                          memoryBudgetBytes: options.memoryBudgetBytes,
+                          spill
+                      });
             }
 
             logger.info(`${fmtCount(combined.meta.numGaussians)} gaussians · ${combined.meta.shBands} SH bands`);
-            if (outputFormat !== null) { // null output: process for side-effects (e.g. --stats), skip the write
+            if (outputFormat !== null) {
+                // null output: process for side-effects (e.g. --stats), skip the write
+
                 // .sogst clip scalars (time range, frame rate) ride in the
                 // input PLY's header comments. A ChunkSource deliberately
                 // carries no comments, so read the headers directly here.
@@ -1358,14 +1626,17 @@ const main = async () => {
                     options.sogstClip = { ...fromInputs, ...options.sogstClip };
                 }
 
-                await writeSource({
-                    filename: outputFilename,
-                    outputFormat,
-                    source: combined,
-                    pool,
-                    options,
-                    createDevice: deviceCreator
-                }, new NodeFileSystem());
+                await writeSource(
+                    {
+                        filename: outputFilename,
+                        outputFormat,
+                        source: combined,
+                        pool,
+                        options,
+                        createDevice: deviceCreator
+                    },
+                    new NodeFileSystem()
+                );
             }
 
             await combined.close();
@@ -1383,8 +1654,10 @@ const main = async () => {
         // output byte-for-byte.
         if (!isNullOutput && outputFormat === 'lod') {
             const pool = createChunkDataPool();
-            const single = inputArgs.length === 1 && !isHttpUrl(inputArgs[0].filename) ?
-                getInputFormat(resolveInput(inputArgs[0].filename).classifyName) : null;
+            const single =
+                inputArgs.length === 1 && !isHttpUrl(inputArgs[0].filename)
+                    ? getInputFormat(resolveInput(inputArgs[0].filename).classifyName)
+                    : null;
 
             let perLevel: ChunkSource[] = [];
             let envSource: ChunkSource | null = null;
@@ -1395,59 +1668,70 @@ const main = async () => {
                 // Intrinsic multi-LOD: view each level with selectLod (shared parent);
                 // env fetched separately. The input's own actions apply per level.
                 const { filename: inFile, fileSystem } = resolveInput(inputArgs[0].filename);
-                const multi = single === 'lcc2' ?
-                    await readLcc2Source(fileSystem, inFile, { ...options, lodSelect: [] }, pool) :
-                    single === 'lod' ?
-                        await readLodSource(fileSystem, inFile, { ...options, lodSelect: [] }, pool) :
-                        await readLccSource(fileSystem, inFile, { ...options, lodSelect: [] }, pool);
+                const multi =
+                    single === 'lcc2'
+                        ? await readLcc2Source(fileSystem, inFile, { ...options, lodSelect: [] }, pool)
+                        : single === 'lod'
+                          ? await readLodSource(fileSystem, inFile, { ...options, lodSelect: [] }, pool)
+                          : await readLccSource(fileSystem, inFile, { ...options, lodSelect: [] }, pool);
                 container = multi;
-                envSource = single === 'lcc2' ?
-                    await readLcc2EnvironmentSource(fileSystem, inFile, pool) :
-                    single === 'lod' ?
-                        await readLodEnvironmentSource(fileSystem, inFile, pool) :
-                        await readLccEnvironmentSource(fileSystem, inFile, pool);
+                envSource =
+                    single === 'lcc2'
+                        ? await readLcc2EnvironmentSource(fileSystem, inFile, pool)
+                        : single === 'lod'
+                          ? await readLodEnvironmentSource(fileSystem, inFile, pool)
+                          : await readLccEnvironmentSource(fileSystem, inFile, pool);
                 // --select-lod picks which levels go into the lod-meta (default all).
-                perLevel = resolveLodLevels(options.lodSelect, multi.meta.numLods).map(lvl => selectLod(multi, lvl));
+                perLevel = resolveLodLevels(options.lodSelect, multi.meta.numLods).map((lvl) => selectLod(multi, lvl));
                 inputActions = inputArgs[0].processActions;
             } else {
                 // PLY inputs grouped by --tag-lod tag (env = -1, untagged = level 0);
                 // each input's own actions applied before grouping.
                 const tagged = inputArgs.map((a) => {
-                    const ply = !isHttpUrl(a.filename) && getInputFormat(resolveInput(a.filename).classifyName) === 'ply';
-                    const lods = a.processActions.filter(act => act.kind === 'lod');
+                    const ply =
+                        !isHttpUrl(a.filename) && getInputFormat(resolveInput(a.filename).classifyName) === 'ply';
+                    const lods = a.processActions.filter((act) => act.kind === 'lod');
                     const tag = lods.length > 0 ? (lods[lods.length - 1] as { value: number }).value : 0;
                     const rest = stripLodTags(a.processActions);
                     return { arg: a, ply, tag, rest };
                 });
-                if (!tagged.every(t => t.ply)) {
-                    throw new Error('lod-meta.json output requires a single streamed-SOG/LCC/LCC2 input, or local PLY input(s) (optionally --tag-lod tagged).');
-                }
-                const opened = await Promise.all(tagged.map(async (t) => {
-                    const { filename: inFile, fileSystem } = resolveInput(t.arg.filename);
-                    const src = await processSourceBridged(
-                        await readPly(await fileSystem.createSource(inFile), pool),
-                        t.rest, pool, processOptions
+                if (!tagged.every((t) => t.ply)) {
+                    throw new Error(
+                        'lod-meta.json output requires a single streamed-SOG/LCC/LCC2 input, or local PLY input(s) (optionally --tag-lod tagged).'
                     );
-                    return { src, tag: t.tag };
-                }));
-                const mains = opened.filter(o => o.tag >= 0);
+                }
+                const opened = await Promise.all(
+                    tagged.map(async (t) => {
+                        const { filename: inFile, fileSystem } = resolveInput(t.arg.filename);
+                        const src = await processSourceBridged(
+                            await readPly(await fileSystem.createSource(inFile), pool),
+                            t.rest,
+                            pool,
+                            processOptions
+                        );
+                        return { src, tag: t.tag };
+                    })
+                );
+                const mains = opened.filter((o) => o.tag >= 0);
                 if (mains.length === 0) {
                     throw new Error('No Gaussians to write');
                 }
-                const mainTags = [...new Set(mains.map(m => m.tag))].sort((a, b) => a - b);
+                const mainTags = [...new Set(mains.map((m) => m.tag))].sort((a, b) => a - b);
                 perLevel = mainTags.map((tag) => {
-                    const group = mains.filter(m => m.tag === tag).map(m => m.src);
+                    const group = mains.filter((m) => m.tag === tag).map((m) => m.src);
                     return group.length === 1 ? group[0] : concatSource(group, pool);
                 });
-                const envs = opened.filter(o => o.tag === -1).map(o => o.src);
-                envSource = envs.length === 0 ? null : (envs.length === 1 ? envs[0] : concatSource(envs, pool));
+                const envs = opened.filter((o) => o.tag === -1).map((o) => o.src);
+                envSource = envs.length === 0 ? null : envs.length === 1 ? envs[0] : concatSource(envs, pool);
             }
 
             // Output (and single-input) actions apply PER LEVEL and to the env —
             // never across levels.
             const perLevelActions = stripLodTags([...inputActions, ...outputArg.processActions]);
             if (perLevelActions.length > 0) {
-                perLevel = await Promise.all(perLevel.map(s => processSourceBridged(s, perLevelActions, pool, processOptions)));
+                perLevel = await Promise.all(
+                    perLevel.map((s) => processSourceBridged(s, perLevelActions, pool, processOptions))
+                );
                 if (envSource) envSource = await processSourceBridged(envSource, perLevelActions, pool, processOptions);
             }
 
@@ -1456,8 +1740,8 @@ const main = async () => {
             // bake to identity when per-input actions left transforms diverged.
             if (perLevel.length > 1) {
                 const refTransform = perLevel[0].meta.transform;
-                if (!perLevel.every(s => s.meta.transform.equals(refTransform))) {
-                    perLevel = perLevel.map(s => bakeTransform(s, Transform.IDENTITY));
+                if (!perLevel.every((s) => s.meta.transform.equals(refTransform))) {
+                    perLevel = perLevel.map((s) => bakeTransform(s, Transform.IDENTITY));
                 }
             }
             const mainSource = perLevel.length === 1 ? perLevel[0] : stackLods(perLevel);
@@ -1467,16 +1751,28 @@ const main = async () => {
             }
 
             const phase = logger.group(`Output ${outputArg.filename}`, { index: phaseTotal, total: phaseTotal });
-            logger.info(`${fmtCount(total)} gaussians · ${mainSource.meta.shBands} SH bands · ${mainSource.meta.numLods} LODs (streaming LOD)`);
-            await writeLodSource({
-                filename: outputFilename,
-                mainSource,
-                envSource,
-                iterations: options.iterations,
-                createDevice: deviceCreator,
-                chunkCount: options.lodChunkCount,
-                chunkExtent: options.lodChunkExtent
-            }, new NodeFileSystem());
+            logger.info(
+                `${fmtCount(total)} gaussians · ${mainSource.meta.shBands} SH bands · ${mainSource.meta.numLods} LODs (streaming LOD)`
+            );
+            await writeLodSource(
+                {
+                    filename: outputFilename,
+                    mainSource,
+                    envSource,
+                    iterations: options.iterations,
+                    colorError: options.shColorError,
+                    webpEffort: options.webpEffort,
+                    createDevice: deviceCreator,
+                    sogVersion: options.sogVersion,
+                    sogBlind: options.sogBlind,
+                    extras: options.sogExtras,
+                    chunkCount: options.lodChunkCount,
+                    chunkExtent: options.lodChunkExtent,
+                    chunkMin: options.lodChunkMin,
+                    fileCounts: options.lodFileCount
+                },
+                new NodeFileSystem()
+            );
 
             await mainSource.close();
             if (container) await container.close();
@@ -1490,7 +1786,9 @@ const main = async () => {
         // *tags*: tags build lod-meta.json levels and don't apply to single-scene
         // output. (Tag-free non-lod conversions and null output ran the single-scene
         // pipeline above; lod-meta output ran the LOD path.)
-        throw new Error('--tag-lod tags apply to lod-meta.json output; for single-scene output choose a level with --select-lod (-L).');
+        throw new Error(
+            '--tag-lod tags apply to lod-meta.json output; for single-scene output choose a level with --select-lod (-L).'
+        );
     } catch (err) {
         failExit(err);
     }

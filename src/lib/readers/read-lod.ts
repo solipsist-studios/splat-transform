@@ -1,8 +1,16 @@
-import { containerSource, type ContainerSegment } from './container-source';
-import { readSogSource } from './read-sog';
-import { type ChunkDataPool, type ChunkSource } from '../chunk';
-import { dirname, join, readFile, type ReadFileSystem } from '../io/read';
-import { type Options } from '../types';
+import type { ChunkDataPool, ChunkSource } from '../chunk';
+import { withComments } from '../comments';
+import { withExtras } from '../extras';
+import { dirname, join, readFile } from '../io/read';
+import type { ReadFileSystem } from '../io/read';
+import { isSplatModel } from '../splat-model';
+import type { SplatModel } from '../splat-model';
+import type { Options } from '../types';
+import { logger } from '../utils';
+
+import { containerSource, summarizeUnits } from './container-source';
+import type { ContainerSegment } from './container-source';
+import { readSogSource, statSogSource } from './read-sog';
 
 type LodReference = {
     file: number;
@@ -13,17 +21,26 @@ type LodReference = {
 type LodNode = {
     children?: LodNode[];
     lods?: Record<string, LodReference>;
-    errors?: number[];
 };
 
 type LodMeta = {
     version?: number;
     count?: number;
+    model?: string;
     counts?: number[];
     lodLevels: number;
     environment?: string;
     filenames: string[];
     tree: LodNode;
+    extras?: unknown;
+    comments?: string[];
+};
+
+// An unrecognized model reads as 'default', as in SOG meta.json.
+const modelFromLodMeta = (value: string): SplatModel => {
+    if (isSplatModel(value)) return value;
+    logger.warn(`unrecognized splat model '${value}' in lod-meta.json, reading as 'default'`);
+    return 'default';
 };
 
 const parseLodMeta = (text: string, filename: string): LodMeta => {
@@ -44,12 +61,15 @@ const parseLodMeta = (text: string, filename: string): LodMeta => {
     if (!Number.isInteger(meta.lodLevels) || meta.lodLevels <= 0) {
         throw new Error(`Invalid lod-meta.json lodLevels: ${filename}`);
     }
-    if (meta.counts !== undefined &&
-        (!Array.isArray(meta.counts) || meta.counts.length !== meta.lodLevels ||
-        meta.counts.some(count => !Number.isInteger(count) || count < 0))) {
+    if (
+        meta.counts !== undefined &&
+        (!Array.isArray(meta.counts) ||
+            meta.counts.length !== meta.lodLevels ||
+            meta.counts.some((count) => !Number.isInteger(count) || count < 0))
+    ) {
         throw new Error(`Invalid lod-meta.json counts: ${filename}`);
     }
-    if (!Array.isArray(meta.filenames) || meta.filenames.some(name => typeof name !== 'string')) {
+    if (!Array.isArray(meta.filenames) || meta.filenames.some((name) => typeof name !== 'string')) {
         throw new Error(`Invalid lod-meta.json filenames: ${filename}`);
     }
     if (!meta.tree || typeof meta.tree !== 'object') {
@@ -62,21 +82,29 @@ const parseLodMeta = (text: string, filename: string): LodMeta => {
 const collectFilesByLod = (meta: LodMeta, filename: string): Map<number, Map<number, number>> => {
     const result = new Map<number, Map<number, number>>();
     const traverse = (node: LodNode): void => {
-        if (!node || typeof node !== 'object' || Array.isArray(node) ||
-            (node.children !== undefined && !Array.isArray(node.children))) {
+        if (
+            !node ||
+            typeof node !== 'object' ||
+            Array.isArray(node) ||
+            (node.children !== undefined && !Array.isArray(node.children))
+        ) {
             throw new Error(`Invalid lod-meta.json tree: ${filename}`);
-        }
-        if (node.errors !== undefined &&
-            (!Array.isArray(node.errors) || node.errors.length !== meta.lodLevels ||
-            node.errors.some(error => typeof error !== 'number' || !Number.isFinite(error) || error < 0))) {
-            throw new Error(`Invalid lod-meta.json errors: ${filename}`);
         }
         for (const [key, ref] of Object.entries(node.lods ?? {})) {
             const lod = Number(key);
-            if (!Number.isInteger(lod) || lod < 0 || lod >= meta.lodLevels ||
-                !ref || !Number.isInteger(ref.file) || ref.file < 0 || ref.file >= meta.filenames.length ||
-                !Number.isInteger(ref.offset) || ref.offset < 0 ||
-                !Number.isInteger(ref.count) || ref.count < 0) {
+            if (
+                !Number.isInteger(lod) ||
+                lod < 0 ||
+                lod >= meta.lodLevels ||
+                !ref ||
+                !Number.isInteger(ref.file) ||
+                ref.file < 0 ||
+                ref.file >= meta.filenames.length ||
+                !Number.isInteger(ref.offset) ||
+                ref.offset < 0 ||
+                !Number.isInteger(ref.count) ||
+                ref.count < 0
+            ) {
                 throw new Error(`Invalid lod-meta.json LOD reference: ${filename}`);
             }
             let files = result.get(lod);
@@ -108,9 +136,7 @@ const collectFilesByLod = (meta: LodMeta, filename: string): Map<number, Map<num
 
 const resolveLodSelection = (lodSelect: number[], numLods: number): number[] => {
     if (lodSelect.length === 0) return Array.from({ length: numLods }, (_, i) => i);
-    return lodSelect
-    .map(lod => (lod < 0 ? numLods + lod : lod))
-    .filter(lod => lod >= 0 && lod < numLods);
+    return lodSelect.map((lod) => (lod < 0 ? numLods + lod : lod)).filter((lod) => lod >= 0 && lod < numLods);
 };
 
 /**
@@ -142,20 +168,31 @@ const readLodSource = async (
     }
 
     const filesByLod = collectFilesByLod(meta, filename);
+    const filesOf = (lod: number) => [...(filesByLod.get(lod)?.entries() ?? [])].sort(([a], [b]) => a - b);
+
+    // whether any selected unit holds opacity above 1, and their blind origins; only each unit's meta.json is read
+    const paths = [...new Set(inputLods.flatMap((lod) => filesOf(lod).map(([file]) => related(meta.filenames[file]))))];
+    const units = await summarizeUnits(paths, (path) => statSogSource(fileSystem, path));
+
     const segmentsByLod = inputLods.map((lod): ContainerSegment[] => {
-        const files = filesByLod.get(lod);
-        return [...(files?.entries() ?? [])]
-        .sort(([a], [b]) => a - b)
-        .map(([file, count]) => {
+        return filesOf(lod).map(([file, count]) => {
             const path = related(meta.filenames[file]);
-            return {
-                count,
-                decode: () => readSogSource(fileSystem, path, pool, { logging: 'silent' })
-            };
+            return { count, decode: () => readSogSource(fileSystem, path, pool, { logging: 'silent' }) };
         });
     });
 
-    return containerSource(segmentsByLod, pool);
+    // the scene's extras and comments live in lod-meta.json, not in its units; the model recorded
+    // for the whole tree wins over the files' own, and without one the files decide
+    return withComments(
+        withExtras(
+            await containerSource(segmentsByLod, pool, {
+                ...units,
+                ...(meta.model === undefined ? {} : { model: modelFromLodMeta(meta.model) })
+            }),
+            meta.extras
+        ),
+        Array.isArray(meta.comments) ? meta.comments.map(String) : undefined
+    );
 };
 
 /**

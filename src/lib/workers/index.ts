@@ -1,6 +1,8 @@
+import type { TypedArray } from '../data-table/data-table';
+import { quantize1dColumns } from '../spatial/quantize-1d-core';
+import type { QuantizedColumns } from '../spatial/quantize-1d-core';
+
 import { WorkerQueue } from './worker-queue';
-import { type TypedArray } from '../data-table/data-table';
-import { quantize1dColumns, type QuantizedColumns } from '../spatial/quantize-1d-core';
 
 /**
  * Typed client wrappers around WorkerQueue tasks. These own the marshalling
@@ -14,19 +16,29 @@ import { quantize1dColumns, type QuantizedColumns } from '../spatial/quantize-1d
  * @param columns - Input columns pooled into 1D.
  * @param k - Number of codebook entries.
  * @param alpha - Density weight exponent.
+ * @param gamma - Importance exponent (bin weight also scaled by exp(gamma * value)).
  * @returns Centroids (k Float32 codebook) and per-column Uint8 labels.
  * @ignore
  */
-const runQuantize1dColumns = async (columns: { name: string, data: TypedArray }[], k?: number, alpha?: number): Promise<QuantizedColumns> => {
+const runQuantize1dColumns = async (
+    columns: { name: string; data: TypedArray }[],
+    k?: number,
+    alpha?: number,
+    gamma?: number
+): Promise<QuantizedColumns> => {
     if (WorkerQueue.isInline) {
         // zero-copy: no point marshalling when running on this thread anyway
-        return quantize1dColumns(columns, k, alpha);
+        return quantize1dColumns(columns, k, alpha, gamma);
     }
 
     // compact copies: column data may be views into larger shared buffers,
     // and the originals must remain usable after the transfer
-    const copies = columns.map(c => ({ name: c.name, data: c.data.slice() }));
-    return await WorkerQueue.run('quantize1d', { columns: copies, k, alpha }, copies.map(c => c.data.buffer as ArrayBuffer));
+    const copies = columns.map((c) => ({ name: c.name, data: c.data.slice() }));
+    return await WorkerQueue.run(
+        'quantize1d',
+        { columns: copies, k, alpha, gamma },
+        copies.map((c) => c.data.buffer as ArrayBuffer)
+    );
 };
 
 /**
@@ -35,11 +47,12 @@ const runQuantize1dColumns = async (columns: { name: string, data: TypedArray }[
  * @param rgba - RGBA pixel data. Transferred: unusable after this call.
  * @param width - Image width in pixels.
  * @param height - Image height in pixels.
+ * @param effort - Lossless compression effort 0–9; the codec's default when omitted.
  * @returns The encoded WebP data.
  * @ignore
  */
-const runEncodeWebp = (rgba: Uint8Array, width: number, height: number): Promise<Uint8Array> => {
-    return WorkerQueue.run('encodeWebp', { rgba, width, height }, [rgba.buffer as ArrayBuffer]);
+const runEncodeWebp = (rgba: Uint8Array, width: number, height: number, effort?: number): Promise<Uint8Array> => {
+    return WorkerQueue.run('encodeWebp', { rgba, width, height, effort }, [rgba.buffer as ArrayBuffer]);
 };
 
 export { WorkerQueue, runQuantize1dColumns, runEncodeWebp };

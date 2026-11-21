@@ -1,4 +1,4 @@
-import { type ChunkFieldMap, type ChunkLayer } from './layout';
+import type { ChunkFieldMap, ChunkLayer } from './layout';
 
 /**
  * A CPU-resident buffer holding one layer's data for one chunk of gaussians.

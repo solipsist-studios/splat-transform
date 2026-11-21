@@ -1,4 +1,7 @@
-import { type SplatModel } from '../splat-model';
+import { extname } from 'pathe';
+
+import { producerComments } from '../comments';
+import type { SplatModel } from '../splat-model';
 import { fmtBytes, logger } from '../utils';
 
 // Brush's spelling of the model, which its importer (brush-serde import.rs) and
@@ -22,6 +25,19 @@ const splatModelComment = (model: SplatModel): string | null => {
 };
 
 /**
+ * A scene's comments as PLY header lines, without model tags or a generator
+ * line (see {@link producerComments}): the writer's own model tag decides the
+ * model. A header line cannot hold a line break, so any (from a SOG meta.json,
+ * say) becomes a space.
+ *
+ * @param comments - The scene's comments.
+ * @returns The `comment ...` header lines.
+ */
+const plyCommentLines = (comments: readonly string[] | undefined): string[] => {
+    return producerComments((comments ?? []).map((c) => c.replace(/[\r\n]+/g, ' '))).map((c) => `comment ${c}`);
+};
+
+/**
  * Emit a single `Writing`-group entry as `<filename> (<formatted size>)`.
  *
  * Lives here (rather than in `io/write/`) so the low-level I/O layer stays
@@ -35,4 +51,20 @@ const logWrittenFile = (filename: string, bytes: number): void => {
     logger.info(`${filename} (${fmtBytes(bytes)})`);
 };
 
-export { logWrittenFile, splatModelComment };
+/**
+ * Output filename of one frame of an image sequence: `<name>.NNNN<ext>`,
+ * the frame number padded to at least four digits and to the width of the
+ * last frame's.
+ *
+ * @param filename - The sequence's output filename.
+ * @param frame - The frame number.
+ * @param lastFrame - The last frame number of the sequence, which sets the padding.
+ * @returns The frame's filename.
+ */
+const frameFilename = (filename: string, frame: number, lastFrame: number): string => {
+    const ext = extname(filename);
+    const digits = Math.max(4, String(lastFrame).length);
+    return `${filename.slice(0, filename.length - ext.length)}.${String(frame).padStart(digits, '0')}${ext}`;
+};
+
+export { frameFilename, logWrittenFile, plyCommentLines, splatModelComment };

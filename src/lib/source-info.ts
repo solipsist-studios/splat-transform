@@ -1,6 +1,7 @@
-import { type ChunkSourceMetadata, hasGaussianLayers, orderedLayers } from './chunk';
-import { type LodStats, type SourceStats } from './ops';
-import { type InputFormat } from './read';
+import { hasGaussianLayers, orderedLayers } from './chunk';
+import type { ChunkSourceMetadata } from './chunk';
+import type { LodStats, SourceStats } from './ops';
+import type { FileInfo, InputFormat } from './read';
 import { forwardTransforms } from './value-transforms';
 
 /**
@@ -12,12 +13,20 @@ import { forwardTransforms } from './value-transforms';
 
 type OutputFormat = 'text' | 'json';
 
+// The metadata the info block is built from: a full source's meta, or one
+// rebuilt from a header-only FileInfo (see formatFileInfo).
+type InfoMeta = Pick<
+    ChunkSourceMetadata,
+    'numGaussians' | 'numLods' | 'lodCounts' | 'shBands' | 'model' | 'availableLayers' | 'extraColumns'
+>;
+
 // Pretty-print, but collapse innermost arrays (numbers, strings, null — no
 // nested brackets) onto one line so the columnar stat arrays read as table
 // rows instead of one value per line.
 const stringifyCompact = (value: unknown): string => {
-    return JSON.stringify(value, null, 4)
-    .replace(/\[[^[\]{}]*\]/g, m => m.replace(/\s+/g, ' ').replace('[ ', '[').replace(' ]', ']'));
+    return JSON.stringify(value, null, 4).replace(/\[[^[\]{}]*\]/g, (m) =>
+        m.replace(/\s+/g, ' ').replace('[ ', '[').replace(' ]', ']')
+    );
 };
 
 /**
@@ -29,7 +38,7 @@ const stringifyCompact = (value: unknown): string => {
  * @param format - Detected input format; included only when provided.
  * @returns The info fields.
  */
-const buildSourceInfo = (meta: ChunkSourceMetadata, format?: InputFormat) => ({
+const buildSourceInfo = (meta: InfoMeta, format?: InputFormat) => ({
     ...(format ? { format } : {}),
     gaussian: hasGaussianLayers(meta.availableLayers),
     numGaussians: meta.numGaussians,
@@ -38,7 +47,7 @@ const buildSourceInfo = (meta: ChunkSourceMetadata, format?: InputFormat) => ({
     shBands: meta.shBands,
     model: meta.model,
     layers: orderedLayers(meta.availableLayers),
-    extraColumns: meta.extraColumns.map(e => ({ name: e.name, type: e.type }))
+    extraColumns: meta.extraColumns.map((e) => ({ name: e.name, type: e.type }))
 });
 
 /**
@@ -48,7 +57,7 @@ const buildSourceInfo = (meta: ChunkSourceMetadata, format?: InputFormat) => ({
  * @param format - Detected input format; emitted only when provided.
  * @returns One `key: value` line per field.
  */
-const sourceInfoLines = (meta: ChunkSourceMetadata, format?: InputFormat): string[] => {
+const sourceInfoLines = (meta: InfoMeta, format?: InputFormat): string[] => {
     return [
         ...(format ? [`format: ${format}`] : []),
         `gaussian: ${hasGaussianLayers(meta.availableLayers) ? 'yes' : 'no'}`,
@@ -59,7 +68,7 @@ const sourceInfoLines = (meta: ChunkSourceMetadata, format?: InputFormat): strin
         // untagged scenes say nothing, so existing output is unchanged
         ...(meta.model === 'default' ? [] : [`model: ${meta.model}`]),
         `layers: ${orderedLayers(meta.availableLayers).join(', ')}`,
-        `extra columns: ${meta.extraColumns.length > 0 ? meta.extraColumns.map(e => `${e.name} (${e.type})`).join(', ') : '(none)'}`
+        `extra columns: ${meta.extraColumns.length > 0 ? meta.extraColumns.map((e) => `${e.name} (${e.type})`).join(', ') : '(none)'}`
     ];
 };
 
@@ -74,11 +83,31 @@ const sourceInfoLines = (meta: ChunkSourceMetadata, format?: InputFormat): strin
  * @param sourceFormat - Detected input format; reported when provided.
  * @returns A text or JSON block for `logger.output`.
  */
-const formatSourceInfo = (meta: ChunkSourceMetadata, format: OutputFormat = 'text', sourceFormat?: InputFormat): string => {
+const formatSourceInfo = (meta: InfoMeta, format: OutputFormat = 'text', sourceFormat?: InputFormat): string => {
     if (format === 'json') {
         return stringifyCompact(buildSourceInfo(meta, sourceFormat));
     }
     return sourceInfoLines(meta, sourceFormat).join('\n');
+};
+
+/**
+ * Render a {@link FileInfo} exactly as the `info` action renders the same file's
+ * source, for reporting from {@link readFileInfo} without opening the source.
+ * @param info - The file info.
+ * @param format - Output format. Default: 'text'
+ * @returns A text or JSON block for `logger.output`.
+ */
+const formatFileInfo = (info: FileInfo, format: OutputFormat = 'text'): string => {
+    const meta: InfoMeta = {
+        numGaussians: info.numGaussians,
+        numLods: info.numLods,
+        lodCounts: info.lodCounts,
+        shBands: info.shBands,
+        model: info.model,
+        availableLayers: new Set(info.layers),
+        extraColumns: info.extraColumns
+    };
+    return formatSourceInfo(meta, format, info.format);
 };
 
 // Display transform: raw values map to user-friendly space for output
@@ -96,25 +125,30 @@ const BARS = '▁▂▃▄▅▆▇█';
 // all-blank for an empty column).
 const sparkline = (counts: number[]): string => {
     const maxBin = Math.max(...counts);
-    return counts.map((c) => {
-        if (c === 0) return ' ';
-        return BARS[maxBin > 0 ? Math.floor(c / maxBin * (BARS.length - 1)) : 0];
-    }).join('');
+    return counts
+        .map((c) => {
+            if (c === 0) return ' ';
+            return BARS[maxBin > 0 ? Math.floor((c / maxBin) * (BARS.length - 1)) : 0];
+        })
+        .join('');
 };
 
-// Map a LOD's stats to display space for JSON output: value arrays through the
-// per-column display transform, counts and histograms as computed.
-const displayLodStats = (lod: LodStats): LodStats => {
+// Map a LOD's stats to display space for JSON output: order statistics through
+// the per-column display transform (monotonic, so they map exactly), mean and
+// stdDev from the per-value display-space accumulation, counts and histograms
+// as computed.
+const displayLodStats = (lod: LodStats) => {
     const mapped = (values: number[]): number[] => values.map((v, i) => displayValue(lod.columns[i], v));
+    const { displayMean, displayStdDev, ...data } = lod.data;
     return {
         ...lod,
         data: {
-            ...lod.data,
+            ...data,
             min: mapped(lod.data.min),
             max: mapped(lod.data.max),
             median: mapped(lod.data.median),
-            mean: mapped(lod.data.mean),
-            stdDev: mapped(lod.data.stdDev)
+            mean: displayMean,
+            stdDev: displayStdDev
         }
     };
 };
@@ -128,20 +162,20 @@ const statsTable = (lod: LodStats): string[] => {
         String(displayValue(name, data.min[i])),
         String(displayValue(name, data.max[i])),
         String(displayValue(name, data.median[i])),
-        String(displayValue(name, data.mean[i])),
-        String(displayValue(name, data.stdDev[i])),
+        String(data.displayMean[i]),
+        String(data.displayStdDev[i]),
         String(data.nanCount[i]),
         String(data.infCount[i]),
         sparkline(data.histogram[i])
     ]);
 
     const colWidths = headers.map((header, colIndex) => {
-        const dataWidths = rows.map(row => row[colIndex].length);
+        const dataWidths = rows.map((row) => row[colIndex].length);
         return Math.max(header.length, ...dataWidths);
     });
 
     const padRow = (cells: string[]) => `| ${cells.map((cell, i) => cell.padEnd(colWidths[i])).join(' | ')} |`;
-    const separator = `|${colWidths.map(w => '-'.repeat(w + 2)).join('|')}|`;
+    const separator = `|${colWidths.map((w) => '-'.repeat(w + 2)).join('|')}|`;
 
     return [padRow(headers), separator, ...rows.map(padRow)];
 };
@@ -149,16 +183,21 @@ const statsTable = (lod: LodStats): string[] => {
 /**
  * Render a source's statistics for the `stats` action: the info block followed
  * by one table per LOD (text), or the info object plus a per-LOD columnar
- * `stats` array (JSON — exactly the {@link LodStats} shape). Values are shown
- * in display space (see {@link forwardTransforms}); histogram bin edges span
- * `[min[i], max[i]]`.
+ * `stats` array (JSON — the {@link LodStats} shape, with `displayMean` and
+ * `displayStdDev` reported as `mean` and `stdDev`). Values are shown in display space (see
+ * {@link forwardTransforms}); histogram bin edges span `[min[i], max[i]]`.
  * @param meta - The source metadata.
  * @param stats - The computed per-LOD statistics.
  * @param format - Output format. Default: 'text'
  * @param sourceFormat - Detected input format; reported when provided.
  * @returns A text or JSON block for `logger.output`.
  */
-const formatSourceStats = (meta: ChunkSourceMetadata, stats: SourceStats, format: OutputFormat = 'text', sourceFormat?: InputFormat): string => {
+const formatSourceStats = (
+    meta: ChunkSourceMetadata,
+    stats: SourceStats,
+    format: OutputFormat = 'text',
+    sourceFormat?: InputFormat
+): string => {
     if (format === 'json') {
         return stringifyCompact({
             ...buildSourceInfo(meta, sourceFormat),
@@ -181,4 +220,4 @@ const formatSourceStats = (meta: ChunkSourceMetadata, stats: SourceStats, format
     return lines.join('\n');
 };
 
-export { formatSourceInfo, formatSourceStats };
+export { formatFileInfo, formatSourceInfo, formatSourceStats };

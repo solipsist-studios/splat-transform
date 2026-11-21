@@ -30,10 +30,26 @@ type MessageKind = 'error' | 'warn' | 'info' | 'debug';
  */
 type LogEvent =
     | { kind: 'scopeStart'; depth: number; name: string; index?: number; total?: number }
-    | { kind: 'scopeEnd'; depth: number; name: string; durationMs: number; failed?: boolean; index?: number; total?: number }
+    | {
+          kind: 'scopeEnd';
+          depth: number;
+          name: string;
+          durationMs: number;
+          failed?: boolean;
+          index?: number;
+          total?: number;
+      }
     | { kind: 'barStart'; depth: number; name: string; total: number }
     | { kind: 'barTick'; depth: number; name: string; current: number; total: number }
-    | { kind: 'barEnd'; depth: number; name: string; durationMs: number; current: number; total: number; failed?: boolean }
+    | {
+          kind: 'barEnd';
+          depth: number;
+          name: string;
+          durationMs: number;
+          current: number;
+          total: number;
+          failed?: boolean;
+      }
     | { kind: 'message'; depth: number; level: MessageKind; text: string }
     | { kind: 'output'; text: string };
 
@@ -141,17 +157,19 @@ const now = (): number => {
     return Date.now();
 };
 
-const fmtArgs = (args: any[]): string => {
-    return args.map((a) => {
-        if (a instanceof Error) return a.stack ?? a.message;
-        if (typeof a === 'string') return a;
-        if (typeof a === 'number' || typeof a === 'boolean' || a == null) return String(a);
-        try {
-            return JSON.stringify(a);
-        } catch {
-            return String(a);
-        }
-    }).join(' ');
+const fmtArgs = (args: unknown[]): string => {
+    return args
+        .map((a) => {
+            if (a instanceof Error) return a.stack ?? a.message;
+            if (typeof a === 'string') return a;
+            if (typeof a === 'number' || typeof a === 'boolean' || a == null) return String(a);
+            try {
+                return JSON.stringify(a);
+            } catch {
+                return String(a);
+            }
+        })
+        .join(' ');
 };
 
 /**
@@ -161,7 +179,9 @@ const fmtArgs = (args: any[]): string => {
  * every event silently.
  */
 class NullRenderer implements Renderer {
-    handle(_event: LogEvent): void { /* no-op */ }
+    handle(_event: LogEvent): void {
+        /* no-op */
+    }
 }
 
 const verbosityRank: Record<Verbosity, number> = {
@@ -254,9 +274,8 @@ class LoggerCore {
             });
             return;
         }
-        const numbering = top.index !== undefined && top.total !== undefined ?
-            { index: top.index, total: top.total } :
-            {};
+        const numbering =
+            top.index !== undefined && top.total !== undefined ? { index: top.index, total: top.total } : {};
         this.emit({ kind: 'scopeEnd', depth: top.depth, name: top.name, durationMs, failed, ...numbering });
     }
 
@@ -278,9 +297,9 @@ class LoggerCore {
         }
         const depth = this.stack.length;
         const numbering = index !== undefined && total !== undefined ? { index, total } : undefined;
-        const scope: Scope = numbering ?
-            { kind: 'group', name, depth, start: now(), index: numbering.index, total: numbering.total } :
-            { kind: 'group', name, depth, start: now() };
+        const scope: Scope = numbering
+            ? { kind: 'group', name, depth, start: now(), index: numbering.index, total: numbering.total }
+            : { kind: 'group', name, depth, start: now() };
         this.stack.push(scope);
         this.emit({ kind: 'scopeStart', depth, name, ...(numbering ?? {}) });
         return this.makeGroup(scope);
@@ -336,7 +355,13 @@ class LoggerCore {
                 if (next === scope.current) return;
                 scope.current = next;
                 if (!isTopOfStack()) return;
-                this.emit({ kind: 'barTick', depth: scope.depth, name: scope.name, current: scope.current, total: scope.total });
+                this.emit({
+                    kind: 'barTick',
+                    depth: scope.depth,
+                    name: scope.name,
+                    current: scope.current,
+                    total: scope.total
+                });
             },
             update: (current: number) => {
                 if (closed) return;
@@ -348,7 +373,13 @@ class LoggerCore {
                 if (next === scope.current) return;
                 scope.current = next;
                 if (!isTopOfStack()) return;
-                this.emit({ kind: 'barTick', depth: scope.depth, name: scope.name, current: scope.current, total: scope.total });
+                this.emit({
+                    kind: 'barTick',
+                    depth: scope.depth,
+                    name: scope.name,
+                    current: scope.current,
+                    total: scope.total
+                });
             },
             end: () => {
                 if (closed) return;
@@ -458,7 +489,7 @@ const logger = {
      * Emit an info message indented under the innermost active scope.
      * @param args - Message parts (joined with a space).
      */
-    info(...args: any[]): void {
+    info(...args: unknown[]): void {
         if (!core.isLevelVisible('info')) return;
         core.message('info', fmtArgs(args));
     },
@@ -467,7 +498,7 @@ const logger = {
      * Emit a warning indented under the innermost active scope.
      * @param args - Message parts.
      */
-    warn(...args: any[]): void {
+    warn(...args: unknown[]): void {
         if (!core.isLevelVisible('warn')) return;
         core.message('warn', fmtArgs(args));
     },
@@ -477,7 +508,7 @@ const logger = {
      * an automatic unwind of all open scopes, marking each as failed.
      * @param args - Message parts.
      */
-    error(...args: any[]): void {
+    error(...args: unknown[]): void {
         core.message('error', fmtArgs(args));
     },
 
@@ -485,7 +516,7 @@ const logger = {
      * Emit a debug message. Shown only at `verbose` verbosity.
      * @param args - Message parts.
      */
-    debug(...args: any[]): void {
+    debug(...args: unknown[]): void {
         if (!core.isLevelVisible('debug')) return;
         core.message('debug', fmtArgs(args));
     },

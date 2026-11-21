@@ -1,7 +1,8 @@
-import { type SplatModel } from '../splat-model';
-import { type Transform } from '../utils';
-import { type ChunkData } from './data';
-import { type ExtraColumn, type ChunkLayer, type SHBands, type LayerLayout } from './layout';
+import type { SplatModel } from '../splat-model';
+import type { Transform } from '../utils';
+
+import type { ChunkData } from './data';
+import type { ExtraColumn, ChunkLayer, SHBands, LayerLayout } from './layout';
 
 /**
  * Static description of a {@link ChunkSource}'s contents — what's in it and
@@ -21,23 +22,43 @@ type ChunkSourceMetadata = {
     readonly numGaussians: number;
     readonly numLods: number;
     /** Gaussian counts per LOD. `lodCounts[0]` matches `numGaussians`. */
-    readonly lodCounts: ReadonlyArray<number>;
+    readonly lodCounts: readonly number[];
     /** Gaussians per chunk (all chunks are this size except the last per LOD). */
     readonly chunkSize: number;
     /** Number of chunks per LOD: `Math.ceil(lodCounts[lod] / chunkSize)`. */
-    readonly numChunks: ReadonlyArray<number>;
+    readonly numChunks: readonly number[];
     /** SH band count present in the source. */
     readonly shBands: SHBands;
     /** How the scene was trained, and so how it must be evaluated. */
     readonly model: SplatModel;
     /** Extra non-standard columns mapped to the `other` layer. */
-    readonly extraColumns: ReadonlyArray<ExtraColumn>;
+    readonly extraColumns: readonly ExtraColumn[];
     /** Coordinate-space transform; applied lazily when consumed. */
     readonly transform: Transform;
     /** Which layers the source can serve. */
     readonly availableLayers: ReadonlySet<ChunkLayer>;
     /** Per-layer stride + field map. Keyed by layer; only present for available layers. */
     readonly layouts: Readonly<Partial<Record<ChunkLayer, LayerLayout>>>;
+    /**
+     * Some gaussian's opacity may exceed 1 (decimated scenes, SOG v3 / PLY `opacity_linear`
+     * input). A hint for writers that must choose their output before seeing the data (the
+     * streaming PLY writer writes `opacity_linear` instead of `opacity`); absent means no
+     * opacity exceeds 1. Combined sources carry it when any input does.
+     */
+    readonly opacityAboveOne?: boolean;
+    /**
+     * Application-defined JSON carried by the scene's container (SOG `meta.json` /
+     * `lod-meta.json` `extras`, as in glTF). No meaning to splat-transform: read,
+     * passed through and written back. Absent when the scene has none.
+     */
+    readonly extras?: unknown;
+    /**
+     * Free-form producer comments carried by the scene (PLY header `comment` lines,
+     * SOG `meta.json` / `lod-meta.json` `comments`), e.g. `Postshot v1.1.69` or
+     * `postshot.color.eotf=sRGB`. Passed through verbatim and written back; ones that
+     * describe coordinates are not updated by transforms. Absent when there are none.
+     */
+    readonly comments?: readonly string[];
 };
 
 /**

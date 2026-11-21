@@ -1,11 +1,6 @@
-import {
-    type ChunkData,
-    type ChunkDataPool,
-    type ChunkLayer,
-    type ChunkSource,
-    type ChunkSourceMetadata,
-    SH_REST_COUNTS
-} from '../chunk';
+import { SH_REST_COUNTS } from '../chunk';
+import type { ChunkData, ChunkDataPool, ChunkLayer, ChunkSource, ChunkSourceMetadata } from '../chunk';
+import { forwardTransforms } from '../value-transforms';
 
 /**
  * One-pass streaming statistics over a {@link ChunkSource}: exact
@@ -28,6 +23,10 @@ const round = (value: number): number => {
     return Math.round(value * Math.pow(10, PRECISION)) / Math.pow(10, PRECISION);
 };
 
+// Display-space values span many decades (linear scales), so they round to
+// significant digits instead, matching how the formatter displays min/max.
+const roundSignificant = (value: number): number => (Number.isFinite(value) ? +value.toPrecision(PRECISION) : value);
+
 /**
  * A LOD's measurements in columnar (struct-of-arrays) form: every field is an
  * array index-aligned with the owning {@link LodStats}'s `columns`.
@@ -43,6 +42,16 @@ type LodStatsData = {
     mean: number[];
     /** Per-column population standard deviation. */
     stdDev: number[];
+    /**
+     * Per-column arithmetic mean of the display-space values (opacity/scale/f_dc
+     * through their forward transforms, 6 significant digits; equal to `mean`
+     * for untransformed columns). A mean can't be mapped through a nonlinear
+     * transform after the fact, so it is accumulated per value. `Infinity`
+     * when a display value overflows (e.g. `exp` of a huge log-scale).
+     */
+    displayMean: number[];
+    /** Per-column population standard deviation of the display-space values (as `displayMean`). */
+    displayStdDev: number[];
     /** Per-column NaN count. */
     nanCount: number[];
     /** Per-column Infinity count. */
@@ -95,6 +104,8 @@ type SourceStats = {
  * mean/variance, NaN/Inf counts, and a fine histogram with exact fixed-width
  * bins whose range doubles (merging bin pairs losslessly) whenever a value
  * falls outside — so a single pass needs no prior knowledge of the range.
+ * With a `display` transform it also tracks Welford mean/variance of the
+ * transformed values.
  */
 class StatsAccumulator {
     n = 0;
@@ -104,6 +115,18 @@ class StatsAccumulator {
     max = -Infinity;
     private mean = 0;
     private m2 = 0;
+
+    // Display-space Welford runs in units of `displayScale`, a power of two
+    // kept above half of every |value| seen, so squared deviations can't
+    // overflow while the values themselves are finite (e.g. `exp` of a
+    // log-scale near 700). Power-of-two rescaling is exact, so values that
+    // never trigger it get bit-identical results.
+    private displayScale = 1;
+    private displayMean = 0;
+    private displayM2 = 0;
+    private displayOverflow = false;
+
+    constructor(private display?: (v: number) => number) {}
 
     // Fine histogram, seeded lazily from the first two distinct values (a
     // constant column never allocates). `firstValue`/`firstCount` track the
@@ -130,6 +153,23 @@ class StatsAccumulator {
         const d = v - this.mean;
         this.mean += d / this.n;
         this.m2 += d * (v - this.mean);
+
+        if (this.display) {
+            const dv = this.display(v);
+            if (dv === Infinity) {
+                this.displayOverflow = true;
+            } else {
+                while (Math.abs(dv) >= 2 * this.displayScale) {
+                    this.displayScale *= 2;
+                    this.displayMean /= 2;
+                    this.displayM2 /= 4;
+                }
+                const sv = dv / this.displayScale;
+                const dd = sv - this.displayMean;
+                this.displayMean += dd / this.n;
+                this.displayM2 += dd * (sv - this.displayMean);
+            }
+        }
 
         if (this.bins === null) {
             if (this.firstCount === 0 || v === this.firstValue) {
@@ -173,7 +213,7 @@ class StatsAccumulator {
     }
 
     private insert(v: number, count: number): void {
-        const bin = Math.min(FINE_BINS - 1, Math.floor((v - this.lo) * FINE_BINS / (this.hi - this.lo)));
+        const bin = Math.min(FINE_BINS - 1, Math.floor(((v - this.lo) * FINE_BINS) / (this.hi - this.lo)));
         this.bins![bin] += count;
     }
 
@@ -227,20 +267,38 @@ class StatsAccumulator {
             const c = this.bins[b];
             if (c === 0) continue;
             const mid = this.lo + (b + 0.5) * width;
-            const idx = Math.min(NUM_BINS - 1, Math.max(0, Math.floor((mid - this.min) / range * NUM_BINS)));
+            const idx = Math.min(NUM_BINS - 1, Math.max(0, Math.floor(((mid - this.min) / range) * NUM_BINS)));
             out[idx] += c;
         }
         return out;
     }
 
-    finalize(): { min: number; max: number; median: number; mean: number; stdDev: number; nanCount: number; infCount: number; histogram: number[] } {
+    finalize(): {
+        min: number;
+        max: number;
+        median: number;
+        mean: number;
+        stdDev: number;
+        displayMean: number;
+        displayStdDev: number;
+        nanCount: number;
+        infCount: number;
+        histogram: number[];
+    } {
         const empty = this.n === 0;
+        const mean = empty ? NaN : round(this.mean);
+        const stdDev = empty ? NaN : round(Math.sqrt(this.m2 / this.n));
+        const raw = !this.display || empty;
+        const display = (v: number): number =>
+            this.displayOverflow ? Infinity : roundSignificant(this.displayScale * v);
         return {
             min: empty ? NaN : round(this.min),
             max: empty ? NaN : round(this.max),
             median: round(this.quantile(0.5)),
-            mean: empty ? NaN : round(this.mean),
-            stdDev: empty ? NaN : round(Math.sqrt(this.m2 / this.n)),
+            mean,
+            stdDev,
+            displayMean: raw ? mean : display(this.displayMean),
+            displayStdDev: raw ? stdDev : display(Math.sqrt(this.displayM2 / this.n)),
             nanCount: this.nanCount,
             infCount: this.infCount,
             histogram: this.computeHistogram()
@@ -260,8 +318,9 @@ const buildColumnPlans = (meta: ChunkSourceMetadata): ColumnPlan[] => {
         ['x', 'y', 'z'].forEach((name, elem) => plans.push({ name, layer: 'position', elem, uint: false }));
     }
     if (meta.availableLayers.has('geometric')) {
-        ['rot_0', 'rot_1', 'rot_2', 'rot_3', 'scale_0', 'scale_1', 'scale_2', 'opacity']
-        .forEach((name, elem) => plans.push({ name, layer: 'geometric', elem, uint: false }));
+        ['rot_0', 'rot_1', 'rot_2', 'rot_3', 'scale_0', 'scale_1', 'scale_2', 'opacity'].forEach((name, elem) =>
+            plans.push({ name, layer: 'geometric', elem, uint: false })
+        );
     }
     if (meta.availableLayers.has('color')) {
         ['f_dc_0', 'f_dc_1', 'f_dc_2'].forEach((name, elem) => plans.push({ name, layer: 'color', elem, uint: false }));
@@ -270,12 +329,14 @@ const buildColumnPlans = (meta: ChunkSourceMetadata): ColumnPlan[] => {
         }
     }
     if (meta.availableLayers.has('other')) {
-        meta.extraColumns.forEach((e, elem) => plans.push({ name: e.name, layer: 'other', elem, uint: e.type === 'uint32' }));
+        meta.extraColumns.forEach((e, elem) =>
+            plans.push({ name: e.name, layer: 'other', elem, uint: e.type === 'uint32' })
+        );
     }
     return plans;
 };
 
-type MutableReadRequest = { chunkIndex: number; lod: number } & { [L in ChunkLayer]?: ChunkData };
+type MutableReadRequest = { chunkIndex: number; lod: number } & Partial<Record<ChunkLayer, ChunkData>>;
 
 /**
  * Compute per-LOD, per-column statistics for a source in a single streaming
@@ -290,13 +351,13 @@ type MutableReadRequest = { chunkIndex: number; lod: number } & { [L in ChunkLay
 const computeSourceStats = async (src: ChunkSource, pool: ChunkDataPool): Promise<SourceStats> => {
     const { meta } = src;
     const plans = buildColumnPlans(meta);
-    const layers = [...new Set(plans.map(p => p.layer))];
+    const layers = [...new Set(plans.map((p) => p.layer))];
     const lods: LodStats[] = [];
 
     const hasFill = meta.availableLayers.has('position') && meta.availableLayers.has('geometric');
 
     for (let lod = 0; lod < meta.numLods; lod++) {
-        const accs = plans.map(() => new StatsAccumulator());
+        const accs = plans.map((p) => new StatsAccumulator(forwardTransforms[p.name]));
         const lodCount = meta.lodCounts[lod];
         const numChunks = meta.numChunks[lod] ?? 0;
 
@@ -342,7 +403,7 @@ const computeSourceStats = async (src: ChunkSource, pool: ChunkDataPool): Promis
                     // The smallest may be 0 (a -Infinity flat-splat scale), so
                     // pick the top two explicitly rather than dividing it out.
                     const lo = Math.min(s0, Math.min(s1, s2));
-                    const top2 = s0 === lo ? s1 * s2 : (s1 === lo ? s0 * s2 : s0 * s1);
+                    const top2 = s0 === lo ? s1 * s2 : s1 === lo ? s0 * s2 : s0 * s1;
                     const area = Math.PI * top2;
                     areaAcc.add(area);
                     if (!Number.isNaN(area)) totalArea += area;
@@ -352,13 +413,13 @@ const computeSourceStats = async (src: ChunkSource, pool: ChunkDataPool): Promis
             for (const cd of acquired) cd.release();
         }
 
-        const results = accs.map(a => a.finalize());
+        const results = accs.map((a) => a.finalize());
 
         let fillRatio: number | undefined;
         if (hasFill) {
             // Robust extents (p1-p99 per axis) so flyaway splats can't inflate
             // the cross-section and mask the fill.
-            const axis = (name: string): StatsAccumulator => accs[plans.findIndex(p => p.name === name)];
+            const axis = (name: string): StatsAccumulator => accs[plans.findIndex((p) => p.name === name)];
             const [dx, dy, dz] = ['x', 'y', 'z'].map((name) => {
                 const acc = axis(name);
                 return Math.max(0, acc.quantile(0.99) - acc.quantile(0.01));
@@ -371,22 +432,24 @@ const computeSourceStats = async (src: ChunkSource, pool: ChunkDataPool): Promis
                 const medianArea = areaAcc.quantile(0.5);
                 crossSection = Number.isFinite(medianArea) ? medianArea : 0;
             }
-            fillRatio = round(crossSection > 0 ? totalArea / crossSection : (totalArea > 0 ? Infinity : 0));
+            fillRatio = round(crossSection > 0 ? totalArea / crossSection : totalArea > 0 ? Infinity : 0);
         }
 
         lods.push({
             lod,
             numGaussians: lodCount,
-            columns: plans.map(p => p.name),
+            columns: plans.map((p) => p.name),
             data: {
-                min: results.map(r => r.min),
-                max: results.map(r => r.max),
-                median: results.map(r => r.median),
-                mean: results.map(r => r.mean),
-                stdDev: results.map(r => r.stdDev),
-                nanCount: results.map(r => r.nanCount),
-                infCount: results.map(r => r.infCount),
-                histogram: results.map(r => r.histogram)
+                min: results.map((r) => r.min),
+                max: results.map((r) => r.max),
+                median: results.map((r) => r.median),
+                mean: results.map((r) => r.mean),
+                stdDev: results.map((r) => r.stdDev),
+                displayMean: results.map((r) => r.displayMean),
+                displayStdDev: results.map((r) => r.displayStdDev),
+                nanCount: results.map((r) => r.nanCount),
+                infCount: results.map((r) => r.infCount),
+                histogram: results.map((r) => r.histogram)
             },
             ...(fillRatio !== undefined ? { fillRatio } : {})
         });

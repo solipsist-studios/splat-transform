@@ -1,19 +1,18 @@
-import {
-    createInMemoryChunkSource,
+import { createInMemoryChunkSource, OPACITY_LINEAR_COLUMN, SH_REST_COUNTS, DEFAULT_CHUNK_SIZE } from '../chunk';
+import type {
     InMemoryChunkSource,
-    SH_REST_COUNTS,
-    DEFAULT_CHUNK_SIZE,
-    type ExtraColumn,
-    type ChunkData,
-    type ChunkDataPool,
-    type ChunkSource,
-    type ChunkSourceMetadata,
-    type ChunkLayer,
-    type SHBands
+    ExtraColumn,
+    ChunkData,
+    ChunkDataPool,
+    ChunkSource,
+    ChunkSourceMetadata,
+    ChunkLayer,
+    SHBands
 } from '../chunk';
 import { Column, DataTable } from '../data-table';
-import { type SplatModel } from '../splat-model';
-import { type Transform } from '../utils';
+import type { SplatModel } from '../splat-model';
+import type { Transform } from '../utils';
+import { opacityToLogit } from '../utils/opacity';
 
 /**
  * The legacy `DataTable` <-> `ChunkSource` compatibility bridge.
@@ -33,17 +32,15 @@ import { type Transform } from '../utils';
 
 /** Standard column names that map directly to the canonical layers. */
 const POSITION_COLS = ['x', 'y', 'z'] as const;
-const GEOMETRIC_COLS = [
-    'rot_0', 'rot_1', 'rot_2', 'rot_3',
-    'scale_0', 'scale_1', 'scale_2',
-    'opacity'
-] as const;
+const GEOMETRIC_COLS = ['rot_0', 'rot_1', 'rot_2', 'rot_3', 'scale_0', 'scale_1', 'scale_2', 'opacity'] as const;
 const COLOR_DC_COLS = ['f_dc_0', 'f_dc_1', 'f_dc_2'] as const;
 
+// opacity_linear is standard too: it fills the geometric layer's opacity slot, not an extra
 const standardColumnSet = new Set<string>([
     ...POSITION_COLS,
     ...GEOMETRIC_COLS,
-    ...COLOR_DC_COLS
+    ...COLOR_DC_COLS,
+    OPACITY_LINEAR_COLUMN
 ]);
 
 /**
@@ -89,6 +86,7 @@ const detectShBands = (dataTable: DataTable): SHBands => {
     if (count === SH_REST_COUNTS[1]) return 1;
     if (count === SH_REST_COUNTS[2]) return 2;
     if (count === SH_REST_COUNTS[3]) return 3;
+    if (count === SH_REST_COUNTS[4]) return 4;
     throw new Error(`dataTableToChunkSource: unrecognized f_rest_* count: ${count}`);
 };
 
@@ -97,9 +95,7 @@ const detectExtras = (dataTable: DataTable): ExtraColumn[] => {
     for (const c of dataTable.columns) {
         if (standardColumnSet.has(c.name)) continue;
         if (/^f_rest_\d+$/.test(c.name)) continue;
-        const type: 'float32' | 'uint32' = (
-            c.dataType === 'float32' || c.dataType === 'float64'
-        ) ? 'float32' : 'uint32';
+        const type: 'float32' | 'uint32' = c.dataType === 'float32' || c.dataType === 'float64' ? 'float32' : 'uint32';
         extras.push({ name: c.name, type });
     }
     return extras;
@@ -126,10 +122,7 @@ const splitToChunks = (
     let rowOffset = 0;
     while (rowsRemaining > 0) {
         const rows = Math.min(chunkSize, rowsRemaining);
-        const slice = interleaved.subarray(
-            rowOffset * elemsPerRow,
-            (rowOffset + rows) * elemsPerRow
-        );
+        const slice = interleaved.subarray(rowOffset * elemsPerRow, (rowOffset + rows) * elemsPerRow);
         // Copy into a fresh ArrayBuffer so each chunk owns its bytes.
         const ab = new ArrayBuffer(rows * elemsPerRow * 4);
         if (isFloat) {
@@ -177,81 +170,100 @@ const dataTableToChunkSource = (
     const extras = detectExtras(dataTable);
     const transform: Transform = dataTable.transform;
 
-    const hasPosition = POSITION_COLS.every(c => dataTable.hasColumn(c));
-    const hasGeometric = GEOMETRIC_COLS.every(c => dataTable.hasColumn(c));
-    const hasColor = COLOR_DC_COLS.every(c => dataTable.hasColumn(c));
+    const hasPosition = POSITION_COLS.every((c) => dataTable.hasColumn(c));
+    // the opacity slot holds true opacity: opacity_linear when the table has it, else sigmoid(opacity)
+    const linear = dataTable.getColumnByName(OPACITY_LINEAR_COLUMN)?.data;
+    const hasGeometric = GEOMETRIC_COLS.every((c) => dataTable.hasColumn(c) || (c === 'opacity' && !!linear));
+    const hasColor = COLOR_DC_COLS.every((c) => dataTable.hasColumn(c));
     const hasOther = extras.length > 0;
 
     const col = (name: string): Float32Array => dataTable.getColumnByName(name)!.data as Float32Array;
     const srcRow = (i: number): number => (indices ? indices[i] : i);
 
-    const positionChunks: ArrayBuffer[] | undefined = hasPosition ? (() => {
-        const arr = new Float32Array(count * 3);
-        const x = col('x'), y = col('y'), z = col('z');
-        for (let i = 0; i < count; i++) {
-            const s = srcRow(i);
-            arr[i * 3 + 0] = x[s];
-            arr[i * 3 + 1] = y[s];
-            arr[i * 3 + 2] = z[s];
-        }
-        return splitToChunks(arr, count, 3, chunkSize);
-    })() : undefined;
+    const positionChunks: ArrayBuffer[] | undefined = hasPosition
+        ? (() => {
+              const arr = new Float32Array(count * 3);
+              const x = col('x'),
+                  y = col('y'),
+                  z = col('z');
+              for (let i = 0; i < count; i++) {
+                  const s = srcRow(i);
+                  arr[i * 3 + 0] = x[s];
+                  arr[i * 3 + 1] = y[s];
+                  arr[i * 3 + 2] = z[s];
+              }
+              return splitToChunks(arr, count, 3, chunkSize);
+          })()
+        : undefined;
 
-    const geometricChunks: ArrayBuffer[] | undefined = hasGeometric ? (() => {
-        const arr = new Float32Array(count * 8);
-        const r0 = col('rot_0'), r1 = col('rot_1'), r2 = col('rot_2'), r3 = col('rot_3');
-        const s0 = col('scale_0'), s1 = col('scale_1'), s2 = col('scale_2');
-        const op = col('opacity');
-        for (let i = 0; i < count; i++) {
-            const s = srcRow(i);
-            const o = i * 8;
-            arr[o + 0] = r0[s];
-            arr[o + 1] = r1[s];
-            arr[o + 2] = r2[s];
-            arr[o + 3] = r3[s];
-            arr[o + 4] = s0[s];
-            arr[o + 5] = s1[s];
-            arr[o + 6] = s2[s];
-            arr[o + 7] = op[s];
-        }
-        return splitToChunks(arr, count, 8, chunkSize);
-    })() : undefined;
+    const geometricChunks: ArrayBuffer[] | undefined = hasGeometric
+        ? (() => {
+              const arr = new Float32Array(count * 8);
+              const r0 = col('rot_0'),
+                  r1 = col('rot_1'),
+                  r2 = col('rot_2'),
+                  r3 = col('rot_3');
+              const s0 = col('scale_0'),
+                  s1 = col('scale_1'),
+                  s2 = col('scale_2');
+              const op = linear ? null : col('opacity');
+              for (let i = 0; i < count; i++) {
+                  const s = srcRow(i);
+                  const o = i * 8;
+                  arr[o + 0] = r0[s];
+                  arr[o + 1] = r1[s];
+                  arr[o + 2] = r2[s];
+                  arr[o + 3] = r3[s];
+                  arr[o + 4] = s0[s];
+                  arr[o + 5] = s1[s];
+                  arr[o + 6] = s2[s];
+                  arr[o + 7] = linear ? linear[s] : 1 / (1 + Math.exp(-op![s]));
+              }
+              return splitToChunks(arr, count, 8, chunkSize);
+          })()
+        : undefined;
 
-    const colorChunks: ArrayBuffer[] | undefined = hasColor ? (() => {
-        const elemsPerRow = 3 + numRest;
-        const arr = new Float32Array(count * elemsPerRow);
-        const dc0 = col('f_dc_0'), dc1 = col('f_dc_1'), dc2 = col('f_dc_2');
-        const restCols: Float32Array[] = [];
-        for (let r = 0; r < numRest; r++) restCols.push(col(`f_rest_${r}`));
-        for (let i = 0; i < count; i++) {
-            const s = srcRow(i);
-            const o = i * elemsPerRow;
-            arr[o + 0] = dc0[s];
-            arr[o + 1] = dc1[s];
-            arr[o + 2] = dc2[s];
-            for (let r = 0; r < numRest; r++) arr[o + 3 + r] = restCols[r][s];
-        }
-        return splitToChunks(arr, count, elemsPerRow, chunkSize);
-    })() : undefined;
+    const colorChunks: ArrayBuffer[] | undefined = hasColor
+        ? (() => {
+              const elemsPerRow = 3 + numRest;
+              const arr = new Float32Array(count * elemsPerRow);
+              const dc0 = col('f_dc_0'),
+                  dc1 = col('f_dc_1'),
+                  dc2 = col('f_dc_2');
+              const restCols: Float32Array[] = [];
+              for (let r = 0; r < numRest; r++) restCols.push(col(`f_rest_${r}`));
+              for (let i = 0; i < count; i++) {
+                  const s = srcRow(i);
+                  const o = i * elemsPerRow;
+                  arr[o + 0] = dc0[s];
+                  arr[o + 1] = dc1[s];
+                  arr[o + 2] = dc2[s];
+                  for (let r = 0; r < numRest; r++) arr[o + 3 + r] = restCols[r][s];
+              }
+              return splitToChunks(arr, count, elemsPerRow, chunkSize);
+          })()
+        : undefined;
 
-    const otherChunks: ArrayBuffer[] | undefined = hasOther ? (() => {
-        const elemsPerRow = extras.length;
-        const arr = new Uint32Array(count * elemsPerRow);
-        const f32View = new Float32Array(arr.buffer);
-        const cols = extras.map(e => dataTable.getColumnByName(e.name)!.data);
-        for (let i = 0; i < count; i++) {
-            const s = srcRow(i);
-            const o = i * elemsPerRow;
-            for (let e = 0; e < elemsPerRow; e++) {
-                if (extras[e].type === 'float32') {
-                    f32View[o + e] = cols[e][s] as number;
-                } else {
-                    arr[o + e] = cols[e][s] as number;
-                }
-            }
-        }
-        return splitToChunks(arr, count, elemsPerRow, chunkSize);
-    })() : undefined;
+    const otherChunks: ArrayBuffer[] | undefined = hasOther
+        ? (() => {
+              const elemsPerRow = extras.length;
+              const arr = new Uint32Array(count * elemsPerRow);
+              const f32View = new Float32Array(arr.buffer);
+              const cols = extras.map((e) => dataTable.getColumnByName(e.name)!.data);
+              for (let i = 0; i < count; i++) {
+                  const s = srcRow(i);
+                  const o = i * elemsPerRow;
+                  for (let e = 0; e < elemsPerRow; e++) {
+                      if (extras[e].type === 'float32') {
+                          f32View[o + e] = cols[e][s] as number;
+                      } else {
+                          arr[o + e] = cols[e][s] as number;
+                      }
+                  }
+              }
+              return splitToChunks(arr, count, elemsPerRow, chunkSize);
+          })()
+        : undefined;
 
     return createInMemoryChunkSource({
         numGaussians: count,
@@ -261,6 +273,7 @@ const dataTableToChunkSource = (
         extraColumns: extras,
         transform,
         lodCounts: [count],
+        opacityAboveOne: !!linear,
         position: positionChunks ? [positionChunks] : undefined,
         geometric: geometricChunks ? [geometricChunks] : undefined,
         color: colorChunks ? [colorChunks] : undefined,
@@ -278,7 +291,9 @@ const dataTableToChunkSource = (
  *
  * Each requested layer is read chunk-by-chunk and scattered into the
  * appropriate named columns (`x, y, z, rot_*, scale_*, opacity, f_dc_*,
- * f_rest_*`, plus extras).
+ * f_rest_*`, plus extras). The source's true opacity becomes the `opacity`
+ * logit (see `opacityToLogit`), plus an `opacity_linear` column holding it
+ * when some gaussian's exceeds 1.
  * @param src - The source to materialize.
  * @param pool - The `ChunkData` pool used for the temporary read buffers; its `chunkSize` must be >= the source's.
  * @param layers - Optional layer filter; when set, only these layers (intersected with the source's) are read and allocated. Omit for every available layer. Consumers of a subset (e.g. voxelization needs only position + geometric) skip the unused columns entirely rather than loading and discarding them.
@@ -313,7 +328,8 @@ const materializeToDataTable = async (
     const scale0 = wantsGeometric ? new Float32Array(N) : null;
     const scale1 = wantsGeometric ? new Float32Array(N) : null;
     const scale2 = wantsGeometric ? new Float32Array(N) : null;
-    const opacity = wantsGeometric ? new Float32Array(N) : null;
+    // true opacity from the opacity slot, written as an `opacity` logit plus (when some exceeds 1) `opacity_linear`
+    const linearOpacity = wantsGeometric ? new Float32Array(N) : null;
 
     const dc0 = wantsColor ? new Float32Array(N) : null;
     const dc1 = wantsColor ? new Float32Array(N) : null;
@@ -322,11 +338,13 @@ const materializeToDataTable = async (
     const numRest = SH_REST_COUNTS[meta.shBands];
     const restArrays: Float32Array[] = wantsColor ? Array.from({ length: numRest }, () => new Float32Array(N)) : [];
 
-    const extraArrays = wantsOther ? meta.extraColumns.map(e => ({
-        name: e.name,
-        type: e.type,
-        data: e.type === 'float32' ? new Float32Array(N) : new Uint32Array(N)
-    })) : [];
+    const extraArrays = wantsOther
+        ? meta.extraColumns.map((e) => ({
+              name: e.name,
+              type: e.type,
+              data: e.type === 'float32' ? new Float32Array(N) : new Uint32Array(N)
+          }))
+        : [];
 
     const chunkSize = meta.chunkSize;
 
@@ -350,8 +368,12 @@ const materializeToDataTable = async (
         const layouts = meta.layouts;
         const acquired: { layer: ChunkLayer; chunkData: ChunkData }[] = [];
         const req: {
-            chunkIndex: number; lod: number;
-            position?: ChunkData; geometric?: ChunkData; color?: ChunkData; other?: ChunkData;
+            chunkIndex: number;
+            lod: number;
+            position?: ChunkData;
+            geometric?: ChunkData;
+            color?: ChunkData;
+            other?: ChunkData;
         } = { chunkIndex: k, lod };
 
         if (wantsPosition) {
@@ -403,7 +425,7 @@ const materializeToDataTable = async (
                     scale0![di] = f32[si + 4];
                     scale1![di] = f32[si + 5];
                     scale2![di] = f32[si + 6];
-                    opacity![di] = f32[si + 7];
+                    linearOpacity![di] = f32[si + 7];
                 }
             } else if (layer === 'color') {
                 const f32 = new Float32Array(chunkData.data, 0, count * elemsPerRow);
@@ -418,7 +440,8 @@ const materializeToDataTable = async (
                         restArrays[r][di] = f32[si + 3 + r];
                     }
                 }
-            } else { // 'other'
+            } else {
+                // 'other'
                 const f32 = new Float32Array(chunkData.data, 0, count * elemsPerRow);
                 const u32 = new Uint32Array(chunkData.data, 0, count * elemsPerRow);
                 const cols = extraArrays.length;
@@ -450,16 +473,20 @@ const materializeToDataTable = async (
             new Column('rot_3', rot3!),
             new Column('scale_0', scale0!),
             new Column('scale_1', scale1!),
-            new Column('scale_2', scale2!),
-            new Column('opacity', opacity!)
+            new Column('scale_2', scale2!)
         );
+        const opacity = new Float32Array(N);
+        let aboveOne = false;
+        for (let i = 0; i < N; i++) {
+            const a = linearOpacity![i];
+            opacity[i] = opacityToLogit(a);
+            if (a > 1) aboveOne = true;
+        }
+        columns.push(new Column('opacity', opacity));
+        if (aboveOne) columns.push(new Column(OPACITY_LINEAR_COLUMN, linearOpacity!));
     }
     if (wantsColor) {
-        columns.push(
-            new Column('f_dc_0', dc0!),
-            new Column('f_dc_1', dc1!),
-            new Column('f_dc_2', dc2!)
-        );
+        columns.push(new Column('f_dc_0', dc0!), new Column('f_dc_1', dc1!), new Column('f_dc_2', dc2!));
         for (let r = 0; r < numRest; r++) {
             columns.push(new Column(`f_rest_${r}`, restArrays[r]));
         }

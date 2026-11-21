@@ -1,14 +1,15 @@
 /**
- * Packs the running-state (linear color + residual transmittance) into a
+ * Packs the running-state (premultiplied gamma color + residual transmittance) into a
  * single RGBA8-packed u32 per group pixel. Composites the user-supplied
  * background under the residual transmittance so the final image carries
  * the chosen `bgR/bgG/bgB/bgA` everywhere the splats didn't fully cover.
  *
  * @returns WGSL source for the finalize compute shader.
  */
-const finalizeWgsl = () => /* wgsl */`
+const finalizeWgsl = () => /* wgsl */ `
 #include "uniformsStruct"
 #include "constants"
+#include "packRGBA8"
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
 @group(0) @binding(1) var<storage, read> runningState: array<vec4<f32>>;
@@ -28,15 +29,10 @@ fn main(
     let pixelIdx = localPixelY * groupPixelW + localPixelX;
     let state = runningState[pixelIdx];
 
-    let color = state.rgb + state.a * vec3<f32>(uniforms.bgR, uniforms.bgG, uniforms.bgB);
+    let color = state.rgb + state.a * uniforms.bgA * vec3<f32>(uniforms.bgR, uniforms.bgG, uniforms.bgB);
     let alphaOut = (1.0 - state.a) + state.a * uniforms.bgA;
 
-    let r = u32(clamp(color.r, 0.0, 1.0) * 255.0 + 0.5);
-    let g = u32(clamp(color.g, 0.0, 1.0) * 255.0 + 0.5);
-    let bch = u32(clamp(color.b, 0.0, 1.0) * 255.0 + 0.5);
-    let aOut = u32(clamp(alphaOut, 0.0, 1.0) * 255.0 + 0.5);
-
-    output[pixelIdx] = r | (g << 8u) | (bch << 16u) | (aOut << 24u);
+    output[pixelIdx] = packRGBA8(vec4<f32>(color / max(alphaOut, 1e-8), alphaOut));
 }
 `;
 

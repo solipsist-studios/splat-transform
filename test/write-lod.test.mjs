@@ -21,7 +21,7 @@ import { bakeTransform, mapSource, stackLods } from '../src/lib/ops/index.js';
 import { readPly } from '../src/lib/readers/read-ply.js';
 import { collectFilesByLod, readLodEnvironmentSource } from '../src/lib/readers/read-lod.js';
 import { createChunkDataPool } from '../src/lib/chunk/index.js';
-import { findNearest, positionsFromSlim, writeLodSource } from '../src/lib/writers/write-lod.js';
+import { positionsFromSlim, writeLodSource } from '../src/lib/writers/write-lod.js';
 import { version } from '../src/lib/version.js';
 
 import { encodePlyBinary } from './helpers/test-utils.mjs';
@@ -79,8 +79,7 @@ const makeTable = (n) => {
     ], Transform.PLY);
 };
 
-// A table from explicit per-splat values, for exercising the LOD error metric.
-// Defaults put every splat at the origin with log-scale -3 (sigma ~0.0498) and
+// A table from explicit per-splat values. Defaults put every splat at the origin with log-scale -3 (sigma ~0.0498) and
 // opacity logit 0 (alpha 0.5).
 const makeSplatTable = (splats) => {
     const col = (key, fallback) => new Float32Array(splats.map(s => s[key] ?? fallback));
@@ -102,8 +101,8 @@ const makeSplatTable = (splats) => {
     ], Transform.PLY);
 };
 
-// The error table of a scene whose levels are given splat-by-splat.
-const writeErrors = async (levels) => {
+// The manifest of a scene whose levels are given splat-by-splat.
+const writeLevels = async (levels) => {
     const fs = new MemoryFileSystem();
     const sources = levels.map(splats => dataTableToChunkSource(makeSplatTable(splats), 1 << 20));
     await writeLodSource({
@@ -114,16 +113,7 @@ const writeErrors = async (levels) => {
         chunkCount: 1,
         chunkExtent: 16
     }, fs);
-    const meta = JSON.parse(new TextDecoder().decode(fs.results.get('/scene/lod-meta.json')));
-    return meta.tree.errors;
-};
-
-const makeShTable = (restValue) => {
-    const table = makeTable(1);
-    for (let i = 0; i < 9; i++) {
-        table.addColumn(new Column(`f_rest_${i}`, new Float32Array([restValue])));
-    }
-    return table;
+    return JSON.parse(new TextDecoder().decode(fs.results.get('/scene/lod-meta.json')));
 };
 
 // Build a structural multi-LOD source from per-level row counts (each level a
@@ -176,7 +166,6 @@ describe('writeLodSource: lod-meta.json contract', function () {
         assert.strictEqual(meta.count, 5);
         assert.deepStrictEqual(meta.counts, [3, 2]);
         assert.strictEqual(meta.lodLevels, 2);
-        assert.strictEqual(meta.lodErrors, true, 'error tables are declared in the header');
         assert.ok(!('environment' in meta), 'environment omitted when there are no environment splats');
         assert.deepStrictEqual([...meta.filenames].sort(), ['0_0/meta.json', '1_0/meta.json']);
 
@@ -191,113 +180,111 @@ describe('writeLodSource: lod-meta.json contract', function () {
             { offset: meta.tree.lods['1'].offset, count: meta.tree.lods['1'].count },
             { offset: 0, count: 2 }
         );
-        assert.strictEqual(meta.tree.errors.length, 2);
-        assert.strictEqual(meta.tree.errors[0], 0);
-        assert.ok(Number.isFinite(meta.tree.errors[1]) && meta.tree.errors[1] >= 0);
 
         assert.ok(fs.results.has('/scene/0_0/meta.json'));
         assert.ok(fs.results.has('/scene/1_0/meta.json'));
     });
 
-    it('matches errors to lodLevels when trailing structural LODs are empty', async function () {
-        const { meta } = await writeScene([1, 0], 0);
-        assert.strictEqual(meta.lodLevels, 1);
-        assert.deepStrictEqual(meta.tree.errors, [0]);
-        assert.doesNotThrow(() => collectFilesByLod(meta, '/scene/lod-meta.json'));
-    });
+    const wideSplats = Array.from({ length: 300 }, (_, i) => ({ x: i * 0.5 }));
 
-    it('prunes KNN traversal when a target LOD contains fewer than k splats', function () {
-        let farLeafVisits = 0;
-        const nearLeaf = {
-            count: 2,
-            aabb: { min: [0, 0, 0], max: [0, 0, 0] },
-            indices: Uint32Array.of(0, 2)
-        };
-        const farLeaf = {
-            count: 1,
-            aabb: { min: [1000, 0, 0], max: [1000, 0, 0] },
-            get indices() {
-                farLeafVisits++;
-                return Uint32Array.of(1);
-            }
-        };
-        const root = {
-            count: 3,
-            aabb: { min: [0, 0, 0], max: [1000, 0, 0] },
-            left: nearLeaf,
-            right: farLeaf
-        };
-        const slim = {
-            x: Float32Array.of(0, 1000, 0),
-            y: new Float32Array(3),
-            z: new Float32Array(3)
-        };
-
-        const [result] = findNearest(root, slim, Uint32Array.of(0), Int32Array.of(2, 3), 4);
-        assert.deepStrictEqual(result, Int32Array.of(2, -1, -1, -1));
-        assert.strictEqual(farLeafVisits, 0);
-    });
-
-    it('includes stored spherical harmonics in the LOD error', async function () {
+    it('records the chunk minimum and does not split a sparse node for extent below it', async function () {
+        // 300 splats over 150 m: wider than the 16 m extent limit (and enough for the
+        // spatial tree to have interior nodes), but far below the default minimum of
+        // 8K gaussians, so the region stays one leaf
+        const source = dataTableToChunkSource(makeSplatTable(wideSplats), 1 << 20);
         const fs = new MemoryFileSystem();
         await writeLodSource({
             filename: '/scene/lod-meta.json',
-            mainSource: stackLods([
-                dataTableToChunkSource(makeShTable(0), 1 << 20),
-                dataTableToChunkSource(makeShTable(2), 1 << 20)
-            ]),
+            mainSource: source,
             envSource: null,
             iterations: 1,
             chunkCount: 1,
             chunkExtent: 16
         }, fs);
-
         const meta = JSON.parse(new TextDecoder().decode(fs.results.get('/scene/lod-meta.json')));
-        assert.ok(meta.tree.errors[1] > 0);
+        assert.strictEqual(meta.asset.chunkMinGaussians, 8192);
+        assert.ok(!('children' in meta.tree), 'a sparse wide node is one leaf');
+        assert.strictEqual(meta.tree.lods['0'].count, wideSplats.length);
     });
 
-    it('reports no error for a level identical to the finest', async function () {
-        assert.deepStrictEqual(await writeErrors([[{}], [{}]]), [0, 0]);
+    it('splits a wide node for extent once it holds more than the chunk minimum', async function () {
+        const source = dataTableToChunkSource(makeSplatTable(wideSplats), 1 << 20);
+        const fs = new MemoryFileSystem();
+        await writeLodSource({
+            filename: '/scene/lod-meta.json',
+            mainSource: source,
+            envSource: null,
+            iterations: 1,
+            chunkCount: 1,
+            chunkExtent: 16,
+            chunkMin: 0
+        }, fs);
+        const meta = JSON.parse(new TextDecoder().decode(fs.results.get('/scene/lod-meta.json')));
+        assert.strictEqual(meta.asset.chunkMinGaussians, 0);
+        assert.strictEqual(meta.tree.children?.length, 2, 'the extent limit splits a node above the minimum');
+        const leaves = [];
+        const walk = (n) => { if (n.children) n.children.forEach(walk); else leaves.push(n); };
+        walk(meta.tree);
+        assert.ok(leaves.length >= 2, `expected the extent limit to split the node, got ${leaves.length} leaf`);
+        assert.strictEqual(leaves.reduce((sum, l) => sum + l.lods['0'].count, 0), wideSplats.length);
     });
 
-    it('resolves a sub-sigma displacement', async function () {
-        // half a sigma apart: 1 - exp(-d^2/4) = 0.0606 for the relative field-L2
-        const sigma = Math.exp(-3);
-        const errors = await writeErrors([[{}], [{ x: 0.5 * sigma }]]);
-        assert.ok(errors[1] > 0.05 && errors[1] < 0.07, `expected ~0.0606, got ${errors[1]}`);
+    it('shares one device request across overlapping unit writes', async function () {
+        // like the CLI's creator, this one only caches its device once resolved:
+        // the next unit starting meanwhile must not begin a second initialization
+        let initializations = 0;
+        let ready = false;
+        const createDevice = async () => {
+            if (ready) return undefined;
+            initializations++;
+            await new Promise(resolve => setTimeout(resolve, 50));
+            ready = true;
+            return undefined; // no device: k-means runs on the CPU
+        };
+
+        // 3000 SH1 splats over 150 m: several leaves, packed into several units
+        const n = 3000;
+        const table = makeSplatTable(Array.from({ length: n }, (_, i) => ({ x: i * 0.05 })));
+        for (let j = 0; j < 9; j++) {
+            table.addColumn(new Column(`f_rest_${j}`, new Float32Array(n).map((_, i) => Math.sin(i * (j + 1)))));
+        }
+
+        const fs = new MemoryFileSystem();
+        await writeLodSource({
+            filename: '/scene/lod-meta.json',
+            mainSource: dataTableToChunkSource(table, 1 << 20),
+            envSource: null,
+            iterations: 1,
+            createDevice,
+            chunkCount: 1,
+            chunkExtent: 16,
+            chunkMin: 0
+        }, fs);
+        const meta = JSON.parse(new TextDecoder().decode(fs.results.get('/scene/lod-meta.json')));
+        assert.ok(meta.filenames.length > 1, `expected several units, got ${meta.filenames.length}`);
+        assert.strictEqual(initializations, 1);
     });
 
-    it('penalises an opacity drop at identical geometry', async function () {
-        const errors = await writeErrors([[{ opacity: 2 }], [{ opacity: -2 }]]);
-        assert.ok(errors[1] > 0.5, `expected a large error, got ${errors[1]}`);
+    it('trims lodLevels when trailing structural LODs are empty', async function () {
+        const { meta } = await writeScene([1, 0], 0);
+        assert.strictEqual(meta.lodLevels, 1);
+        assert.doesNotThrow(() => collectFilesByLod(meta, '/scene/lod-meta.json'));
     });
 
-    it('penalises thinning even when the survivors are identical', async function () {
-        // two coincident splats decimated to one: every nearest-neighbour match
-        // is exact, but the level carries half the alpha mass
-        const errors = await writeErrors([[{}, {}], [{}]]);
-        assert.ok(Math.abs(errors[1] - 0.5) < 1e-6, `expected 0.5, got ${errors[1]}`);
-    });
-
-    // Non-finite geometry is rejected up front rather than tolerated: a NaN scale
-    // or opacity would otherwise poison that splat's footprint mass, and the error
-    // table would quietly claim a coarse level costs nothing.
+    // Non-finite input is rejected up front rather than tolerated. The check runs
+    // on the bounds pass, so it covers every gaussian of every level.
     const rejects = [
         ['a NaN scale', { scale: NaN }, /non-finite scale/],
         ['a NaN opacity', { opacity: NaN }, /non-finite opacity/],
         ['a NaN position', { x: NaN }, /non-finite position/],
         ['a NaN rotation', { rot_0: NaN }, /non-finite rotation/],
         ['a zero-norm rotation', { rot_0: 0 }, /zero-norm rotation/],
-        // a NaN colour makes splatError NaN for every pair the splat is in, and
-        // directional discards NaN matches — so the more of a level is broken, the
-        // less error it reports. Left unchecked, two displaced levels whose colours
-        // are NaN report error 0 and the engine drops the finer one.
         ['a NaN color', { f_dc: NaN }, /non-finite color or SH/]
     ];
 
     for (const [label, splat, expected] of rejects) {
         it(`refuses to write LODs for input with ${label}`, async function () {
-            await assert.rejects(() => writeErrors([[{}, splat], [{}]]), (err) => {
+            await assert.rejects(() => writeLevels([[{}, splat], [{}]]), (err) => {
                 assert.match(err.message, expected);
                 assert.match(err.message, /--filter-nan/);
                 return true;
@@ -308,19 +295,8 @@ describe('writeLodSource: lod-meta.json contract', function () {
     it('accepts the non-finite values --filter-nan deliberately keeps', async function () {
         // a flat splat (scale -Inf) and a fully opaque one (opacity +Inf) survive
         // filterNaN, so the writer must not reject them
-        const errors = await writeErrors([[{}, { scale: -Infinity }, { opacity: Infinity }], [{}]]);
-        assert.ok(
-            errors.every(error => Number.isFinite(error) && error >= 0),
-            `expected finite non-negative errors, got ${errors}`
-        );
-    });
-
-    it('keeps the error table monotone across levels', async function () {
-        // level 2 matches a level-0 splat exactly while level 1 sits between
-        // both, so the raw errors would rank the coarser level as the better one
-        const errors = await writeErrors([[{ x: 0 }, { x: 1 }], [{ x: 0.5 }], [{ x: 0 }]]);
-        assert.ok(errors[1] > 0, `expected a non-zero error, got ${errors[1]}`);
-        assert.ok(errors[2] >= errors[1], `expected monotone errors, got ${errors}`);
+        const meta = await writeLevels([[{}, { scale: -Infinity }, { opacity: Infinity }], [{}]]);
+        assert.deepStrictEqual(meta.counts, [3, 1]);
     });
 
     it('references the environment SOG when environment splats are present', async function () {

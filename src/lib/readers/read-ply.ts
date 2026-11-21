@@ -1,15 +1,4 @@
-import { isCompressedPly, decompressPly } from './decompress-ply';
-import { fileChunkSource, readExact, sortGatherSlots, gatherRuns } from './reader-utils';
 import {
-    type ChunkData,
-    type ChunkLayer,
-    type ReadRequest,
-    type ChunkSource,
-    type ChunkSourceMetadata,
-    type ChunkDataPool,
-    type ExtraColumn,
-    type LayerLayout,
-    type SHBands,
     SH_REST_COUNTS,
     POSITION_STRIDE,
     GEOMETRIC_STRIDE,
@@ -17,20 +6,36 @@ import {
     positionFields,
     geometricFields,
     colorFields,
-    otherLayout
+    otherLayout,
+    OPACITY_LINEAR_COLUMN
 } from '../chunk';
+import type {
+    ChunkData,
+    ChunkLayer,
+    ReadRequest,
+    ChunkSource,
+    ChunkSourceMetadata,
+    ChunkDataPool,
+    ExtraColumn,
+    LayerLayout,
+    SHBands
+} from '../chunk';
+import { AA_COMMENT_KEY, MODE_COMMENT_KEY, producerComments } from '../comments';
 import { Column, DataTable } from '../data-table';
-import { type ReadSource, type ReadStream } from '../io/read';
-import { type SplatModel } from '../splat-model';
+import type { ReadSource, ReadStream } from '../io/read';
+import type { SplatModel } from '../splat-model';
 import { logger, Transform } from '../utils';
 
+import { isCompressedPly, decompressPly } from './decompress-ply';
+import { fileChunkSource, readExact, sortGatherSlots, gatherRuns } from './reader-utils';
+
 type PlyProperty = {
-    name: string;               // 'x', 'f_dc_0', etc
-    type: string;               // 'float', 'char', etc
+    name: string; // 'x', 'f_dc_0', etc
+    type: string; // 'float', 'char', etc
 };
 
 type PlyElement = {
-    name: string;               // 'vertex', etc
+    name: string; // 'vertex', etc
     count: number;
     properties: PlyProperty[];
 };
@@ -38,41 +43,36 @@ type PlyElement = {
 type PlyHeader = {
     comments: string[];
     elements: PlyElement[];
-    headerBytes: number;        // byte offset at which binary data begins
-    format: string;             // 'binary_little_endian' | 'binary_big_endian' | 'ascii'
+    headerBytes: number; // byte offset at which binary data begins
+    format: string; // 'binary_little_endian' | 'binary_big_endian' | 'ascii'
 };
 
 // A whole-PLY decode result: one DataTable per element (consumed by decompressPly).
 type PlyData = {
     comments: string[];
     elements: {
-        name: string,
-        dataTable: DataTable
+        name: string;
+        dataTable: DataTable;
     }[];
 };
 
 const GEOMETRIC_COLS = ['rot_0', 'rot_1', 'rot_2', 'rot_3', 'scale_0', 'scale_1', 'scale_2', 'opacity'];
 const COLOR_DC_COLS = ['f_dc_0', 'f_dc_1', 'f_dc_2'];
 const SCALE_2_WORD = GEOMETRIC_COLS.indexOf('scale_2');
+const OPACITY_WORD = GEOMETRIC_COLS.indexOf('opacity');
 // The geometric columns a 2DGS record carries (everything but the third scale).
-const GEOMETRIC_COLS_2DGS = GEOMETRIC_COLS.filter(c => c !== 'scale_2');
+const GEOMETRIC_COLS_2DGS = GEOMETRIC_COLS.filter((c) => c !== 'scale_2');
 
-// Brush's `SplatRenderMode: <mode>` (brush-serde export.rs/import.rs) — the wire
-// form we also write, see `splatModelComment` in the writers.
-const MODE_COMMENT_KEY = 'splatrendermode: ';
 const MODE_TO_MODEL: Readonly<Record<string, SplatModel>> = {
     default: 'default',
     mip: 'antialiased',
     '2dgs': '2dgs'
 };
 
-// Postshot's flag.
-const AA_COMMENT_KEY = 'antialiased ';
-
 /**
  * Detect the splat model from a PLY header's comments. Two producer forms are
  * recognized: Brush's `SplatRenderMode: default | mip | 2dgs` and Postshot's
- * `antialiased 0 | 1`.
+ * `postshot.anti_aliasing=0 | 1`.
  *
  * Matching is case-insensitive and the last match wins (as Brush's own importer
  * does), so a file carrying both forms is decided by header order. Unrecognized
@@ -97,44 +97,82 @@ const splatModelFromComments = (comments: string[]): SplatModel => {
     return model;
 };
 
+/**
+ * The header comments a scene carries through, as metadata (see {@link producerComments}).
+ *
+ * @param comments - Header comments, without their leading `comment `.
+ * @returns `{ comments }` with the comments to keep, or `{}` when none are left.
+ */
+const commentsMeta = (comments: string[]): { comments?: string[] } => {
+    const kept = producerComments(comments);
+    return kept.length > 0 ? { comments: kept } : {};
+};
+
 const getDataType = (type: string) => {
     switch (type) {
-        case 'char': return Int8Array;
-        case 'uchar': return Uint8Array;
-        case 'short': return Int16Array;
-        case 'ushort': return Uint16Array;
-        case 'int': return Int32Array;
-        case 'uint': return Uint32Array;
-        case 'float': return Float32Array;
-        case 'double': return Float64Array;
-        default: return null;
+        case 'char':
+            return Int8Array;
+        case 'uchar':
+            return Uint8Array;
+        case 'short':
+            return Int16Array;
+        case 'ushort':
+            return Uint16Array;
+        case 'int':
+            return Int32Array;
+        case 'uint':
+            return Uint32Array;
+        case 'float':
+            return Float32Array;
+        case 'double':
+            return Float64Array;
+        default:
+            return null;
     }
 };
 
-// Reads one numeric value from a DataView at a byte offset (little-endian).
+// Reads one numeric value from a DataView at a byte offset.
 type ValueReader = (view: DataView, offset: number) => number;
 
-const getReader = (type: string): ValueReader => {
+const getReader = (type: string, le = true): ValueReader => {
     switch (type) {
-        case 'char':   return (v, o) => v.getInt8(o);
-        case 'uchar':  return (v, o) => v.getUint8(o);
-        case 'short':  return (v, o) => v.getInt16(o, true);
-        case 'ushort': return (v, o) => v.getUint16(o, true);
-        case 'int':    return (v, o) => v.getInt32(o, true);
-        case 'uint':   return (v, o) => v.getUint32(o, true);
-        case 'float':  return (v, o) => v.getFloat32(o, true);
-        case 'double': return (v, o) => v.getFloat64(o, true);
-        default: throw new Error(`readPly: unsupported ply type '${type}'`);
+        case 'char':
+            return (v, o) => v.getInt8(o);
+        case 'uchar':
+            return (v, o) => v.getUint8(o);
+        case 'short':
+            return (v, o) => v.getInt16(o, le);
+        case 'ushort':
+            return (v, o) => v.getUint16(o, le);
+        case 'int':
+            return (v, o) => v.getInt32(o, le);
+        case 'uint':
+            return (v, o) => v.getUint32(o, le);
+        case 'float':
+            return (v, o) => v.getFloat32(o, le);
+        case 'double':
+            return (v, o) => v.getFloat64(o, le);
+        default:
+            throw new Error(`readPly: unsupported ply type '${type}'`);
     }
 };
 
 const typeSize = (type: string): number => {
     switch (type) {
-        case 'char': case 'uchar': return 1;
-        case 'short': case 'ushort': return 2;
-        case 'int': case 'uint': case 'float': return 4;
-        case 'double': return 8;
-        default: throw new Error(`readPly: unsupported ply type '${type}'`);
+        case 'char':
+        case 'uchar':
+            return 1;
+        case 'short':
+        case 'ushort':
+            return 2;
+        case 'int':
+        case 'uint':
+        case 'float':
+            return 4;
+        case 'double':
+            return 8;
+        default:
+            throw new Error(`readPly: unsupported ply type '${type}'`);
     }
 };
 
@@ -183,7 +221,8 @@ const readHeader = async (source: ReadSource): Promise<PlyHeader> => {
     for (let i = 1; i < lines.length; i++) {
         const words = lines[i].split(' ').filter(Boolean);
         switch (words[0]) {
-            case 'ply': case 'end_header':
+            case 'ply':
+            case 'end_header':
                 break;
             case 'format':
                 format = words[1] ?? '';
@@ -197,7 +236,8 @@ const readHeader = async (source: ReadSource): Promise<PlyHeader> => {
                 elements.push(current);
                 break;
             case 'property':
-                if (!current || words.length !== 3 || !getDataType(words[1])) throw new Error('readPly: invalid property line');
+                if (!current || words.length !== 3 || !getDataType(words[1]))
+                    throw new Error('readPly: invalid property line');
                 current.properties.push({ name: words[2], type: words[1] });
                 break;
             default:
@@ -218,9 +258,9 @@ const decodeElement = async (
     count: number,
     onProgress?: (rows: number) => void
 ): Promise<DataTable> => {
-    const columns = properties.map(p => new Column(p.name, new (getDataType(p.type)!)(count)));
+    const columns = properties.map((p) => new Column(p.name, new (getDataType(p.type)!)(count)));
     const numProperties = columns.length;
-    const allFloat = properties.every(p => p.type === 'float');
+    const allFloat = properties.every((p) => p.type === 'float');
     const blockRows = 1024;
     const numBlocks = Math.ceil(count / blockRows);
 
@@ -228,7 +268,7 @@ const decodeElement = async (
         const rowSize = numProperties * 4;
         const blockData = new Uint8Array(blockRows * rowSize);
         const floatData = new Float32Array(blockData.buffer);
-        const storage = columns.map(c => c.data as Float32Array);
+        const storage = columns.map((c) => c.data as Float32Array);
 
         for (let b = 0; b < numBlocks; ++b) {
             const rows = Math.min(blockRows, count - b * blockRows);
@@ -292,7 +332,9 @@ const decodePlyToDataTable = async (source: ReadSource): Promise<DataTable> => {
     const decoded = [];
     for (const element of headerElements) {
         const priorRows = prior; // snapshot for the progress closure (prior is reassigned below)
-        const dataTable = await decodeElement(stream, element.properties, element.count, r => bar.update(priorRows + r));
+        const dataTable = await decodeElement(stream, element.properties, element.count, (r) =>
+            bar.update(priorRows + r)
+        );
         prior += element.count;
         decoded.push({ name: element.name, dataTable });
     }
@@ -303,7 +345,7 @@ const decodePlyToDataTable = async (source: ReadSource): Promise<DataTable> => {
     if (isCompressedPly(plyData)) {
         result = decompressPly(plyData);
     } else {
-        const vertexElement = plyData.elements.find(e => e.name === 'vertex');
+        const vertexElement = plyData.elements.find((e) => e.name === 'vertex');
         if (!vertexElement) {
             throw new Error('PLY file does not contain vertex element');
         }
@@ -338,9 +380,9 @@ const lerp = (a: number, b: number, t: number): number => a * (1 - t) + b * t;
 // attributes** straight into the layer buffers — no whole-scene decode, no
 // intermediate DataTable, no per-gaussian object churn.
 const readCompressedChunked = (source: ReadSource, header: PlyHeader, pool: ChunkDataPool): ChunkSource => {
-    const chunkEl = header.elements.find(e => e.name === 'chunk');
-    const vertexEl = header.elements.find(e => e.name === 'vertex');
-    const shEl = header.elements.find(e => e.name === 'sh');
+    const chunkEl = header.elements.find((e) => e.name === 'chunk');
+    const vertexEl = header.elements.find((e) => e.name === 'vertex');
+    const shEl = header.elements.find((e) => e.name === 'sh');
     if (!chunkEl || !vertexEl) {
         throw new Error('readPly: compressed PLY missing chunk/vertex element');
     }
@@ -379,7 +421,17 @@ const readCompressedChunked = (source: ReadSource, header: PlyHeader, pool: Chun
 
     const numGaussians = vertexEl.count;
     const restCount = shEl ? shEl.properties.length : 0;
-    const shBands: SHBands = (restCount === 0 ? 0 : ({ [SH_REST_COUNTS[1]]: 1, [SH_REST_COUNTS[2]]: 2, [SH_REST_COUNTS[3]]: 3 } as Record<number, SHBands>)[restCount]);
+    const shBands: SHBands =
+        restCount === 0
+            ? 0
+            : (
+                  {
+                      [SH_REST_COUNTS[1]]: 1,
+                      [SH_REST_COUNTS[2]]: 2,
+                      [SH_REST_COUNTS[3]]: 3,
+                      [SH_REST_COUNTS[4]]: 4
+                  } as Record<number, SHBands>
+              )[restCount];
     if (shBands === undefined) {
         throw new Error(`readPly: unrecognized compressed sh column count ${restCount}`);
     }
@@ -412,6 +464,7 @@ const readCompressedChunked = (source: ReadSource, header: PlyHeader, pool: Chun
         numChunks: [numChunks],
         shBands,
         model: splatModelFromComments(header.comments),
+        ...commentsMeta(header.comments),
         extraColumns: [],
         transform: Transform.PLY.clone(),
         availableLayers,
@@ -450,25 +503,44 @@ const readCompressedChunked = (source: ReadSource, header: PlyHeader, pool: Chun
         const bcol = (name: string): Float32Array => bnd.getColumnByName(name)!.data as Float32Array;
 
         // Bound columns, fetched once per read; indexed by 256-block `gi >> 8`.
-        const minX = pos ? bcol('min_x') : null, minY = pos ? bcol('min_y') : null, minZ = pos ? bcol('min_z') : null;
-        const maxX = pos ? bcol('max_x') : null, maxY = pos ? bcol('max_y') : null, maxZ = pos ? bcol('max_z') : null;
-        const minSX = geo ? bcol('min_scale_x') : null, minSY = geo ? bcol('min_scale_y') : null, minSZ = geo ? bcol('min_scale_z') : null;
-        const maxSX = geo ? bcol('max_scale_x') : null, maxSY = geo ? bcol('max_scale_y') : null, maxSZ = geo ? bcol('max_scale_z') : null;
+        const minX = pos ? bcol('min_x') : null,
+            minY = pos ? bcol('min_y') : null,
+            minZ = pos ? bcol('min_z') : null;
+        const maxX = pos ? bcol('max_x') : null,
+            maxY = pos ? bcol('max_y') : null,
+            maxZ = pos ? bcol('max_z') : null;
+        const minSX = geo ? bcol('min_scale_x') : null,
+            minSY = geo ? bcol('min_scale_y') : null,
+            minSZ = geo ? bcol('min_scale_z') : null;
+        const maxSX = geo ? bcol('max_scale_x') : null,
+            maxSY = geo ? bcol('max_scale_y') : null,
+            maxSZ = geo ? bcol('max_scale_z') : null;
         const sw = 3 + restCount;
         const hasColors = col ? bnd.hasColumn('min_r') : false;
-        const minR = hasColors ? bcol('min_r') : null, minG = hasColors ? bcol('min_g') : null, minB = hasColors ? bcol('min_b') : null;
-        const maxR = hasColors ? bcol('max_r') : null, maxG = hasColors ? bcol('max_g') : null, maxB = hasColors ? bcol('max_b') : null;
+        const minR = hasColors ? bcol('min_r') : null,
+            minG = hasColors ? bcol('min_g') : null,
+            minB = hasColors ? bcol('min_b') : null;
+        const maxR = hasColors ? bcol('max_r') : null,
+            maxG = hasColors ? bcol('max_g') : null,
+            maxB = hasColors ? bcol('max_b') : null;
 
         // Decode one packed record: vertex words at local index `vi` in `v`, sh
         // bytes at local index `si` in `sBytes`, bounds from global index `gi`,
         // written to output row `dstRow`. Shared by the chunk and gather paths.
-        const decodeRecord = (v: Uint32Array, vi: number, sBytes: Uint8Array | null, si: number, gi: number, dstRow: number): void => {
+        const decodeRecord = (
+            v: Uint32Array,
+            vi: number,
+            sBytes: Uint8Array | null,
+            si: number,
+            gi: number,
+            dstRow: number
+        ): void => {
             const ci = gi >> 8;
             const base = vi * vWords;
             if (pos) {
                 const pp = v[base + ppIdx];
                 const o = dstRow * 3;
-                pos[o]     = lerp(minX![ci], maxX![ci], unpackUnorm(pp >>> 21, 11));
+                pos[o] = lerp(minX![ci], maxX![ci], unpackUnorm(pp >>> 21, 11));
                 pos[o + 1] = lerp(minY![ci], maxY![ci], unpackUnorm(pp >>> 11, 10));
                 pos[o + 2] = lerp(minZ![ci], maxZ![ci], unpackUnorm(pp, 11));
             }
@@ -481,19 +553,37 @@ const readCompressedChunked = (source: ReadSource, header: PlyHeader, pool: Chun
                 const rc = (unpackUnorm(pr, 10) - 0.5) * ROT_NORM;
                 const rm = Math.sqrt(Math.max(0, 1 - (ra * ra + rb * rb + rc * rc)));
                 switch (pr >>> 30) {
-                    case 0: geo[o] = rm; geo[o + 1] = ra; geo[o + 2] = rb; geo[o + 3] = rc; break;
-                    case 1: geo[o] = ra; geo[o + 1] = rm; geo[o + 2] = rb; geo[o + 3] = rc; break;
-                    case 2: geo[o] = ra; geo[o + 1] = rb; geo[o + 2] = rm; geo[o + 3] = rc; break;
-                    default: geo[o] = ra; geo[o + 1] = rb; geo[o + 2] = rc; geo[o + 3] = rm;
+                    case 0:
+                        geo[o] = rm;
+                        geo[o + 1] = ra;
+                        geo[o + 2] = rb;
+                        geo[o + 3] = rc;
+                        break;
+                    case 1:
+                        geo[o] = ra;
+                        geo[o + 1] = rm;
+                        geo[o + 2] = rb;
+                        geo[o + 3] = rc;
+                        break;
+                    case 2:
+                        geo[o] = ra;
+                        geo[o + 1] = rb;
+                        geo[o + 2] = rm;
+                        geo[o + 3] = rc;
+                        break;
+                    default:
+                        geo[o] = ra;
+                        geo[o + 1] = rb;
+                        geo[o + 2] = rc;
+                        geo[o + 3] = rm;
                 }
                 // scale
                 const ps = v[base + psIdx];
                 geo[o + 4] = lerp(minSX![ci], maxSX![ci], unpackUnorm(ps >>> 21, 11));
                 geo[o + 5] = lerp(minSY![ci], maxSY![ci], unpackUnorm(ps >>> 11, 10));
                 geo[o + 6] = lerp(minSZ![ci], maxSZ![ci], unpackUnorm(ps, 11));
-                // opacity (alpha of packed_color)
-                const cw = unpackUnorm(v[base + pcIdx], 8);
-                geo[o + 7] = -Math.log(1 / cw - 1);
+                // opacity (alpha of packed_color), as true opacity
+                geo[o + 7] = unpackUnorm(v[base + pcIdx], 8);
             }
             if (col) {
                 const o = dstRow * sw;
@@ -511,7 +601,7 @@ const readCompressedChunked = (source: ReadSource, header: PlyHeader, pool: Chun
                     const sb = si * shRowSize;
                     for (let r = 0; r < restCount; r++) {
                         const byte = sBytes[sb + shOff[r]];
-                        const nrm = (byte === 0) ? 0 : (byte === 255) ? 1 : (byte + 0.5) / 256;
+                        const nrm = byte === 0 ? 0 : byte === 255 ? 1 : (byte + 0.5) / 256;
                         col[o + 3 + r] = (nrm - 0.5) * 8;
                     }
                 }
@@ -524,19 +614,29 @@ const readCompressedChunked = (source: ReadSource, header: PlyHeader, pool: Chun
             // combined per-record cost drives the gap/window accounting).
             const { indices, indexOffset, count } = request;
             if (count <= 0) return;
-            const slot = sortGatherSlots(count, s => indices[indexOffset + s]);
+            const slot = sortGatherSlots(count, (s) => indices[indexOffset + s]);
             const rowAt = (t: number) => indices[indexOffset + slot[t]];
             const wantSh = !!(col && shEl);
             const costBytes = vertexRowSize + (wantSh ? shRowSize : 0);
 
-            for (const run of gatherRuns(count, t => rowAt(t) * vertexRowSize, vertexRowSize, costBytes)) {
+            for (const run of gatherRuns(count, (t) => rowAt(t) * vertexRowSize, vertexRowSize, costBytes)) {
                 const firstRow = run.firstByte / vertexRowSize;
                 const rc = run.recordCount;
 
                 const vNeed = rc * vertexRowSize;
                 if (!gatherV || gatherV.length < vNeed) gatherV = new Uint8Array(vNeed);
                 const vBytes = gatherV.subarray(0, vNeed);
-                if (await readExact(source.read(vertexOffset + firstRow * vertexRowSize, vertexOffset + (firstRow + rc) * vertexRowSize), vBytes, 0, vNeed) !== vNeed) {
+                if (
+                    (await readExact(
+                        source.read(
+                            vertexOffset + firstRow * vertexRowSize,
+                            vertexOffset + (firstRow + rc) * vertexRowSize
+                        ),
+                        vBytes,
+                        0,
+                        vNeed
+                    )) !== vNeed
+                ) {
                     throw new Error(`readPly: short gather vertex read at row ${firstRow}`);
                 }
                 const vU32 = new Uint32Array(gatherV.buffer, gatherV.byteOffset, rc * vWords);
@@ -546,7 +646,14 @@ const readCompressedChunked = (source: ReadSource, header: PlyHeader, pool: Chun
                     const sNeed = rc * shRowSize;
                     if (!gatherS || gatherS.length < sNeed) gatherS = new Uint8Array(sNeed);
                     sBytes = gatherS.subarray(0, sNeed);
-                    if (await readExact(source.read(shOffset + firstRow * shRowSize, shOffset + (firstRow + rc) * shRowSize), sBytes, 0, sNeed) !== sNeed) {
+                    if (
+                        (await readExact(
+                            source.read(shOffset + firstRow * shRowSize, shOffset + (firstRow + rc) * shRowSize),
+                            sBytes,
+                            0,
+                            sNeed
+                        )) !== sNeed
+                    ) {
                         throw new Error(`readPly: short gather sh read at row ${firstRow}`);
                     }
                 }
@@ -570,7 +677,14 @@ const readCompressedChunked = (source: ReadSource, header: PlyHeader, pool: Chun
 
         vScratch ??= new Uint8Array(chunkSize * vertexRowSize);
         const vBytes = vScratch.subarray(0, count * vertexRowSize);
-        if (await readExact(source.read(vertexOffset + start * vertexRowSize, vertexOffset + (start + count) * vertexRowSize), vBytes, 0, vBytes.length) !== vBytes.length) {
+        if (
+            (await readExact(
+                source.read(vertexOffset + start * vertexRowSize, vertexOffset + (start + count) * vertexRowSize),
+                vBytes,
+                0,
+                vBytes.length
+            )) !== vBytes.length
+        ) {
             throw new Error(`readPly: short vertex read for chunk ${request.chunkIndex}`);
         }
         const vU32 = new Uint32Array(vScratch.buffer, 0, count * vWords);
@@ -579,7 +693,14 @@ const readCompressedChunked = (source: ReadSource, header: PlyHeader, pool: Chun
         if (col && shEl) {
             sScratch ??= new Uint8Array(chunkSize * shRowSize);
             sBytes = sScratch.subarray(0, count * shRowSize);
-            if (await readExact(source.read(shOffset + start * shRowSize, shOffset + (start + count) * shRowSize), sBytes, 0, sBytes.length) !== sBytes.length) {
+            if (
+                (await readExact(
+                    source.read(shOffset + start * shRowSize, shOffset + (start + count) * shRowSize),
+                    sBytes,
+                    0,
+                    sBytes.length
+                )) !== sBytes.length
+            ) {
                 throw new Error(`readPly: short sh read for chunk ${request.chunkIndex}`);
             }
         }
@@ -605,6 +726,8 @@ type LayerPlan = {
     dstIdx: Uint32Array;
     // 2DGS only: the record has no scale_2, so the slot is filled with a constant.
     synthScale2: boolean;
+    // The opacity slot was filled from the `opacity` logit, so it is converted to true opacity.
+    logitOpacity: boolean;
 };
 
 /**
@@ -633,27 +756,40 @@ const readPly = async (source: ReadSource, pool: ChunkDataPool): Promise<ChunkSo
 
     const header = await readHeader(source);
     const { headerBytes } = header;
-    const vertex = header.elements.find(e => e.name === 'vertex');
+    const vertex = header.elements.find((e) => e.name === 'vertex');
     if (!vertex) {
         throw new Error('readPly: PLY has no vertex element');
     }
     const properties = vertex.properties;
     const vertexCount = vertex.count;
 
+    // Records are range-read at a fixed stride, so only binary layouts can be
+    // read. An ascii body would otherwise be decoded as binary garbage.
+    const le = header.format === 'binary_little_endian';
+    if (!le && header.format !== 'binary_big_endian') {
+        throw new Error(
+            `readPly: unsupported PLY format '${header.format}' (only binary_little_endian and binary_big_endian are supported)`
+        );
+    }
+
     // Compressed PLY (packed chunk + vertex elements): lazy dequantizing reader.
     // `packed_position` is the marker.
-    if (properties.some(p => p.name === 'packed_position')) {
+    if (properties.some((p) => p.name === 'packed_position')) {
+        if (!le) {
+            throw new Error('readPly: compressed PLY must be binary_little_endian');
+        }
         return readCompressedChunked(source, header, pool);
     }
 
-    // Integrity guard: an uncompressed binary-little-endian PLY is exactly
+    // Integrity guard: an uncompressed binary PLY is exactly
     // `headerBytes + Σ element.count * rowStride` bytes. A mismatch means the file
-    // is truncated or corrupt — fail fast rather than decode garbage. (ascii /
-    // big-endian / compressed layouts have no such simple relation, so skip them.)
-    if (header.format === 'binary_little_endian' && source.size !== undefined) {
+    // is truncated or corrupt — fail fast rather than decode garbage.
+    if (source.size !== undefined) {
         const expected = headerBytes + header.elements.reduce((sum, e) => sum + e.count * rowSizeOf(e.properties), 0);
         if (source.size !== expected) {
-            throw new Error(`readPly: file size ${source.size} does not match header-implied size ${expected} (truncated or corrupt PLY)`);
+            throw new Error(
+                `readPly: file size ${source.size} does not match header-implied size ${expected} (truncated or corrupt PLY)`
+            );
         }
     }
 
@@ -663,13 +799,14 @@ const readPly = async (source: ReadSource, pool: ChunkDataPool): Promise<ChunkSo
     const reader = new Map<string, ValueReader>();
     for (const p of properties) {
         recordOffset.set(p.name, recordStride);
-        reader.set(p.name, getReader(p.type));
+        reader.set(p.name, getReader(p.type, le));
         recordStride += typeSize(p.type);
     }
 
     // Whole-record-float enables the typed-array fast path (every field 4-byte
-    // aligned, so a Float32Array view over the record bytes is valid).
-    const recordAllFloat = properties.every(p => p.type === 'float');
+    // aligned, so a Float32Array view over the record bytes is valid). The view
+    // reads in host byte order, so big-endian files take the DataView path.
+    const recordAllFloat = le && properties.every((p) => p.type === 'float');
 
     const has = (name: string) => recordOffset.has(name);
     const hasPosition = ['x', 'y', 'z'].every(has);
@@ -681,8 +818,12 @@ const readPly = async (source: ReadSource, pool: ChunkDataPool): Promise<ChunkSo
     // surfel) so the rest of the pipeline sees an ordinary geometric layer.
     // Only a file that is otherwise a complete gaussian record qualifies — a
     // point cloud that happens to carry two scales is not a 2DGS scene.
-    const is2dgs = !has('scale_2') && GEOMETRIC_COLS_2DGS.every(has);
-    const geometricCols = is2dgs ? GEOMETRIC_COLS_2DGS : GEOMETRIC_COLS;
+    // The opacity slot holds true opacity: the file's `opacity_linear` when it has one (a
+    // linear PLY, whose opacity may exceed 1), else its `opacity` logit, converted on read.
+    const opacityProp = has(OPACITY_LINEAR_COLUMN) ? OPACITY_LINEAR_COLUMN : 'opacity';
+    const withOpacityProp = (cols: string[]) => cols.map((c) => (c === 'opacity' ? opacityProp : c));
+    const is2dgs = !has('scale_2') && withOpacityProp(GEOMETRIC_COLS_2DGS).every(has);
+    const geometricCols = withOpacityProp(is2dgs ? GEOMETRIC_COLS_2DGS : GEOMETRIC_COLS);
     const hasGeometric = geometricCols.every(has);
     const model = is2dgs ? '2dgs' : splatModelFromComments(header.comments);
 
@@ -693,32 +834,46 @@ const readPly = async (source: ReadSource, pool: ChunkDataPool): Promise<ChunkSo
         if (m) highestRest = Math.max(highestRest, parseInt(m[1], 10));
     }
     const restCount = highestRest + 1;
-    const shBands: SHBands = (restCount === 0 ? 0 : ({ [SH_REST_COUNTS[1]]: 1, [SH_REST_COUNTS[2]]: 2, [SH_REST_COUNTS[3]]: 3 } as Record<number, SHBands>)[restCount]);
+    const shBands: SHBands =
+        restCount === 0
+            ? 0
+            : (
+                  {
+                      [SH_REST_COUNTS[1]]: 1,
+                      [SH_REST_COUNTS[2]]: 2,
+                      [SH_REST_COUNTS[3]]: 3,
+                      [SH_REST_COUNTS[4]]: 4
+                  } as Record<number, SHBands>
+              )[restCount];
     if (shBands === undefined) {
         throw new Error(`readPly: unrecognized f_rest_* count ${restCount}`);
     }
 
     // Non-standard columns become `other` extras (in file order). scale_2 stays
     // standard for 2DGS: it's absent, not extra.
-    const standard = new Set<string>(['x', 'y', 'z', ...GEOMETRIC_COLS, ...COLOR_DC_COLS]);
+    const standard = new Set<string>(['x', 'y', 'z', ...GEOMETRIC_COLS, OPACITY_LINEAR_COLUMN, ...COLOR_DC_COLS]);
     const extras: ExtraColumn[] = properties
-    .filter(p => !standard.has(p.name) && !/^f_rest_\d+$/.test(p.name))
-    .map((p) => {
-        const type: 'float32' | 'uint32' = p.type === 'float' || p.type === 'double' ? 'float32' : 'uint32';
-        return { name: p.name, type };
-    });
+        .filter((p) => !standard.has(p.name) && !/^f_rest_\d+$/.test(p.name))
+        .map((p) => {
+            const type: 'float32' | 'uint32' = p.type === 'float' || p.type === 'double' ? 'float32' : 'uint32';
+            return { name: p.name, type };
+        });
     const hasOther = extras.length > 0;
 
     // Build per-layer fill plans + layouts.
     const fieldNames = (layer: ChunkLayer): string[] => {
         switch (layer) {
-            case 'position': return ['x', 'y', 'z'];
-            case 'geometric': return geometricCols;
-            case 'color': return [...COLOR_DC_COLS, ...Array.from({ length: SH_REST_COUNTS[shBands] }, (_, k) => `f_rest_${k}`)];
-            case 'other': return extras.map(e => e.name);
+            case 'position':
+                return ['x', 'y', 'z'];
+            case 'geometric':
+                return geometricCols;
+            case 'color':
+                return [...COLOR_DC_COLS, ...Array.from({ length: SH_REST_COUNTS[shBands] }, (_, k) => `f_rest_${k}`)];
+            case 'other':
+                return extras.map((e) => e.name);
         }
     };
-    const uintByName = new Map(extras.map(e => [e.name, e.type === 'uint32']));
+    const uintByName = new Map(extras.map((e) => [e.name, e.type === 'uint32']));
 
     const layerPlan = (layer: ChunkLayer, stride: number): LayerPlan => {
         // The geometric layer's destination slot is its canonical position (so a
@@ -727,13 +882,23 @@ const readPly = async (source: ReadSource, pool: ChunkDataPool): Promise<ChunkSo
         const fields: FillField[] = fieldNames(layer).map((name, idx) => ({
             recordOffset: recordOffset.get(name)!,
             read: reader.get(name)!,
-            dstByteOffset: (layer === 'geometric' ? GEOMETRIC_COLS.indexOf(name) : idx) * 4,
+            dstByteOffset:
+                (layer === 'geometric' ? (name === opacityProp ? OPACITY_WORD : GEOMETRIC_COLS.indexOf(name)) : idx) *
+                4,
             uint: uintByName.get(name) ?? false
         }));
-        const allFloat = recordAllFloat && fields.every(f => !f.uint);
-        const srcIdx = new Uint32Array(fields.map(f => f.recordOffset >> 2));
-        const dstIdx = new Uint32Array(fields.map(f => f.dstByteOffset >> 2));
-        return { stride, fields, allFloat, srcIdx, dstIdx, synthScale2: is2dgs && layer === 'geometric' };
+        const allFloat = recordAllFloat && fields.every((f) => !f.uint);
+        const srcIdx = new Uint32Array(fields.map((f) => f.recordOffset >> 2));
+        const dstIdx = new Uint32Array(fields.map((f) => f.dstByteOffset >> 2));
+        return {
+            stride,
+            fields,
+            allFloat,
+            srcIdx,
+            dstIdx,
+            synthScale2: is2dgs && layer === 'geometric',
+            logitOpacity: opacityProp === 'opacity' && layer === 'geometric'
+        };
     };
 
     const availableLayers = new Set<ChunkLayer>();
@@ -772,13 +937,56 @@ const readPly = async (source: ReadSource, pool: ChunkDataPool): Promise<ChunkSo
         numChunks: [numChunks],
         shBands,
         model,
+        ...commentsMeta(header.comments),
         extraColumns: extras,
         transform: Transform.PLY.clone(),
         availableLayers,
-        layouts
+        layouts,
+        ...(opacityProp === OPACITY_LINEAR_COLUMN ? { opacityAboveOne: true } : {})
     };
 
-    const fill = (recordBytes: Uint8Array, count: number, chunkData: ChunkData, plan: LayerPlan, dstRow: number): void => {
+    // One whole-float record into one destination row (float offsets). Shared
+    // by `fill`'s fast path and the gather read, so the caller owns the views:
+    // on incoherent input gather runs are a few records long and there are
+    // millions of them, and building views per record was most of the decode.
+    const fillFloatRecord = (
+        recF32: Float32Array,
+        rb: number,
+        dstF32: Float32Array,
+        db: number,
+        plan: LayerPlan
+    ): void => {
+        // 2DGS: no source field targets the scale_2 slot, so fill it here.
+        // -Infinity log scale is linear 0 — a zero-thickness surfel.
+        if (plan.synthScale2) dstF32[db + SCALE_2_WORD] = -Infinity;
+        const { srcIdx, dstIdx } = plan;
+        for (let j = 0; j < srcIdx.length; j++) {
+            dstF32[db + dstIdx[j]] = recF32[rb + srcIdx[j]];
+        }
+        if (plan.logitOpacity) dstF32[db + OPACITY_WORD] = 1 / (1 + Math.exp(-dstF32[db + OPACITY_WORD]));
+    };
+
+    const fill = (
+        recordBytes: Uint8Array,
+        count: number,
+        chunkData: ChunkData,
+        plan: LayerPlan,
+        dstRow: number
+    ): void => {
+        // Fast path: whole-float record -> de-interleave via Float32Array views
+        // (no DataView). Restricted to little-endian records (recordAllFloat);
+        // big-endian records take the slower per-field DataView path below.
+        if (plan.allFloat) {
+            const recF32 = new Float32Array(recordBytes.buffer, recordBytes.byteOffset, recordBytes.byteLength >> 2);
+            const dstF32 = new Float32Array(chunkData.data);
+            const sStrideF = recordStride >> 2;
+            const dStrideF = plan.stride >> 2;
+            for (let i = 0; i < count; i++) {
+                fillFloatRecord(recF32, i * sStrideF, dstF32, (dstRow + i) * dStrideF, plan);
+            }
+            return;
+        }
+
         // 2DGS: no source field targets the scale_2 slot, so fill it here (order
         // relative to the de-interleave below doesn't matter). -Infinity log scale
         // is linear 0 — a zero-thickness surfel.
@@ -788,25 +996,6 @@ const readPly = async (source: ReadSource, pool: ChunkDataPool): Promise<ChunkSo
             for (let i = 0; i < count; i++) {
                 dstF32[(dstRow + i) * dStrideF + SCALE_2_WORD] = -Infinity;
             }
-        }
-
-        // Fast path: whole-float record -> de-interleave via Float32Array views
-        // (no DataView). Little-endian only, matching the binary PLY format.
-        if (plan.allFloat) {
-            const recF32 = new Float32Array(recordBytes.buffer, recordBytes.byteOffset, recordBytes.byteLength >> 2);
-            const dstF32 = new Float32Array(chunkData.data);
-            const sStrideF = recordStride >> 2;
-            const dStrideF = plan.stride >> 2;
-            const { srcIdx, dstIdx } = plan;
-            const nf = srcIdx.length;
-            for (let i = 0; i < count; i++) {
-                const rb = i * sStrideF;
-                const db = (dstRow + i) * dStrideF;
-                for (let j = 0; j < nf; j++) {
-                    dstF32[db + dstIdx[j]] = recF32[rb + srcIdx[j]];
-                }
-            }
-            return;
         }
 
         // General path: mixed types via DataView readers.
@@ -822,6 +1011,10 @@ const readPly = async (source: ReadSource, pool: ChunkDataPool): Promise<ChunkSo
                 } else {
                     dst.setFloat32(dstBase + f.dstByteOffset, v, true);
                 }
+            }
+            if (plan.logitOpacity) {
+                const at = dstBase + OPACITY_WORD * 4;
+                dst.setFloat32(at, 1 / (1 + Math.exp(-dst.getFloat32(at, true))), true);
             }
         }
     };
@@ -843,8 +1036,9 @@ const readPly = async (source: ReadSource, pool: ChunkDataPool): Promise<ChunkSo
             throw new Error('readPly: only lod 0 is supported');
         }
 
-        const requested: ChunkLayer[] = (['position', 'geometric', 'color', 'other'] as ChunkLayer[])
-        .filter(layer => request[layer]);
+        const requested: ChunkLayer[] = (['position', 'geometric', 'color', 'other'] as ChunkLayer[]).filter(
+            (layer) => request[layer]
+        );
         for (const layer of requested) {
             if (!plans[layer]) {
                 throw new Error(`readPly: layer '${layer}' not available`);
@@ -861,9 +1055,15 @@ const readPly = async (source: ReadSource, pool: ChunkDataPool): Promise<ChunkSo
             const { indices, indexOffset, count } = request;
             if (count <= 0) return;
 
-            const slot = sortGatherSlots(count, s => indices[indexOffset + s]);
+            const slot = sortGatherSlots(count, (s) => indices[indexOffset + s]);
             const byteAt = (t: number) => indices[indexOffset + slot[t]] * recordStride;
 
+            // Whole-float layers de-interleave through views built once per
+            // request (destinations) and once per run (records), not per record.
+            const sStrideF = recordStride >> 2;
+            const dstF32 = requested.map((layer) =>
+                plans[layer]!.allFloat ? new Float32Array(request[layer]!.data) : null
+            );
             for (const run of gatherRuns(count, byteAt, recordStride)) {
                 const need = run.recordCount * recordStride;
                 if (!gatherScratch || gatherScratch.length < need) {
@@ -876,11 +1076,23 @@ const readPly = async (source: ReadSource, pool: ChunkDataPool): Promise<ChunkSo
                     throw new Error(`readPly: short gather read (${got}/${need}) at byte ${base}`);
                 }
 
+                const recF32 = new Float32Array(
+                    recordBytes.buffer,
+                    recordBytes.byteOffset,
+                    recordBytes.byteLength >> 2
+                );
                 for (let t = run.j0; t < run.j1; t++) {
                     const row = (byteAt(t) - run.firstByte) / recordStride;
-                    const rec = recordBytes.subarray(row * recordStride, (row + 1) * recordStride);
-                    for (const layer of requested) {
-                        fill(rec, 1, request[layer]!, plans[layer]!, slot[t]);
+                    for (let li = 0; li < requested.length; li++) {
+                        const layer = requested[li];
+                        const plan = plans[layer]!;
+                        const dst = dstF32[li];
+                        if (dst) {
+                            fillFloatRecord(recF32, row * sStrideF, dst, slot[t] * (plan.stride >> 2), plan);
+                        } else {
+                            const rec = recordBytes.subarray(row * recordStride, (row + 1) * recordStride);
+                            fill(rec, 1, request[layer]!, plan, slot[t]);
+                        }
                     }
                 }
             }

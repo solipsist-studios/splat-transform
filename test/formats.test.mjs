@@ -35,11 +35,12 @@ import { dataTableToChunkSource, materializeToDataTable } from '../src/lib/compa
 import { decodePlyToDataTable } from '../src/lib/readers/read-ply.js';
 import { decodeSplatToDataTable } from '../src/lib/readers/read-splat.js';
 import { writeCompressedPlySource } from '../src/lib/writers/write-compressed-ply.js';
+import { writeSplatStreaming } from '../src/lib/writers/write-splat-streaming.js';
 import { gaussianCloudToDataTable, getSpzModule } from '../src/lib/spz-module.js';
 import { createChunkDataPool } from '../src/lib/chunk/index.js';
 
 import { compareSummaries, compareDataTables, computeStatsView } from './helpers/summary-compare.mjs';
-import { createMinimalTestData, createTestDataTable, encodePlyBinary } from './helpers/test-utils.mjs';
+import { createMinimalTestData, createTestDataTable, encodePlyBinary, assertColumnValue } from './helpers/test-utils.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const fixturesDir = join(__dirname, 'fixtures', 'splat');
@@ -283,11 +284,23 @@ describe('Compressed PLY Format', () => {
         const a = legacyFs.results.get('out.compressed.ply');
         const b = sourceFs.results.get('out.compressed.ply');
         assert.ok(a && b, 'both wrote output');
-        assert.strictEqual(
-            Buffer.compare(Buffer.from(a.buffer, a.byteOffset, a.byteLength), Buffer.from(b.buffer, b.byteOffset, b.byteLength)),
-            0,
-            'compressed-ply bytes must be identical'
-        );
+        // The source path carries true opacity, whose logit differs from the table's by f32
+        // rounding, which can move the 8-bit opacity at a rounding boundary: compare the decodes,
+        // exact except opacity, which may differ by one byte step.
+        const decode = async (bytes) => materializeToDataTable(await readPly(new BufferReadSource(bytes), pool), pool);
+        const [da, db] = [await decode(a), await decode(b)];
+        assert.deepStrictEqual(da.columnNames, db.columnNames);
+        for (const name of da.columnNames) {
+            const ca = da.getColumnByName(name).data, cb = db.getColumnByName(name).data;
+            for (let i = 0; i < ca.length; i++) {
+                if (name === 'opacity') {
+                    const sa = 1 / (1 + Math.exp(-ca[i])), sb = 1 / (1 + Math.exp(-cb[i]));
+                    assert.ok(Math.abs(sa - sb) <= 1 / 255 + 1e-6, `opacity row ${i}: ${sa} vs ${sb}`);
+                } else {
+                    assert.strictEqual(ca[i], cb[i], `column '${name}' row ${i}`);
+                }
+            }
+        }
     });
 
     it('gathers a shuffled subset identically to the sequential decode', async () => {
@@ -322,7 +335,7 @@ describe('Compressed PLY Format', () => {
         for (let j = 0; j < count; j++) {
             const e = order[j];
             assert.strictEqual(px[j * 3], x[e], `x out-row ${j}`);
-            assert.strictEqual(op[j], opF[e], `opacity out-row ${j}`);
+            assert.ok(Math.abs(op[j] - 1 / (1 + Math.exp(-opF[e]))) < 1e-6, `opacity out-row ${j}`); // true opacity
             assert.strictEqual(dc[j * 3], dc0[e], `f_dc_0 out-row ${j}`);
         }
         for (const layer of ['position', 'geometric', 'color']) acq[layer].release();
@@ -664,7 +677,7 @@ describe('SPLAT Format (Input Only)', () => {
         for (let j = 0; j < count; j++) {
             const e = order[j];
             assert.strictEqual(px[j * 3], x[e], `x out-row ${j}`);
-            assert.strictEqual(op[j], opF[e], `opacity out-row ${j}`);
+            assert.ok(Math.abs(op[j] - 1 / (1 + Math.exp(-opF[e]))) < 1e-6, `opacity out-row ${j}`); // true opacity
             assert.strictEqual(dc[j * 3], dc0[e], `f_dc_0 out-row ${j}`);
         }
         for (const layer of ['position', 'geometric', 'color']) acq[layer].release();
@@ -683,9 +696,38 @@ describe('SPLAT Format (Input Only)', () => {
             const a = lazy.getColumnByName(name).data;
             const b = eager.getColumnByName(name).data;
             for (let i = 0; i < eager.numRows; i++) {
-                assert.strictEqual(a[i], b[i], `column '${name}' row ${i}`);
+                assertColumnValue(name, a[i], b[i], `column '${name}' row ${i}`);
             }
         }
+    });
+});
+
+describe('SPLAT Format (Output)', () => {
+    it('normalizes rotations before quantizing them', async () => {
+        // the same rotation stored at unit length and scaled by 2
+        const rots = [[0.8, 0.6, 0, 0], [1.6, 1.2, 0, 0], [-0.4, 0, -0.3, 0]];
+        const n = rots.length;
+        const col = (name, values) => new Column(name, new Float32Array(values));
+        const zeros = new Array(n).fill(0);
+        const dt = new DataTable([
+            col('x', zeros), col('y', zeros), col('z', zeros),
+            col('scale_0', zeros), col('scale_1', zeros), col('scale_2', zeros),
+            col('f_dc_0', zeros), col('f_dc_1', zeros), col('f_dc_2', zeros),
+            col('opacity', zeros),
+            ...[0, 1, 2, 3].map(j => col(`rot_${j}`, rots.map(r => r[j])))
+        ]);
+        dt.transform = Transform.PLY.clone();
+
+        const pool = createChunkDataPool();
+        const writeFs = new MemoryFileSystem();
+        await writeSplatStreaming(dataTableToChunkSource(dt, pool.chunkSize), pool, { filename: 'out.splat' }, writeFs);
+        const bytes = writeFs.results.get('out.splat');
+        assert.strictEqual(bytes.byteLength, n * 32);
+
+        const quat = i => [...bytes.subarray(i * 32 + 28, i * 32 + 32)];
+        assert.deepStrictEqual(quat(0), [230, 204, 128, 128]);
+        assert.deepStrictEqual(quat(1), quat(0), 'a non-unit quaternion must encode like its unit equivalent');
+        assert.deepStrictEqual(quat(2), [25, 128, 51, 128]);
     });
 });
 
@@ -747,7 +789,7 @@ describe('SPZ Format (Input Only)', () => {
         for (let j = 0; j < count; j++) {
             const e = order[j];
             assert.strictEqual(px[j * 3], x[e], `x out-row ${j}`);
-            assert.strictEqual(op[j], opF[e], `opacity out-row ${j}`);
+            assert.ok(Math.abs(op[j] - 1 / (1 + Math.exp(-opF[e]))) < 1e-6, `opacity out-row ${j}`); // true opacity
             assert.strictEqual(dc[j * 3], dc0[e], `f_dc_0 out-row ${j}`);
         }
         for (const layer of ['position', 'geometric', 'color']) acq[layer].release();
@@ -895,12 +937,13 @@ describe('SPZ Format (Input Only)', () => {
         assert(Math.abs(Math.abs(rot3[1]) - Math.sin(Math.PI / 4)) < 0.01);
     });
 
-    it('rejects .spz v4 files with shDegree=4 (band 4 exceeds the chunk model)', async () => {
+    it('reads .spz v4 files with shDegree=4 as 4 SH bands', async () => {
         const spzData = await createSpzFixture({ version: 4, shDegree: 4 });
-        await assert.rejects(
-            readSpzTable(new BufferReadSource(spzData)),
-            /SH degree 4|band 4/
-        );
+        const dataTable = await readSpzTable(new BufferReadSource(spzData));
+
+        assert.strictEqual(dataTable.numRows, 2);
+        assert.ok(dataTable.getColumnByName('f_rest_71'), 'has all 72 f_rest columns');
+        assert.ok(!dataTable.getColumnByName('f_rest_72'));
     });
 
     it('should return an empty table for v4 files with mismatched stream count', async () => {

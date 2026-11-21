@@ -1,9 +1,7 @@
-import {
-    type ChunkLayer,
-    type ChunkSource,
-    type ChunkSourceMetadata,
-    type ReadRequest
-} from '../chunk';
+import type { ChunkLayer, ChunkSource, ChunkSourceMetadata, ReadRequest } from '../chunk';
+import { resolveComments } from '../comments';
+import { resolveExtras } from '../extras';
+import { combineBlindOrigins } from '../utils/sog-blind';
 
 const LAYERS: ChunkLayer[] = ['position', 'geometric', 'color', 'other'];
 
@@ -19,7 +17,8 @@ const LAYERS: ChunkLayer[] = ['position', 'geometric', 'color', 'other'];
  * is a structural axis here; no source carries a per-gaussian LOD tag.
  *
  * All inputs must share layout (chunk size, SH bands, layers, extras, transform)
- * and be single-LOD; the stacked metadata is inherited from `sources[0]`.
+ * and be single-LOD; the stacked metadata is inherited from `sources[0]`, and
+ * carries `opacityAboveOne` when any level does.
  *
  * @param sources - The per-LOD single-LOD sources, in output-LOD order.
  * @returns A multi-LOD source dispatching by LOD to the inputs.
@@ -29,8 +28,8 @@ const stackLods = (sources: ChunkSource[]): ChunkSource => {
         throw new Error('stackLods: at least one source is required');
     }
     const ref = sources[0].meta;
-    const layerKey = (m: ChunkSourceMetadata) => LAYERS.filter(l => m.availableLayers.has(l)).join(',');
-    const extraKey = (m: ChunkSourceMetadata) => m.extraColumns.map(e => `${e.name}:${e.type}`).join(',');
+    const layerKey = (m: ChunkSourceMetadata) => LAYERS.filter((l) => m.availableLayers.has(l)).join(',');
+    const extraKey = (m: ChunkSourceMetadata) => m.extraColumns.map((e) => `${e.name}:${e.type}`).join(',');
     for (const s of sources) {
         if (s.meta.numLods !== 1) {
             throw new Error('stackLods: every input must be single-LOD');
@@ -39,7 +38,9 @@ const stackLods = (sources: ChunkSource[]): ChunkSource => {
             throw new Error('stackLods: inputs must share chunk size and SH band count');
         }
         if (layerKey(s.meta) !== layerKey(ref)) {
-            throw new Error(`stackLods: available-layer mismatch between LOD levels ([${layerKey(s.meta)}] vs [${layerKey(ref)}])`);
+            throw new Error(
+                `stackLods: available-layer mismatch between LOD levels ([${layerKey(s.meta)}] vs [${layerKey(ref)}])`
+            );
         }
         if (extraKey(s.meta) !== extraKey(ref)) {
             throw new Error('stackLods: extra-column mismatch between LOD levels');
@@ -60,13 +61,20 @@ const stackLods = (sources: ChunkSource[]): ChunkSource => {
         }
     }
 
-    const lodCounts = sources.map(s => s.meta.numGaussians);
+    const lodCounts = sources.map((s) => s.meta.numGaussians);
+    const extras = resolveExtras(sources);
+    const comments = resolveComments(sources);
+    const { extras: _refExtras, comments: _refComments, opacityAboveOne: _refAboveOne, ...refMeta } = ref;
     const meta: ChunkSourceMetadata = {
-        ...ref,
+        ...refMeta,
+        ...(extras !== undefined ? { extras } : {}),
+        ...(comments?.length ? { comments } : {}),
+        ...(sources.some((s) => s.meta.opacityAboveOne) ? { opacityAboveOne: true } : {}),
+        extraColumns: combineBlindOrigins(sources.map((s) => s.meta.extraColumns)),
         numGaussians: lodCounts[0],
         numLods: sources.length,
         lodCounts,
-        numChunks: sources.map(s => s.meta.numChunks[0])
+        numChunks: sources.map((s) => s.meta.numChunks[0])
     };
 
     const pick = (lod: number): ChunkSource => {
@@ -87,7 +95,7 @@ const stackLods = (sources: ChunkSource[]): ChunkSource => {
         meta,
         read,
         close: async () => {
-            await Promise.all(sources.map(s => s.close()));
+            await Promise.all(sources.map((s) => s.close()));
         }
     };
 };

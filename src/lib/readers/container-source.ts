@@ -1,11 +1,8 @@
-import {
-    type ChunkDataPool,
-    type ReadRequest,
-    type ChunkSource,
-    type ChunkSourceMetadata
-} from '../chunk';
+import type { ChunkDataPool, ReadRequest, ChunkSource, ChunkSourceMetadata, ExtraColumn } from '../chunk';
 import { concatSource } from '../ops';
-import { type Transform } from '../utils';
+import type { SplatModel } from '../splat-model';
+import type { Transform } from '../utils';
+import { combineBlindOrigins } from '../utils/sog-blind';
 
 /**
  * One contiguous run of gaussians within a LOD, backed by a sub-file that is
@@ -40,12 +37,21 @@ type ContainerSegment = {
  * @param opts - Tuning options.
  * @param opts.cacheSize - Max resident decoded sub-files (default 3, min 2 so a chunk straddling two segments can be served).
  * @param opts.transform - Override the reported pending transform (sub-files decode to their own space; e.g. LCC2 relabels to `LCC2_TRANSFORM`). The sub-file data is unchanged — this only sets `meta.transform`.
+ * @param opts.model - Override the reported splat model (e.g. the one a `lod-meta.json` records for all its files). Only sets `meta.model`.
+ * @param opts.opacityAboveOne - Some unit may hold opacity above 1 (see {@link summarizeUnits}); sets `meta.opacityAboveOne`.
+ * @param opts.extraColumns - The extra columns of every unit combined (see {@link summarizeUnits}), so their SOG blind origins cover the whole container; used when the names and types match the first unit's.
  * @returns A lazy multi-LOD source over the container.
  */
 const containerSource = async (
     segmentsByLod: ContainerSegment[][],
     pool: ChunkDataPool,
-    opts: { cacheSize?: number; transform?: Transform } = {}
+    opts: {
+        cacheSize?: number;
+        transform?: Transform;
+        model?: SplatModel;
+        opacityAboveOne?: boolean;
+        extraColumns?: readonly ExtraColumn[];
+    } = {}
 ): Promise<ChunkSource> => {
     const cacheSize = Math.max(2, opts.cacheSize ?? 3);
     const cache = new Map<ContainerSegment, Promise<ChunkSource>>();
@@ -61,12 +67,12 @@ const containerSource = async (
             const evicted = order.shift()!;
             const ep = cache.get(evicted)!;
             cache.delete(evicted);
-            ep.then(s => s.close()).catch(() => {});
+            ep.then((s) => s.close()).catch<undefined>(() => undefined);
         }
         return p;
     };
 
-    const firstSeg = segmentsByLod.find(segs => segs.length > 0)?.[0];
+    const firstSeg = segmentsByLod.find((segs) => segs.length > 0)?.[0];
     if (!firstSeg) {
         throw new Error('containerSource: no segments');
     }
@@ -76,7 +82,7 @@ const containerSource = async (
     const layout = firstSrc.meta;
     const { chunkSize } = layout;
 
-    const lodCounts = segmentsByLod.map(segs => segs.reduce((acc, s) => acc + s.count, 0));
+    const lodCounts = segmentsByLod.map((segs) => segs.reduce((acc, s) => acc + s.count, 0));
 
     // Static-meta proxy: concatSource reads its `meta` to lay out the LOD up
     // front; the actual sub-source is decoded (and cached) only on `read`, then
@@ -96,6 +102,12 @@ const containerSource = async (
                     `containerSource: sub-file SH band mismatch (${src.meta.shBands} vs ${layout.shBands})`
                 );
             }
+            // the unit fills the first unit's layout: a different set or order of extra columns would misplace values
+            if (columnsKey(src.meta.extraColumns) !== columnsKey(layout.extraColumns)) {
+                throw new Error(
+                    `containerSource: sub-file extra-column mismatch ([${columnsKey(src.meta.extraColumns)}] vs [${columnsKey(layout.extraColumns)}])`
+                );
+            }
             // A short decode (e.g. a malformed sub-file that no-ops) would
             // otherwise leave stale pool-buffer bytes in the unread rows.
             if (src.meta.numGaussians !== seg.count) {
@@ -108,15 +120,21 @@ const containerSource = async (
         close: () => Promise.resolve()
     });
 
-    const perLod = segmentsByLod.map(segs => (segs.length > 0 ? concatSource(segs.map(proxy), pool) : null));
+    const perLod = segmentsByLod.map((segs) => (segs.length > 0 ? concatSource(segs.map(proxy), pool) : null));
 
+    const { opacityAboveOne: _firstAboveOne, ...firstLayout } = layout;
     const meta: ChunkSourceMetadata = {
-        ...layout,
+        ...firstLayout,
+        ...(opts.opacityAboveOne ? { opacityAboveOne: true } : {}),
+        ...(opts.extraColumns && columnsKey(opts.extraColumns) === columnsKey(layout.extraColumns)
+            ? { extraColumns: opts.extraColumns }
+            : {}),
         transform: opts.transform ?? layout.transform,
+        model: opts.model ?? layout.model,
         numGaussians: lodCounts[0] ?? 0,
         numLods: segmentsByLod.length,
         lodCounts,
-        numChunks: lodCounts.map(c => Math.ceil(c / chunkSize))
+        numChunks: lodCounts.map((c) => Math.ceil(c / chunkSize))
     };
 
     // Dispatch to the requested LOD's concatSource (which buckets by sub-file and
@@ -131,7 +149,7 @@ const containerSource = async (
     };
 
     const close = async (): Promise<void> => {
-        await Promise.all([...cache.values()].map(p => p.then(s => s.close()).catch(() => {})));
+        await Promise.all([...cache.values()].map((p) => p.then((s) => s.close()).catch<undefined>(() => undefined)));
         cache.clear();
         order.length = 0;
     };
@@ -139,4 +157,43 @@ const containerSource = async (
     return { meta, read, close };
 };
 
-export { containerSource, type ContainerSegment };
+const columnsKey = (columns: readonly ExtraColumn[]) => columns.map((e) => `${e.name}:${e.type}`).join(',');
+
+/** What a header-only peek of one container unit reports. */
+type UnitSummary = Partial<Pick<ChunkSourceMetadata, 'opacityAboveOne' | 'extraColumns'>>;
+
+/**
+ * Summarize a container's units by a header-only `peek` of each, 16 at a
+ * time: whether any may hold opacity above 1, and their extra columns with
+ * the SOG blind origins combined (see {@link combineBlindOrigins}), so a
+ * range or encoding covers every unit's values. The container must describe
+ * every unit, but only the first is decoded up front. Units must carry the
+ * same extra columns in the same order, since each fills the first's layout.
+ *
+ * @param units - The units to summarize.
+ * @param peek - Reports one unit's summary, or null when it has none to give.
+ * @returns The container's summary.
+ * @throws When units carry different extra columns.
+ */
+const summarizeUnits = async <T>(
+    units: readonly T[],
+    peek: (unit: T) => Promise<UnitSummary | null>
+): Promise<UnitSummary> => {
+    const summaries: UnitSummary[] = [];
+    for (let i = 0; i < units.length; i += 16) {
+        for (const s of await Promise.all(units.slice(i, i + 16).map(peek))) if (s) summaries.push(s);
+    }
+    const lists = summaries.flatMap((s) => (s.extraColumns ? [s.extraColumns] : []));
+    const mismatch = lists.find((l) => columnsKey(l) !== columnsKey(lists[0]));
+    if (mismatch) {
+        throw new Error(
+            `containerSource: units carry different extra columns ([${columnsKey(lists[0])}] vs [${columnsKey(mismatch)}])`
+        );
+    }
+    return {
+        ...(summaries.some((s) => s.opacityAboveOne) ? { opacityAboveOne: true } : {}),
+        ...(lists.length > 0 ? { extraColumns: combineBlindOrigins(lists) } : {})
+    };
+};
+
+export { containerSource, summarizeUnits, type ContainerSegment };
